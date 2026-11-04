@@ -1,0 +1,3 @@
+# WebView2 and the Windows SDK tooling are only first-class on MSVC; this machine defaults to GNU.
+[build]
+target = "x86_64-pc-windows-msvc"

@@ -1,0 +1,99 @@
+import { Button, ListView } from "std-widgets.slint";
+
+// Workaround candidate: a real top-level window, which can sit above the webview's child HWND.
+export component MenuWindow inherits Window {
+    no-frame: true;
+    always-on-top: true;
+    width: 180px;
+    height: 120px;
+    background: #ff00ff;
+}
+
+export component App inherits Window {
+    title: "mailfunction spike: webview host";
+    preferred-width: 1000px;
+    preferred-height: 700px;
+
+    in property <bool> pinned: false;
+    in property <[string]> rows;
+    in property <string> status: "No webview";
+    in property <string> last-key: "Slint has received no keys";
+    in-out property <bool> focus-fix: false;
+    out property <length> slot-x: slot.absolute-position.x;
+    out property <length> slot-y: slot.absolute-position.y;
+    out property <length> slot-w: slot.width;
+    out property <length> slot-h: slot.height;
+
+    always-on-top: pinned;
+    forward-focus: fs;
+
+    callback slot-changed();
+    callback open-html();
+    callback close-webview();
+    callback open-menu();
+    callback key(string);
+    callback pane-clicked();
+
+    public function show-popup() { popup.show(); }
+    public function hide-popup() { popup.close(); }
+
+    fs := FocusScope {
+        key-pressed(e) => {
+            root.key(e.text);
+            accept
+        }
+
+        VerticalLayout {
+            HorizontalLayout {
+                height: 44px;
+                padding: 6px;
+                spacing: 6px;
+                Button { text: "Open HTML"; clicked => { root.open-html(); } }
+                Button { text: "Close webview"; clicked => { root.close-webview(); } }
+                Button { text: "Inline popup"; clicked => { popup.show(); } }
+                Button { text: "Window popup"; clicked => { root.open-menu(); } }
+                Button {
+                    text: root.focus-fix ? "Focus fix: ON" : "Focus fix: OFF";
+                    clicked => {
+                        root.focus-fix = !root.focus-fix;
+                        fs.focus();
+                    }
+                }
+                Text { text: root.status; vertical-alignment: center; }
+                Text { text: root.last-key; vertical-alignment: center; font-weight: 700; }
+            }
+
+            HorizontalLayout {
+                ListView {
+                    width: 320px;
+                    for row in root.rows: Rectangle {
+                        height: 28px;
+                        Text { x: 8px; text: row; vertical-alignment: center; }
+                        TouchArea {
+                            clicked => {
+                                root.pane-clicked();
+                                fs.focus();
+                            }
+                        }
+                    }
+                }
+
+                slot := Rectangle {
+                    background: #dddddd;
+                    changed width => { root.slot-changed(); }
+                    changed height => { root.slot-changed(); }
+                    Text { text: "Webview slot"; }
+
+                    popup := PopupWindow {
+                        x: 40px;
+                        y: 150px;
+                        width: 180px;
+                        height: 120px;
+                        close-policy: no-auto-close;
+                        Rectangle { background: #ff00ff; }
+                    }
+                }
+            }
+        }
+    }
+}
