@@ -392,7 +392,7 @@ fn notifications(w: &World) {
     let account_switch = || {
         w.controller.open_settings();
         w.page(3);
-        click(&w.app, LEFT_OF_CONTROLS, 275.0);
+        click(&w.app, LEFT_OF_CONTROLS, 322.0);
         w.controller.close_settings();
     };
     account_switch();
@@ -412,6 +412,13 @@ fn identity(w: &World) {
     linger();
     let saved = w.reader.identity(w.account).unwrap();
     assert_eq!((saved.name.as_str(), saved.signature.as_str()), ("Kong N.", "Kong\nRocket"));
+    press(&w.app, ESCAPE);
+
+    // Coming back, the page shows what was written, with no sync needed to bring it up to date.
+    let account = w.app.get_accounts().row_data(0).unwrap();
+    assert_eq!((account.name.as_str(), account.signature.as_str()), ("Kong N.", "Kong\nRocket"));
+    w.controller.open_settings();
+    w.page(3);
     settle();
     shot(&w.app, "43-account-filled");
     press(&w.app, ESCAPE);

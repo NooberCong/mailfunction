@@ -189,7 +189,6 @@ impl Controller {
         let reader = Rc::new(Reader::open(dir)?);
         let settings = reader.settings();
         app.global::<Theme>().set_preferences(settings.into());
-        app.set_version(env!("CARGO_PKG_VERSION").into());
         let logos = Rc::new(Logos::new(reader.clone(), &store, network.clone(), app.as_weak()));
         logos.set_enabled(settings.sender_logos);
         let list = Rc::new(MessageList::new(reader.clone(), logos.clone()));

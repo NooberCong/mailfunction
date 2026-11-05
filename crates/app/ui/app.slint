@@ -2067,7 +2067,7 @@ component Choosing inherits Setting {
     }
 }
 
-/// Text the user keeps, with its name in front. It grows with what is typed.
+/// Text the user keeps, under its name. It grows with what is typed.
 component SettingsField inherits Rectangle {
     in property <string> label;
     in property <string> placeholder;
@@ -2077,21 +2077,21 @@ component SettingsField inherits Rectangle {
 
     private property <length> box-height: Math.max(input.preferred-height + 16px, root.multiline ? 84px : 34px);
 
-    height: root.box-height;
+    private property <length> label-height: 22px;
+
+    height: root.label-height + root.box-height;
 
     Text {
         x: 0;
         y: 0;
-        height: 34px;
         text: root.label;
         color: Theme.muted;
-        font-size: Theme.body;
-        vertical-alignment: center;
+        font-size: Theme.small;
     }
 
     Rectangle {
-        x: 84px;
-        width: parent.width - 84px;
+        x: 0;
+        y: root.label-height;
         height: root.box-height;
         border-radius: 8px;
         background: Theme.hover;
@@ -2129,6 +2129,7 @@ component AccountSettings inherits Rectangle {
     callback remove();
 
     private property <bool> confirming;
+    private property <length> action-inset: 10px;
 
     function report() { root.edited(name.text, signature.text, notify.on); }
 
@@ -2168,10 +2169,12 @@ component AccountSettings inherits Rectangle {
                 vertical-alignment: center;
                 horizontal-stretch: 0;
             }
-            VerticalLayout {
-                alignment: center;
+            Rectangle {
+                width: remove.width - root.action-inset;
+                height: remove.height;
                 horizontal-stretch: 0;
                 remove := BarAction {
+                    x: 0;
                     text: root.confirming ? "Click again to remove" : "Remove";
                     clicked => {
                         if (root.confirming) {
@@ -2250,7 +2253,6 @@ component SettingsTab inherits Rectangle {
 component SettingsScreen inherits Rectangle {
     in-out property <int> page;
     in property <[AccountItem]> accounts;
-    in property <string> version;
     callback back();
     callback add-account();
     callback remove-account(int);
@@ -2277,6 +2279,7 @@ component SettingsScreen inherits Rectangle {
             padding: 12px;
             padding-top: 8px;
             spacing: 2px;
+            alignment: start;
 
             HorizontalLayout {
                 alignment: start;
@@ -2290,14 +2293,6 @@ component SettingsScreen inherits Rectangle {
                 text: page.title;
                 active: index == root.page;
                 clicked => { root.page = index; }
-            }
-            Rectangle { vertical-stretch: 1; }
-            Text {
-                x: 12px;
-                text: "mailfunction " + root.version;
-                color: Theme.on-frame-muted;
-                font-size: Theme.small;
-                horizontal-alignment: center;
             }
         }
 
@@ -2409,10 +2404,11 @@ component SettingsScreen inherits Rectangle {
                             edited(name, signature, notify) => { root.identity-edited(index, name, signature, notify); }
                             remove => { root.remove-account(index); }
                         }
-                        Rectangle { height: 8px; }
-                        HorizontalLayout {
-                            alignment: start;
+                        Rectangle {
+                            height: 44px;
                             BarAction {
+                                x: -10px;
+                                y: parent.height - self.height;
                                 text: "Add account";
                                 clicked => { root.add-account(); }
                             }
@@ -2485,7 +2481,6 @@ export component App inherits Window {
 
     in property <bool> settings-open;
     in-out property <int> settings-page;
-    in property <string> version;
 
     in property <string> notice;
     in property <string> notice-action;
@@ -3196,7 +3191,6 @@ export component App inherits Window {
         if root.signed-in && !root.adding && root.settings-open: SettingsScreen {
             page <=> root.settings-page;
             accounts: root.accounts;
-            version: root.version;
             back => { root.close-settings(); }
             add-account => {
                 root.add-account();

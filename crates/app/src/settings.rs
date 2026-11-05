@@ -96,6 +96,8 @@ impl Controller {
     /// Takes the screen away, for when something else is about to fill the window.
     pub(crate) fn leave_settings(&self) {
         self.save_identities();
+        // Not while typing, as the fields would be written over under the cursor.
+        self.publish_accounts();
         self.app.set_settings_open(false);
     }
 
