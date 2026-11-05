@@ -24,6 +24,10 @@ const SMALLEST: u32 = 32;
 const MAX_ICON: usize = 1024 * 1024;
 const MAX_PAGE: usize = 1024 * 1024;
 const MAX_ICONS_TRIED: usize = 4;
+/// BIMI's own limit. usvg recurses as far as a file leads it, so this bounds the stack it can need.
+const MAX_SVG: usize = 32 * 1024;
+/// A stack overflow ends the process, and nothing can catch it, so there must be room to spare.
+const SVG_STACK: usize = 16 * 1024 * 1024;
 /// How much of the tile an icon with its own transparent edge covers.
 const ICON_SHARE: f32 = 0.68;
 
@@ -37,10 +41,13 @@ const SHARED_MAIL: &[&str] = &[
     "protonmail.com", "qq.com", "tutanota.com", "yahoo.com", "yahoo.com.vn", "yandex.com", "yandex.ru", "zoho.com",
 ];
 
-/// The domain to ask for an address's logo: `em.canva.com` and `canva.com` are one brand.
+/// The domain to ask for an address's logo: `em.canva.com` and `canva.com` are one brand. A name
+/// under a private suffix such as `pages.dev` has none: anyone can have one free, which would let
+/// a sender give each recipient a domain of their own and see who looks it up.
 fn domain(address: &str) -> Option<String> {
     let host = address.rsplit_once('@')?.1.trim().to_ascii_lowercase();
-    psl::domain_str(&host).map(str::to_string)
+    let domain = psl::domain(host.as_bytes())?;
+    (domain.suffix().typ() != Some(psl::Type::Private)).then(|| String::from_utf8_lossy(domain.as_bytes()).into_owned())
 }
 
 /// As [`domain`], for one of the user's own accounts. gmail.com has no icon of its own to find.
@@ -202,7 +209,18 @@ fn decode(bytes: &[u8]) -> Option<RgbaImage> {
     (image.width().min(image.height()) >= SMALLEST).then_some(image)
 }
 
+/// Draws an SVG on a stack of its own. A thread's usual 2 MiB overflows on 7 KB of nesting.
 fn render_svg(bytes: &[u8]) -> Option<RgbaImage> {
+    if bytes.len() > MAX_SVG {
+        return None;
+    }
+    std::thread::scope(|scope| {
+        let drawing = std::thread::Builder::new().stack_size(SVG_STACK).spawn_scoped(scope, || draw_svg(bytes));
+        drawing.ok()?.join().ok()?
+    })
+}
+
+fn draw_svg(bytes: &[u8]) -> Option<RgbaImage> {
     use resvg::{tiny_skia, usvg};
     // By default a linked image is read from disk, and a logo comes from a stranger.
     let resolver = usvg::ImageHrefResolver { resolve_string: Box::new(|_, _| None), ..Default::default() };
@@ -328,6 +346,9 @@ mod tests {
         assert_eq!(sender_domain("friend@gmail.com"), None);
         assert_eq!(sender_domain("friend@GMAIL.COM"), None);
         assert_eq!(sender_domain("not an address"), None);
+        for free in ["x@abc123.pages.dev", "x@victim42.github.io", "x@u1.netlify.app"] {
+            assert_eq!(sender_domain(free), None, "{free}");
+        }
         assert_eq!(account_domain("me@gmail.com").as_deref(), Some("google.com"));
         assert_eq!(account_domain("me@rocketjump.io").as_deref(), Some("rocketjump.io"));
         assert_eq!(picture_key("Me@Gmail.com"), "account:me@gmail.com");
@@ -402,6 +423,43 @@ mod tests {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" fill="#c4122f"/></svg>"##;
         let tile = stored(&prepare(svg).unwrap());
         assert_eq!(*tile.get_pixel(64, 64), Rgba([0xc4, 0x12, 0x2f, 255]));
+    }
+
+    /// Each one fills the limit, and overflows a usual thread's stack by a long way. Failing here
+    /// is not a failed test but the end of the test process, which is what would happen to the app.
+    #[test]
+    fn no_svg_within_the_limit_can_overflow_the_stack() {
+        const OPEN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 9 9">"#;
+        const RECT: &str = r#"<rect width="9" height="9"/>"#;
+        let chain = |link: &dyn Fn(usize) -> String, last: &str| {
+            let mut svg = format!("{OPEN}<defs>");
+            let mut n = 0;
+            while svg.len() + link(n).len() + last.len() + 16 < MAX_SVG {
+                svg.push_str(&link(n));
+                n += 1;
+            }
+            format!("{svg}</defs>{}</svg>", last.replace("{n}", &n.to_string()))
+        };
+        let use_first = |attribute: &str| format!(r##"<rect id="c{{n}}" width="9" height="9"/><rect width="9" height="9" {attribute}="url(#c0)"/>"##);
+        let nested = format!("{OPEN}{}{RECT}{}</svg>", "<svg>".repeat(2900), "</svg>".repeat(2900));
+        for svg in [
+            nested,
+            chain(&|i| format!(r##"<clipPath id="c{i}" clip-path="url(#c{})">{RECT}</clipPath>"##, i + 1), &use_first("clip-path")),
+            chain(&|i| format!(r##"<mask id="c{i}" mask="url(#c{})">{RECT}</mask>"##, i + 1), &use_first("mask")),
+            chain(&|i| format!(r##"<mask id="c{i}"><rect width="9" height="9" mask="url(#c{})"/></mask>"##, i + 1), &use_first("mask")),
+            chain(&|i| format!(r##"<pattern id="c{i}" width="1" height="1"><rect width="9" height="9" fill="url(#c{})"/></pattern>"##, i + 1), &use_first("fill")),
+            chain(&|i| format!(r##"<marker id="c{i}"><path d="M0 0L9 9" marker-start="url(#c{})"/></marker>"##, i + 1), &use_first("marker-start")),
+            chain(&|i| format!(r##"<filter id="c{i}"><feImage xlink:href="#e{i}"/></filter><rect id="e{i}" width="9" height="9" filter="url(#c{})"/>"##, i + 1), &use_first("filter")),
+        ] {
+            assert!(svg.len() <= MAX_SVG, "{}", svg.len());
+            let _ = prepare(svg.as_bytes());
+        }
+    }
+
+    #[test]
+    fn an_svg_over_the_limit_is_refused_unread() {
+        let padded = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 9 9"><rect width="9" height="9"/>{}</svg>"#, " ".repeat(MAX_SVG));
+        assert!(prepare(padded.as_bytes()).is_none());
     }
 
     #[test]

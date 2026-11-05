@@ -261,6 +261,7 @@ fn seed(dir: &Path) {
         subject: "Waiting".into(),
         from_name: "Ann".into(),
         from_addr: "ann@example.com".into(),
+        verified: true,
         date: 1_800_000_000,
         size: 1,
         seen: false,

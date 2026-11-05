@@ -24,7 +24,7 @@ pub struct MessageList {
     count: Cell<usize>,
     pages: RefCell<HashMap<usize, Rc<Vec<MessageRow>>>>,
     logos: Rc<Logos>,
-    /// False in Spam: a lookup would tell a spammer's domain that the address is alive, and a
+    /// False in Spam, though nothing there is verified anyway: a lookup would tell a spammer's domain that the address is alive, and a
     /// familiar logo is the last thing a forgery should get.
     show_logos: Cell<bool>,
     /// What a search found, which is shown instead of the label while there is a search.
@@ -110,9 +110,11 @@ impl MessageList {
     }
 
     /// The logo of a message's sender, for an avatar of `size` logical pixels.
-    pub fn logo(&self, address: &str, size: f32) -> Image {
-        match logo::sender_domain(address) {
-            Some(domain) if self.show_logos.get() => self.logos.image(&domain, size),
+    /// A message's logo. Only mail known to be from its domain gets one: a brand's own logo would
+    /// make a forgery convincing, and looking one up tells whoever runs the domain.
+    pub fn logo(&self, message: &MessageRow, size: f32) -> Image {
+        match logo::sender_domain(&message.from_addr) {
+            Some(domain) if message.verified && self.show_logos.get() => self.logos.image(&domain, size),
             _ => Image::default(),
         }
     }
@@ -195,7 +197,7 @@ impl Model for MessageList {
             starred: m.flagged,
             initials: initials(display_name(&m)).into(),
             tone: tone(&m.from_addr),
-            logo: self.logo(&m.from_addr, AVATAR),
+            logo: self.logo(&m, AVATAR),
             count: if m.count > 1 { m.count.to_string().into() } else { "".into() },
             account: self.marked.borrow().iter().position(|a| *a == m.account_id).map_or(-1, |i| i as i32),
         })
@@ -206,8 +208,16 @@ impl Model for MessageList {
     }
 }
 
+/// Who a message is from, as a list shows it. A name written as an address could pass for one, so
+/// it gives way to the real address, and with none to give way to it says nothing.
 pub fn display_name(m: &MessageRow) -> &str {
-    if m.from_name.is_empty() { &m.from_addr } else { &m.from_name }
+    let posing = m.from_name.contains('@');
+    match (m.from_name.as_str(), m.from_addr.as_str()) {
+        ("", address) => address,
+        (_, "") if posing => "(no address)",
+        (_, address) if posing => address,
+        (name, _) => name,
+    }
 }
 
 /// The first letters of the first and last words, or one letter for a single word or an address.

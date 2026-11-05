@@ -150,6 +150,7 @@ fn main() {
         subject: "A long subject that puts the sender where the row will go".into(),
         from_name: "Brand".into(),
         from_addr: "news@brand.example".into(),
+        verified: true,
         date: 1_793_000_000,
         size: 100,
         seen: true,

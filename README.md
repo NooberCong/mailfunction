@@ -29,6 +29,15 @@ through the same hook that serves the page: from a disk cache, or fetched by the
 lockdown never changes, and a message opened again touches no server. Loading images the first time
 can still tell the sender the mail was opened.
 
+Anyone can write a From line, so the app believes one only if Gmail does: sync keeps Gmail's own
+DMARC verdict with each message, for the one address on show. Only such mail gets a logo, or can be
+trusted with always loading images, and nothing in Spam ever is. A logo comes from the sender's own
+domain, so the Sender logos setting does tell that domain your IP address, the first time its mail
+is on screen. Mail arriving tells nobody. Free hosting domains get no logo, as they would let a
+sender give each recipient a domain of their own.
+
+Saved attachments are marked as coming from the internet, as a browser would, and are never opened.
+
 Settings are in the sidebar, or `Ctrl+,`, and apply as they change. The app's own are one JSON
 document in the store, so a new one needs no migration. Each account's name, signature and
 notifications live on the account. Show all images loads every remote image without asking,
@@ -44,7 +53,8 @@ except in Spam.
    to `Ctrl+9`. With two or more, the app opens on All accounts (`Ctrl+0`): every account's Inbox,
    Starred, Sent and so on in one list, where a small badge says whose each message is. Whatever you
    do to a message happens in its own account, and the From line chooses where new mail goes from.
-   Removing an account deletes its local mail and its saved sign-in.
+   Removing an account deletes its local mail and its saved sign-in, overwriting them on disk, and
+   revokes that sign-in at Google.
 
 ```powershell
 rustup run stable-x86_64-pc-windows-msvc cargo run --release -p mailfunction

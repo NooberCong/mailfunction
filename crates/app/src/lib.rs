@@ -51,6 +51,10 @@ const IMAPS_PORT: u16 = 993;
 const GMAIL_SMTP_HOST: &str = "smtp.gmail.com";
 const SMTPS_PORT: u16 = 465;
 
+/// Mail up to this size is rendered where it is asked for. However it is built, that takes under
+/// a fifth of a second, and it means ordinary mail goes up with no loading state in between.
+const RENDER_IN_PLACE: usize = 64 * 1024;
+
 /// Avatar sizes, matching app.slint, so that a logo is cut to exactly the pixels it fills.
 const HEADER_AVATAR: f32 = 40.0;
 const ACCOUNT_AVATAR: f32 = 28.0;
@@ -177,7 +181,6 @@ pub struct Controller {
     /// The message showing in the reader.
     selected: Cell<Option<i64>>,
     /// The address the selected message is from.
-    selected_sender: RefCell<String>,
     last_open: Cell<Option<Instant>>,
     /// The thread in the reader, oldest first.
     open_thread: Cell<Option<ThreadKey>>,
@@ -260,7 +263,6 @@ impl Controller {
             shown: Cell::new(None),
             list_stale: Cell::new(false),
             selected: Cell::new(None),
-            selected_sender: RefCell::default(),
             last_open: Cell::new(None),
             open_thread: Cell::new(None),
             thread: RefCell::default(),
@@ -571,6 +573,13 @@ impl Controller {
         let (store, images) = (self.store.clone(), self.images.clone());
         std::thread::spawn(move || {
             // If either fails the account returns at the next launch, asking to sign in again.
+            // Best effort, as being offline must not stop an account going. Gone from here but
+            // alive at Google, a copy of the token would still open the whole mailbox.
+            if removed.auth == AuthKind::Google
+                && let Ok(token) = secrets::load(&removed.email)
+            {
+                let _ = oauth::revoke(&token);
+            }
             let _ = secrets::delete(&removed.email);
             let _ = store.remove_account(removed.id);
             images.clear();
@@ -733,7 +742,8 @@ impl Controller {
 
     /// The sender's logo, or else their initials in the colours the list gives them.
     fn sender_picture(&self, message: &MessageRow, view: &MessageView) -> Option<Vec<u8>> {
-        let logo = logo::sender_domain(&message.from_addr).and_then(|domain| self.logos.png(&domain, NOTICE_PICTURE));
+        let domain = logo::sender_domain(&message.from_addr).filter(|_| message.verified);
+        let logo = domain.and_then(|domain| self.logos.png(&domain, NOTICE_PICTURE));
         logo.or_else(|| {
             let tones = self.app.global::<Theme>().get_tones();
             let tone = tones.row_data(view.tone as usize % tones.row_count())?;
@@ -987,7 +997,6 @@ impl Controller {
         self.open_thread.set(None);
         self.thread.borrow_mut().clear();
         self.thread_items.set_vec(Vec::new());
-        self.selected_sender.borrow_mut().clear();
         self.app.set_selected_row(-1);
         self.app.set_image_bar(ImageBar::Hidden);
         self.app.set_pane(Pane::Empty);
@@ -1067,7 +1076,7 @@ impl Controller {
                 date: list::short_date(m.date, chrono::Local::now()).into(),
                 initials: initials(display_name(m)).into(),
                 tone: tone(&m.from_addr),
-                logo: self.list.logo(&m.from_addr, THREAD_AVATAR),
+                logo: self.list.logo(m, THREAD_AVATAR),
                 unread: !m.seen,
             })
             .collect();
@@ -1086,12 +1095,11 @@ impl Controller {
         let Some(message) = self.thread.borrow().get(index).cloned() else { return };
         self.app.set_thread_open(index as i32);
         self.selected.set(Some(message.id));
-        self.selected_sender.replace(message.from_addr.clone());
         self.app.set_image_bar(ImageBar::Hidden);
         // The old message goes in the same frame as the click, whatever the new one takes.
         self.hide_page();
         let mut view = header(&message);
-        view.logo = self.list.logo(&message.from_addr, HEADER_AVATAR);
+        view.logo = self.list.logo(&message, HEADER_AVATAR);
         self.app.set_message(view);
         let now = Instant::now();
         if self.last_open.replace(Some(now)).is_none_or(|last| now - last > FLICKING) {
@@ -1131,14 +1139,40 @@ impl Controller {
     }
 
     fn show_body(&self, id: i64) {
-        self.show_page(id, self.all_images_load(id) || self.sender_allowed());
+        self.show_page(id, self.all_images_load(id) || self.sender_allowed(id));
     }
 
-    /// Puts a message up at once. Any remote images it loads come in behind it.
+    /// Puts a message up. Most go up in the frame they were asked for, and any remote images come
+    /// in behind them. Cleaning hostile HTML can take a long time, so past a size where that could
+    /// be noticed it happens on a thread of its own, and the window carries on.
     fn show_page(&self, id: i64, load_images: bool) {
-        let raw = self.reader.body(id).ok().flatten();
         let render = if load_images { render::message_with_images } else { render::message };
-        let Some((raw, rendered)) = raw.and_then(|raw| render(&raw).map(|rendered| (raw, rendered))) else {
+        let Some(raw) = self.reader.body(id).ok().flatten() else {
+            return self.page_rendered(self.next_page(), id, load_images, Vec::new(), None);
+        };
+        let key = self.next_page();
+        if raw.len() <= RENDER_IN_PLACE {
+            let rendered = render(&raw);
+            return self.page_rendered(key, id, load_images, raw, rendered);
+        }
+        self.app.set_pane(Pane::Loading);
+        std::thread::spawn(move || {
+            let rendered = render(&raw);
+            on_ui_thread(move |this| this.page_rendered(key, id, load_images, raw, rendered));
+        });
+    }
+
+    /// A key for the page about to go up. Any page still being rendered is no longer wanted.
+    fn next_page(&self) -> u64 {
+        self.page_key.set(self.page_key.get() + 1);
+        self.page_key.get()
+    }
+
+    fn page_rendered(&self, key: u64, id: i64, load_images: bool, raw: Vec<u8>, rendered: Option<Rendered>) {
+        if key != self.page_key.get() {
+            return;
+        }
+        let Some(rendered) = rendered else {
             self.hide_page();
             self.app.set_pane(Pane::Failed);
             return;
@@ -1146,13 +1180,13 @@ impl Controller {
         let bar = match (rendered.remote_images.is_empty(), load_images) {
             (true, _) => ImageBar::Hidden,
             (false, false) => ImageBar::Blocked,
-            (false, true) if !self.all_images_load(id) && self.sender_allowed() => ImageBar::Allowed,
+            (false, true) if !self.all_images_load(id) && self.sender_allowed(id) => ImageBar::Allowed,
             (false, true) => ImageBar::Hidden,
         };
-        self.page_key.set(self.page_key.get() + 1);
+        self.app.set_can_always_load(self.trusted_row(id).is_some());
         self.page_images.replace(load_images.then(|| PageImages {
             page: self.images.page(),
-            key: self.page_key.get(),
+            key,
             urls: rendered.remote_images.clone(),
             failed: 0,
             arrived: false,
@@ -1162,21 +1196,36 @@ impl Controller {
 
     /// Takes the page away, along with whatever it was still waiting for.
     fn hide_page(&self) {
+        self.next_page();
         self.page_images.take();
         self.pane.hide();
     }
 
-    fn sender_allowed(&self) -> bool {
-        let sender = self.selected_sender.borrow();
-        self.open_account().is_some_and(|account| self.reader.images_allowed(account, &sender).unwrap_or(false))
+    /// The message of the open thread that is on show.
+    fn selected_row(&self) -> Option<MessageRow> {
+        let id = self.selected.get()?;
+        self.thread.borrow().iter().find(|m| m.id == id).cloned()
+    }
+
+    fn in_spam(&self, id: i64) -> bool {
+        let held = self.reader.message_labels(id).unwrap_or_default();
+        self.labels.borrow().iter().any(|l| l.role == Role::Spam && l.ids().iter().any(|id| held.contains(id)))
+    }
+
+    /// The message on show, if it can speak for its sender, which a forgery of them must not.
+    /// Spam is where a failed forgery ends up, so nothing there can.
+    fn trusted_row(&self, id: i64) -> Option<MessageRow> {
+        self.selected_row().filter(|m| m.id == id && m.verified && !self.in_spam(id))
+    }
+
+    fn sender_allowed(&self, id: i64) -> bool {
+        self.trusted_row(id).is_some_and(|m| self.reader.images_allowed(m.account_id, &m.from_addr).unwrap_or(false))
     }
 
     /// Images load without asking, except in Spam, where loading one tells a spammer the address
     /// is read. Searches reach Spam too, so this goes by the message and not by the list on show.
     fn all_images_load(&self, id: i64) -> bool {
-        let held = self.reader.message_labels(id).unwrap_or_default();
-        let spam = self.labels.borrow().iter().any(|l| l.role == Role::Spam && l.ids().iter().any(|id| held.contains(id)));
-        self.settings.get().show_all_images && !spam
+        self.settings.get().show_all_images && !self.in_spam(id)
     }
 
     /// Shows the selected message with its images, because the user asked for them.
@@ -1187,8 +1236,8 @@ impl Controller {
     }
 
     fn set_images_allowed(&self, allowed: bool) {
-        let Some(account) = self.open_account() else { return };
-        let saved = self.store.set_images_allowed(account, &self.selected_sender.borrow(), allowed);
+        let Some(message) = self.selected_row() else { return };
+        let saved = self.store.set_images_allowed(message.account_id, &message.from_addr, allowed);
         match (saved.is_ok(), allowed, self.selected.get()) {
             (true, true, _) => self.load_images(),
             (true, false, Some(id)) => self.show_body(id),
@@ -1235,10 +1284,9 @@ impl Controller {
         self.logos.forget(domain);
         self.list.logo_changed(domain);
         self.publish_accounts();
-        let sender = self.selected_sender.borrow();
-        if logo::sender_domain(&sender).as_deref() == Some(domain) {
+        if let Some(message) = self.selected_row().filter(|m| logo::sender_domain(&m.from_addr).as_deref() == Some(domain)) {
             let mut view = self.app.get_message();
-            view.logo = self.list.logo(&sender, HEADER_AVATAR);
+            view.logo = self.list.logo(&message, HEADER_AVATAR);
             self.app.set_message(view);
         }
     }
@@ -1249,7 +1297,7 @@ impl Controller {
         view.recipients = rendered.recipients.into();
         let files: Vec<FileItem> = compose::attachments(raw)
             .into_iter()
-            .map(|file| writing::file_item(file.name, file.data.len()))
+            .map(|file| writing::file_item(&file.name, file.data.len()))
             .collect();
         view.attachments = ModelRc::new(VecModel::from(files));
         match rendered.body {

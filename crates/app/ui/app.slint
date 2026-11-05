@@ -355,7 +355,8 @@ component AccountRow inherits Rectangle {
     animate background { duration: Theme.fast; }
 
     // The buttons sit inside this area, so the row stays hovered while the pointer is on them.
-    touch := Press {
+    touch := TipPress {
+        tip: root.item.email;
         clicked => { root.clicked(); }
         changed has-hover => {
             if (!self.has-hover) {
@@ -1075,6 +1076,8 @@ component BarAction inherits Rectangle {
 /// because fetching one tells the sender the mail was opened.
 component ImagesBar inherits Rectangle {
     in property <ImageBar> state;
+    /// Mail that may be a forgery cannot speak for its sender.
+    in property <bool> can-always;
     callback load();
     callback always();
     callback stop();
@@ -1105,7 +1108,7 @@ component ImagesBar inherits Rectangle {
                 clicked => { root.load(); }
             }
         }
-        if root.state == ImageBar.blocked: VerticalLayout {
+        if root.state == ImageBar.blocked && root.can-always: VerticalLayout {
             alignment: center;
             horizontal-stretch: 0;
             BarAction {
@@ -2513,7 +2516,7 @@ component SettingsScreen inherits Rectangle {
                         }
                         Toggle {
                             title: "Sender logos";
-                            hint: "Asks each sender's domain for its logo";
+                            hint: "Contacts the domains of genuine senders, which can see your IP address";
                             on <=> Theme.preferences.sender-logos;
                         }
                         Choosing {
@@ -2620,6 +2623,7 @@ export component App inherits Window {
     in-out property <int> selected-row: -1;
     in property <Pane> pane: Pane.empty;
     in property <ImageBar> image-bar: ImageBar.hidden;
+    in property <bool> can-always-load;
     in property <MessageView> message;
     /// The open thread's messages, and which is showing. One message needs no list.
     in property <[ThreadItem]> thread;
@@ -3279,6 +3283,7 @@ export component App inherits Window {
 
                         if root.pane != Pane.empty && root.image-bar != ImageBar.hidden: ImagesBar {
                             state: root.image-bar;
+                            can-always: root.can-always-load;
                             load => { root.load-images(); }
                             always => { root.always-load-images(); }
                             stop => { root.stop-loading-images(); }
@@ -3419,7 +3424,9 @@ export component App inherits Window {
         ]
 
         tip-text := Text {
-            width: parent.width - 16px;
+            // Wider than the text, as a box that only just fits it cuts off anything drawn wider
+            // than it measures.
+            width: parent.width - 8px;
             text: Tip.text;
             color: Theme.sheet;
             font-size: Theme.small;

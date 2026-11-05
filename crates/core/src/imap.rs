@@ -264,7 +264,7 @@ impl Imap {
         let mut fetched = self
             .fetch(&format!(
                 "UID FETCH {low}:{high} (UID FLAGS INTERNALDATE RFC822.SIZE{extra} \
-                 BODY.PEEK[HEADER.FIELDS (FROM SUBJECT MESSAGE-ID REFERENCES IN-REPLY-TO)])"
+                 BODY.PEEK[HEADER.FIELDS (FROM SUBJECT MESSAGE-ID REFERENCES IN-REPLY-TO AUTHENTICATION-RESULTS)])"
             ))
             .await?;
         // `n:*` always returns the last message, even when its UID is below n.

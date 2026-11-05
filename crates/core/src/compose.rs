@@ -10,6 +10,7 @@ use lettre::message::{Attachment as Part, Mailbox, Mailboxes, MessageBuilder, Mu
 use lettre::address::Envelope;
 use mail_parser::{MessageParser, MessageRef};
 
+use crate::oauth::percent_decode;
 use crate::render;
 
 /// Where what is being answered starts. Everything above it is the user's.
@@ -158,6 +159,29 @@ pub fn reply(raw: &[u8], own: &str, all: bool) -> Option<Compose> {
     })
 }
 
+/// A sender's name for a file as one safe to show and to save under: a bare name, with nothing
+/// in it that reads as something else or means something to Windows.
+pub fn safe_file_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    // Marks that change which way text runs, which can turn `fdp.exe` into what reads as `exe.pdf`.
+    let unseen = |c: char| {
+        c.is_control() || matches!(c, '\u{200e}' | '\u{200f}' | '\u{061c}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    };
+    let kept: String = base
+        .chars()
+        .filter(|&c| !unseen(c))
+        .map(|c| if matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+        .collect();
+    let kept = kept.trim_matches([' ', '.']);
+    let stem = kept.split('.').next().unwrap_or_default().to_ascii_uppercase();
+    let numbered = stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && stem.ends_with(|c: char| c.is_ascii_digit());
+    match kept {
+        "" => "Attachment".to_string(),
+        kept if numbered || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") => format!("_{kept}"),
+        kept => kept.to_string(),
+    }
+}
+
 /// A message's real attachments: files, rather than images its own HTML shows inline.
 pub fn attachments(raw: &[u8]) -> Vec<Attachment> {
     let Some(parsed) = MessageParser::default().parse(raw) else { return Vec::new() };
@@ -166,7 +190,7 @@ pub fn attachments(raw: &[u8]) -> Vec<Attachment> {
         .attachments()
         .filter(|p| !(p.is_inline() && p.content_id().is_some()))
         .map(|p| Attachment {
-            name: p.attachment_name().unwrap_or("Attachment").to_string(),
+            name: safe_file_name(p.attachment_name().unwrap_or_default()),
             mime: p.content_type().map_or_else(
                 || "application/octet-stream".to_string(),
                 |t| format!("{}/{}", t.ctype(), t.subtype().unwrap_or("octet-stream")),
@@ -229,6 +253,33 @@ pub fn forward(raw: &[u8]) -> Option<Compose> {
         html: quoting(&format!("{}<div><br></div>", text_to_html(header.trim_end())), &render::fragment(raw)),
         ..Compose::default()
     })
+}
+
+/// What a `mailto:` link asks to be written. Nothing else in it is honoured: other clients have
+/// been made to attach local files by a parameter like `attach`.
+pub fn from_mailto(url: &str) -> Option<Compose> {
+    let rest = url.get(..7).filter(|scheme| scheme.eq_ignore_ascii_case("mailto:")).map(|_| &url[7..])?;
+    let (to, query) = rest.split_once('?').unwrap_or((rest, ""));
+    // One line each, for the fields that have only one. The body keeps its own.
+    let line = |text: String| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut compose = Compose { to: line(percent_decode(to)), ..Compose::default() };
+    let mut body = String::new();
+    for (key, value) in query.split('&').filter_map(|pair| pair.split_once('=')) {
+        let value = percent_decode(value);
+        match key.to_ascii_lowercase().as_str() {
+            "to" if compose.to.is_empty() => compose.to = line(value),
+            "to" => compose.to = format!("{}, {}", compose.to, line(value)),
+            "cc" => compose.cc = line(value),
+            "subject" => compose.subject = line(value),
+            "body" => body = value.replace("\r\n", "\n"),
+            _ => {}
+        }
+    }
+    if !body.is_empty() {
+        compose.html = text_to_html(&body);
+        compose.body = body;
+    }
+    Some(compose)
 }
 
 /// A saved draft as fields again, for a draft written in another client.
@@ -394,6 +445,57 @@ Date: Wed, 04 Nov 2026 10:00:00 +0700\r\nContent-Type: text/plain; charset=utf-8
 
     fn me() -> Mailbox {
         "Me <me@example.com>".parse().unwrap()
+    }
+
+    #[test]
+    fn a_file_name_from_a_sender_is_only_a_name() {
+        for (sent, kept) in [
+            ("report.pdf", "report.pdf"),
+            ("Hóa đơn tháng 10.xlsx", "Hóa đơn tháng 10.xlsx"),
+            ("..\\..\\Startup\\a.exe", "a.exe"),
+            ("../../x.exe", "x.exe"),
+            ("C:\\Windows\\x.exe", "x.exe"),
+            ("a.txt:evil.exe", "a.txt_evil.exe"),
+            ("invoice\u{202e}fdp.exe", "invoicefdp.exe"),
+            ("a\u{2066}b\r\n.pdf", "ab.pdf"),
+            ("report.pdf. . ", "report.pdf"),
+            ("CON", "_CON"),
+            ("nul.txt", "_nul.txt"),
+            ("COM1.exe", "_COM1.exe"),
+            ("company.pdf", "company.pdf"),
+            ("COMA.pdf", "COMA.pdf"),
+            ("", "Attachment"),
+            ("..", "Attachment"),
+            ("dir/", "Attachment"),
+        ] {
+            assert_eq!(safe_file_name(sent), kept, "{sent:?}");
+        }
+    }
+
+    #[test]
+    fn attachments_arrive_with_safe_names() {
+        let raw = b"From: a@x.example\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
+--b\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename*=utf-8''..%5C..%5CStartup%5Ca.exe\r\n\r\nX\r\n--b--\r\n";
+        assert_eq!(attachments(raw)[0].name, "a.exe");
+        assert_eq!(render::message(raw).unwrap().attachments, ["a.exe"]);
+    }
+
+    #[test]
+    fn a_mailto_link_fills_in_what_it_may_and_nothing_else() {
+        let link = "mailto:a%40x.example?cc=b@x.example&Subject=Hi%20there%0D%0ABcc:%20evil@x.example&body=One%0D%0ATwo+three\
+                    &bcc=evil@x.example&attach=C:%5Csecret.txt&attachment=x";
+        let c = from_mailto(link).unwrap();
+        assert_eq!(c.to, "a@x.example");
+        assert_eq!(c.cc, "b@x.example");
+        assert_eq!(c.subject, "Hi there Bcc: evil@x.example");
+        assert_eq!(c.body, "One\nTwo+three");
+        assert_eq!(c.html, "<div>One</div><div>Two+three</div>");
+        assert_eq!(c.bcc, "");
+
+        assert_eq!(from_mailto("MAILTO:a@x.example").unwrap().to, "a@x.example");
+        assert_eq!(from_mailto("mailto:?to=a@x.example&to=b@x.example").unwrap().to, "a@x.example, b@x.example");
+        assert_eq!(from_mailto("mailto:a@x.example").unwrap().html, "");
+        assert_eq!(from_mailto("https://x.example"), None);
     }
 
     #[test]

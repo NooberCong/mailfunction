@@ -176,6 +176,7 @@ fn seed(dir: &std::path::Path) -> (Store, i64) {
             subject: format!("Lịch họp tuần sau và tài liệu cần chuẩn bị {i}"),
             from_name: format!("Nguyễn Thị Minh Anh {i}"),
             from_addr: format!("person{i}@example.vn"),
+            verified: true,
             date: 1_793_000_000 - i64::from(i) * 3600,
             size: 1000,
             // All read: an unread message rightly repaints its row once it counts as read, and

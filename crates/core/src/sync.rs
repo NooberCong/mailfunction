@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 
-use mail_parser::MessageParser;
+use mail_parser::{Message, MessageParser};
 use sha2::{Digest, Sha256};
 
 use crate::engine::Event;
@@ -23,6 +23,8 @@ use crate::{Error, Result};
 
 /// UIDs covered by one backfill request. Sparse folders simply return fewer messages.
 const BACKFILL_SPAN: u32 = 1000;
+/// The name Gmail signs its own authentication results with.
+const GMAIL_RESULTS: &str = "mx.google.com";
 
 /// The folders to mirror. On Gmail every message is in All Mail, or in Spam or Trash, and
 /// labels say the rest, so syncing the label folders too would only fetch duplicates.
@@ -64,6 +66,61 @@ fn gmail_labels(labels: &[String]) -> Vec<LabelSpec> {
         .collect()
 }
 
+/// An Authentication-Results value in its `;`-separated parts, without its comments or quoted
+/// strings, as those can hold text the sender chose. A quote that never closes hides the rest.
+fn statements(value: &str) -> Vec<String> {
+    let mut statements = vec![String::new()];
+    let (mut depth, mut quoted, mut escaped) = (0u32, false, false);
+    for c in value.chars() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if quoted || depth > 0 => escaped = true,
+            '"' => quoted = !quoted,
+            _ if quoted => {}
+            '(' => {
+                depth += 1;
+                statements.last_mut().expect("never empty").push(' ');
+            }
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth > 0 => {}
+            ';' => statements.push(String::new()),
+            c => statements.last_mut().expect("never empty").push(c),
+        }
+    }
+    statements
+}
+
+/// The value of `key=value` if this word is that, whatever the case of the key.
+fn value_of<'a>(word: &'a str, key: &str) -> Option<&'a str> {
+    let (name, value) = word.split_once('=')?;
+    name.eq_ignore_ascii_case(key).then_some(value)
+}
+
+/// Whether Gmail's results say DMARC passed for exactly this domain. Anything unclear is a no.
+fn dmarc_passed(results: &str, domain: &str) -> bool {
+    let statements = statements(results);
+    let Some((server, methods)) = statements.split_first() else { return false };
+    let first_word = |statement: &&String| statement.split_whitespace().next().and_then(|word| value_of(word, "dmarc")).is_some();
+    let mut verdicts = methods.iter().filter(first_word);
+    let (Some(verdict), None) = (verdicts.next(), verdicts.next()) else { return false };
+    let mut words = verdict.split_whitespace();
+    server.trim().eq_ignore_ascii_case(GMAIL_RESULTS)
+        && words.next().and_then(|word| value_of(word, "dmarc")).is_some_and(|result| result.eq_ignore_ascii_case("pass"))
+        && words.any(|word| value_of(word, "header.from").is_some_and(|from| from.eq_ignore_ascii_case(domain)))
+}
+
+/// Whether Gmail vouches for the one address this message is from. The domain it checked has to be
+/// the one on show, so it makes no difference how a From line was built to read two ways. Gmail
+/// puts its results above any the message arrived with, which anyone can write.
+fn gmail_vouches(message: &Message) -> bool {
+    let from = message.from();
+    let mut senders = from.iter().flat_map(|list| list.mailboxes());
+    let (Some(sender), None) = (senders.next(), senders.next()) else { return false };
+    let Some((_, domain)) = sender.address().and_then(|address| address.rsplit_once('@')) else { return false };
+    let results = message.headers().iter().find(|h| h.raw_name().eq_ignore_ascii_case("Authentication-Results"));
+    results.is_some_and(|h| dmarc_passed(&String::from_utf8_lossy(h.raw_value()), domain))
+}
+
 fn new_message(fetched: Fetched) -> NewMessage {
     let header = fetched.data.unwrap_or_default();
     let parsed = MessageParser::default().parse_headers(&header);
@@ -72,6 +129,8 @@ fn new_message(fetched: Fetched) -> NewMessage {
     let sender = parsed.and_then(|m| m.from()).and_then(|list| list.first());
     let from_name = sender.as_ref().and_then(|s| s.name()).unwrap_or_default().to_string();
     let from_addr = sender.as_ref().and_then(|s| s.address()).unwrap_or_default().to_string();
+    // Elsewhere the same header proves nothing, as no server is known to have written it.
+    let verified = fetched.gm_message_id.is_some() && parsed.is_some_and(gmail_vouches);
     let mid = parsed.and_then(|m| m.message_id()).map(str::to_string);
     let references = parsed.map_or_else(Vec::new, |m| {
         let replied_to = m.in_reply_to().into_iter().flat_map(|l| l.iter().collect::<Vec<_>>());
@@ -98,6 +157,7 @@ fn new_message(fetched: Fetched) -> NewMessage {
         subject,
         from_name,
         from_addr,
+        verified,
         date: fetched.date,
         size: fetched.size,
         seen: fetched.seen,
@@ -293,6 +353,63 @@ mod tests {
 
         let bare = Fetched { uid: 1, data: Some(b"Subject: x\r\n\r\n".to_vec()), ..Default::default() };
         assert!(new_message(bare).remote_id.starts_with("hash:"));
+    }
+
+    const PASS: &str = "mx.google.com;\r\n       dkim=pass header.i=@paypal.com header.s=a header.b=x;\r\n       \
+                        spf=pass (google.com: domain of b@paypal.com designates 1.2.3.4 as permitted sender) smtp.mailfrom=b@paypal.com;\r\n       \
+                        dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=paypal.com";
+
+    #[test]
+    fn only_a_clean_pass_for_exactly_this_domain_counts() {
+        assert!(dmarc_passed(PASS, "paypal.com"));
+        assert!(dmarc_passed(PASS, "PayPal.com"));
+        assert!(!dmarc_passed(PASS, "evil.example"));
+        assert!(!dmarc_passed(PASS, "pal.com"));
+        for not_a_pass in [
+            "",
+            "mx.google.com",
+            "mx.google.com; dkim=pass header.i=@paypal.com",
+            "mx.google.com; dmarc=fail (p=NONE) header.from=paypal.com",
+            "mx.google.com; dmarc=none header.from=paypal.com",
+            "mx.google.com; dmarc=pass header.from=paypal.com.evil.example",
+            "mx.google.com; dmarc=pass header.from=evil.example",
+            "mx.google.com; dmarc=pass",
+            "mx.evil.example; dmarc=pass header.from=paypal.com",
+            "mx.google.com.evil.example; dmarc=pass header.from=paypal.com",
+            // Text the sender chose, in the places Gmail repeats it.
+            "mx.google.com; spf=pass (domain of x; dmarc=pass header.from=paypal.com) smtp.mailfrom=x@evil.example",
+            "mx.google.com; spf=pass smtp.mailfrom=\"a;dmarc=pass header.from=paypal.com;\"@evil.example",
+            "mx.google.com; spf=pass (domain of \"x);dmarc=pass header.from=paypal.com;(\"@evil.example) smtp.mailfrom=x",
+            "mx.google.com; spf=pass (a \\) ; dmarc=pass header.from=paypal.com) smtp.mailfrom=x",
+            // Two verdicts cannot both be Gmail's.
+            "mx.google.com; dmarc=pass header.from=paypal.com; dmarc=fail header.from=paypal.com",
+        ] {
+            assert!(!dmarc_passed(not_a_pass, "paypal.com"), "{not_a_pass}");
+        }
+    }
+
+    fn vouched(headers: &str, gmail: bool) -> bool {
+        let data = Some(format!("{headers}Subject: x\r\n\r\n").into_bytes());
+        new_message(Fetched { uid: 1, gm_message_id: gmail.then_some(7), data, ..Default::default() }).verified
+    }
+
+    #[test]
+    fn gmail_vouches_only_for_the_one_address_on_show() {
+        let results = format!("Authentication-Results: {PASS}\r\n");
+        assert!(vouched(&format!("{results}From: PayPal <service@paypal.com>\r\n"), true));
+        assert!(!vouched(&format!("{results}From: PayPal <service@paypal.com>\r\n"), false), "not Gmail, so not Gmail's word");
+        assert!(!vouched("From: PayPal <service@paypal.com>\r\n", true), "no results at all");
+
+        // Forgeries built to read one way to Gmail and another to the app.
+        assert!(!vouched(&format!("{results}From: <service@paypal.com>, <evil@attacker.example>\r\n"), true));
+        assert!(!vouched(&format!("{results}From: <evil@attacker.example>\r\n"), true));
+        assert!(!vouched(&format!("{results}From: =?utf-8?B?c2VydmljZUBwYXlwYWwuY29t?=\r\n"), true));
+        let evil = "Authentication-Results: mx.google.com; dmarc=fail header.from=attacker.example\r\n";
+        assert!(!vouched(&format!("{evil}From: <evil@attacker.example>\r\nFrom: <service@paypal.com>\r\n"), true));
+
+        // Only the topmost counts. The one below it came with the mail.
+        assert!(!vouched(&format!("{evil}{results}From: <service@paypal.com>\r\n"), true));
+        assert!(vouched(&format!("{results}{evil}From: <service@paypal.com>\r\n"), true));
     }
 
     #[test]

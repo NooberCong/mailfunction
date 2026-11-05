@@ -4,8 +4,8 @@
 //! Sanitised HTML is served from an in-memory URL through the same interception hook that
 //! refuses everything else, so there is no size limit and the CSP is a real header. Remote images
 //! come through that hook too, each held open until the app has it, so the page never waits for
-//! them. Mail is hostile: scripts are off, nothing can reach the network, and links open in the
-//! browser.
+//! them. Mail is hostile: scripts are off, nothing can reach the network, links open in the
+//! browser, and `mailto:` links in the app's own composer.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
+use mailfunction_core::compose;
 use mailfunction_core::render::{CONTENT_SECURITY_POLICY, DOCUMENT_ORIGIN, image_index, image_type};
 use slint::{ComponentHandle, Timer, TimerMode};
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
@@ -61,10 +62,10 @@ pub(crate) fn out_of_sight((_, y, w, h): Bounds) -> Rect {
     rect((-w - 64.0, y, w, h))
 }
 
-/// Hands a clicked link to the default browser, for schemes that cannot touch local files.
+/// Hands a link to the default browser, for schemes that cannot touch local files.
 pub fn open_externally(url: &str) {
     let lower = url.to_ascii_lowercase();
-    if ["http:", "https:", "mailto:"].iter().any(|s| lower.starts_with(s)) {
+    if ["http:", "https:"].iter().any(|s| lower.starts_with(s)) {
         unsafe {
             ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL);
         }
@@ -393,7 +394,9 @@ fn lock_down(
         s.SetAreDefaultScriptDialogsEnabled(false)?;
         s.SetAreDefaultContextMenusEnabled(false)?;
         s.SetAreDevToolsEnabled(false)?;
-        s.SetIsStatusBarEnabled(false)?;
+        // The only way to see where a link goes before following it. The browser draws it, so
+        // the page can neither hide it nor change what it says.
+        s.SetIsStatusBarEnabled(true)?;
         s.cast::<ICoreWebView2Settings3>()?.SetAreBrowserAcceleratorKeysEnabled(false)?;
         let s4 = s.cast::<ICoreWebView2Settings4>()?;
         s4.SetIsPasswordAutosaveEnabled(false)?;
@@ -419,7 +422,10 @@ fn lock_down(
                     let mut by_user = BOOL::default();
                     args.IsUserInitiated(&mut by_user)?;
                     if by_user.as_bool() {
-                        open_externally(&uri);
+                        match compose::from_mailto(&uri) {
+                            Some(fields) => on_ui_thread(move |this| this.compose_to(fields)),
+                            None => open_externally(&uri),
+                        }
                     }
                     cancelled.cancelled_navigations.borrow_mut().push(uri);
                 }

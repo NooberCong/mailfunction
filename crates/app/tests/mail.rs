@@ -136,6 +136,7 @@ fn scene() -> (Scene, std::path::PathBuf) {
             subject: m.subject.into(),
             from_name: m.from.0.into(),
             from_addr: m.from.1.into(),
+            verified: true,
             date: NOW - m.hours_ago * 3600,
             size: 1000,
             seen: m.seen,
@@ -362,6 +363,11 @@ fn tips_and_mark_all(s: &Scene) {
     press(app, "j");
     assert_ne!(app.get_pane(), Pane::Empty);
 
+    // An address too long for the sidebar can still be read whole.
+    assert_eq!(hover(app, 100.0, 656.0), "kong@example.com");
+    shot(app, "25-account-tip");
+    hover(app, 800.0, 500.0);
+
     // Icons say what they are, and the key, and nothing is written beside the buttons any more.
     assert_eq!(hover(app, 625.0, 28.0), "Reply (r)");
     assert_eq!(hover(app, 1066.0, 28.0), "Star (s)");
@@ -444,6 +450,7 @@ fn writing(s: &Scene) {
         subject: "From the web".into(),
         from_name: "".into(),
         from_addr: "kong@example.com".into(),
+        verified: true,
         date: NOW,
         size: 100,
         seen: true,
@@ -709,6 +716,7 @@ fn all_accounts(s: &Scene) {
         subject: subject.into(),
         from_name: "Priya Shah".into(),
         from_addr: "priya@work.example".into(),
+        verified: true,
         date: NOW - hours_ago * 3600,
         size: 1000,
         seen: false,

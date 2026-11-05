@@ -2,6 +2,7 @@
 //! hostile mail: an allowlist sanitiser here, then a CSP header, then a webview that has
 //! scripts off and answers every network request itself.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +38,11 @@ const SHEET: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><style>\
     @media (prefers-reduced-motion:reduce){body{animation:none}}\
     </style></head><body>";
 
+/// Past this many tags a message shows as text. Parsing takes time on the square of how deep the
+/// tags go, so 100,000 take 18 seconds and a mail of ordinary size can take hours. No real mail
+/// comes near it, and nesting needs a `<` at every level, so counting them cannot be got around.
+const MOST_TAGS: usize = 32_000;
+
 /// Inline images larger than this are dropped rather than embedded in the page.
 pub(crate) const MAX_INLINE_IMAGE: usize = 8 * 1024 * 1024;
 
@@ -68,11 +74,16 @@ pub fn message_with_images(raw: &[u8]) -> Option<Rendered> {
     rendered(raw, true)
 }
 
+/// The HTML to show for a message, if it has any that can be cleaned in reasonable time.
+fn showable_html(message: MessageRef) -> Option<Cow<str>> {
+    message.html_body().find(|p| matches!(p.kind(), PartKind::Html))?;
+    message.body_html(0).filter(|html| html.bytes().filter(|&b| b == b'<').count() <= MOST_TAGS)
+}
+
 fn rendered(raw: &[u8], load_images: bool) -> Option<Rendered> {
     let parsed = MessageParser::default().parse(raw)?;
     let message = parsed.root();
-    let html = message.html_body().find(|p| matches!(p.kind(), PartKind::Html));
-    let (body, remote_images) = match html.and_then(|_| message.body_html(0)) {
+    let (body, remote_images) = match showable_html(message) {
         Some(html) => {
             let (document, remote) = sanitise(&html, &inline_images(message), load_images);
             (Body::Html(document), remote)
@@ -91,7 +102,7 @@ fn rendered(raw: &[u8], load_images: bool) -> Option<Rendered> {
     let attachments = message
         .attachments()
         .filter(|p| !(p.is_inline() && p.content_id().is_some()))
-        .map(|p| p.attachment_name().unwrap_or("Attachment").to_string())
+        .map(|p| crate::compose::safe_file_name(p.attachment_name().unwrap_or_default()))
         .collect();
     Some(Rendered { body, recipients, attachments, remote_images })
 }
@@ -146,8 +157,7 @@ fn is_safe_data_image(value: &str) -> bool {
 pub fn fragment(raw: &[u8]) -> String {
     let Some(parsed) = MessageParser::default().parse(raw) else { return String::new() };
     let message = parsed.root();
-    let html = message.html_body().find(|p| matches!(p.kind(), PartKind::Html));
-    match html.and_then(|_| message.body_html(0)) {
+    match showable_html(message) {
         Some(html) => clean(&html, &inline_images(message), false).0,
         None => crate::compose::text_to_html(&message.body_text(0).unwrap_or_default()),
     }
@@ -378,6 +388,21 @@ Subject: x\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n\
         let raw = b"From: a@example.com\r\nSubject: x\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHello <b>there</b>\r\n";
         let rendered = message(raw).unwrap();
         assert_eq!(rendered.body, Body::Text("Hello <b>there</b>\r\n".into()));
+    }
+
+    #[test]
+    fn mail_too_deep_to_clean_in_time_shows_as_text_at_once() {
+        let html = format!("{}Hello", "<div>".repeat(MOST_TAGS + 1));
+        let raw = format!("From: a@example.com\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html}\r\n");
+        let started = std::time::Instant::now();
+        let rendered = message(raw.as_bytes()).unwrap();
+        let quoted = fragment(raw.as_bytes());
+        assert!(started.elapsed() < std::time::Duration::from_millis(500), "{:?}", started.elapsed());
+        assert!(matches!(rendered.body, Body::Text(text) if text.contains("Hello")));
+        assert!(quoted.contains("Hello") && !quoted.contains("<div><div>"), "{quoted}");
+
+        let raw = format!("From: a@example.com\r\nContent-Type: text/html\r\n\r\n{}\r\n", "<p>x</p>".repeat(MOST_TAGS / 2 - 1));
+        assert!(matches!(message(raw.as_bytes()).unwrap().body, Body::Html(_)), "a long mail is still HTML");
     }
 
     #[test]

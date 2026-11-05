@@ -20,10 +20,14 @@ use mailfunction_core::settings::Settings;
 use mailfunction_core::store::{Account, AuthKind, LabelSpec, NewMessage, Reader, Role, Security, Store};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::{ComponentHandle, Model};
-use windows::Win32::Foundation::{HWND, RECT};
+use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_12;
+use webview2_com::{CallDevToolsProtocolMethodCompletedHandler, StatusBarTextChangedEventHandler, take_pwstr};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
-use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetClientRect, GetWindowThreadProcessId, IsWindowVisible};
+use windows::core::{BOOL, HSTRING, Interface, PWSTR, w};
+use wry::WebViewExtWindows;
 
 const RED_DOT: &[u8] = b"GIF89a\x01\0\x01\0\x80\0\0\xff\0\0\xff\0\0,\0\0\0\0\x01\0\x01\0\0\x02\x02D\x01\0;";
 const IMAGE_TIME: Duration = Duration::from_millis(1500);
@@ -90,11 +94,15 @@ async fn until(what: &str, mut ready: impl FnMut() -> bool) -> Duration {
     started.elapsed()
 }
 
-/// The window's whole client area, webview included, as blue, green, red and a spare byte.
-fn client_pixels(app: &App) -> (i32, i32, Vec<u8>) {
+fn window(app: &App) -> HWND {
     let handle = app.window().window_handle();
     let RawWindowHandle::Win32(handle) = handle.window_handle().unwrap().as_raw() else { panic!("not Win32") };
-    let hwnd = HWND(handle.hwnd.get() as _);
+    HWND(handle.hwnd.get() as _)
+}
+
+/// The window's whole client area, webview included, as blue, green, red and a spare byte.
+fn client_pixels(app: &App) -> (i32, i32, Vec<u8>) {
+    let hwnd = window(app);
     unsafe {
         let mut client = RECT::default();
         GetClientRect(hwnd, &mut client).unwrap();
@@ -149,6 +157,7 @@ fn mail(uid: u32, subject: &str) -> NewMessage {
         subject: subject.into(),
         from_name: "Brand".into(),
         from_addr: "news@brand.example".into(),
+        verified: true,
         date: 1_793_000_000 - i64::from(uid) * 3600,
         size: 100,
         seen: true,
@@ -178,6 +187,58 @@ fn sneaky(port: u16) -> Vec<u8> {
          <img src=\"https://images.example/sneaky.gif\">\r\n"
     )
     .into_bytes()
+}
+
+/// Mail built to take a long time to clean: `depth` tags, each inside the last.
+fn nested(depth: usize) -> Vec<u8> {
+    let tags = "<div>".repeat(depth);
+    format!("From: a@example.com\r\nSubject: x\r\nContent-Type: text/html\r\n\r\n{tags}Deep down\r\n").into_bytes()
+}
+
+/// One link to write to, and under it one to look at. The second is never clicked, as a real
+/// browser would open.
+const LINKS: &[u8] = b"From: a@example.com\r\nSubject: x\r\nContent-Type: text/html\r\n\r\n\
+    <a href=\"mailto:ann@example.com?subject=Hi&attach=C:%5Csecret.txt\" style=\"display:block;height:120px;background:#ddd\">Write</a>\
+    <a href=\"https://hover.example/where-it-goes\" style=\"display:block;height:120px;background:#bbb\">Look</a>\r\n";
+
+/// Puts a mouse event into this one page through the browser's own input path, so that nothing
+/// reaches the desktop.
+fn mouse(view: &Webview, kind: &str, button: &str, (x, y): (i32, i32)) {
+    let event = HSTRING::from(format!(r#"{{"type":"{kind}","x":{x},"y":{y},"button":"{button}","clickCount":1}}"#));
+    let done = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(|_, _| Ok(())));
+    let sent = view.with_view(|view| unsafe { view.webview().CallDevToolsProtocolMethod(w!("Input.dispatchMouseEvent"), &event, &done) });
+    sent.unwrap().unwrap();
+}
+
+/// What the browser's status bubble says, as it changes.
+fn status_text(view: &Webview) -> Rc<RefCell<String>> {
+    let said = Rc::new(RefCell::new(String::new()));
+    let keeps = said.clone();
+    let handler = StatusBarTextChangedEventHandler::create(Box::new(move |sender, _| {
+        let mut text = PWSTR::null();
+        unsafe { sender.unwrap().cast::<ICoreWebView2_12>()?.StatusBarText(&mut text)? };
+        *keeps.borrow_mut() = take_pwstr(text);
+        Ok(())
+    }));
+    let mut token = Default::default();
+    view.with_view(|view| unsafe { view.webview().cast::<ICoreWebView2_12>().unwrap().add_StatusBarTextChanged(&handler, &mut token).unwrap() });
+    said
+}
+
+/// Whether the status bubble is up. It is a window of the browser's own, outside the app's, and
+/// the only one that is visible.
+fn bubble_on_show(view: &Webview) -> bool {
+    unsafe extern "system" fn each(hwnd: HWND, found: LPARAM) -> BOOL {
+        let found = unsafe { &mut *(found.0 as *mut (u32, bool)) };
+        let mut owner = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut owner)) };
+        found.1 |= owner == found.0 && unsafe { IsWindowVisible(hwnd) }.as_bool();
+        true.into()
+    }
+    let mut found = (0, false);
+    view.with_view(|view| unsafe { view.webview().BrowserProcessId(&mut found.0).unwrap() });
+    let _ = unsafe { EnumWindows(Some(each), LPARAM(&raw mut found as isize)) };
+    found.1
 }
 
 /// Counts the connections made to it. Any at all means a page reached the network.
@@ -263,6 +324,58 @@ async fn scenario(app: App, controller: Rc<Controller>, view: Rc<Webview>, web: 
     assert_eq!(view.activity.image_requests.get(), images_before + 1, "the page's own request never came");
     assert_eq!(web.asked(), asked, "a blocked page reached the web");
     assert_eq!(hits.load(Ordering::SeqCst), 0, "a page reached the network");
+
+    println!("a mail built to take a long time to clean");
+    let started = Instant::now();
+    controller.select_row(row(&app, "Slow to clean"));
+    assert_eq!(app.get_pane(), Pane::Loading);
+    let mut longest = Duration::ZERO;
+    while app.get_pane() != Pane::Html {
+        let tick = Instant::now();
+        sleep(10).await;
+        longest = longest.max(tick.elapsed());
+        assert!(started.elapsed() < Duration::from_secs(120), "it never came");
+    }
+    let took = started.elapsed();
+    println!("  up after {took:?}, and the window went {longest:?} at most without a turn");
+    assert!(took > Duration::from_millis(200), "too quick to prove anything: {took:?}");
+    assert!(longest < Duration::from_millis(250), "the window stopped for {longest:?}");
+
+    println!("left before it was clean");
+    open("Plain page", "another page").await;
+    sleep(500).await;
+    let loaded = view.activity.loaded.get();
+    controller.select_row(row(&app, "Slow to clean"));
+    controller.select_row(row(&app, "Plain page"));
+    until("the page that was wanted", || app.get_pane() == Pane::Html).await;
+    sleep(u64::try_from(took.as_millis()).unwrap() * 2).await;
+    assert_eq!(view.activity.loaded.get(), loaded + 1, "a page nobody wanted went up");
+    assert_eq!(app.get_pane(), Pane::Html);
+
+    println!("a mail too deep to clean at all");
+    controller.select_row(row(&app, "Too deep"));
+    let text = until("its text", || app.get_pane() == Pane::Text).await;
+    assert!(text < OPENS_WITHIN, "it took {text:?}");
+    assert!(app.get_message().text.contains("Deep down"));
+
+    println!("following a mailto link, and looking at where another goes");
+    open("Links", "page up").await;
+    sleep(1000).await;
+    let (write, look) = ((40, 60), (40, 180));
+    let said = status_text(&view);
+    assert!(!bubble_on_show(&view));
+    mouse(&view, "mouseMoved", "none", look);
+    until("the link's address", || said.borrow().contains("hover.example")).await;
+    until("the bubble that shows it", || bubble_on_show(&view)).await;
+    mouse(&view, "mouseMoved", "none", write);
+    sleep(200).await;
+    mouse(&view, "mousePressed", "left", write);
+    mouse(&view, "mouseReleased", "left", write);
+    until("the composer", || app.get_composing()).await;
+    assert_eq!((app.get_draft_to().as_str(), app.get_draft_subject().as_str()), ("ann@example.com", "Hi"));
+    assert_eq!(app.get_draft_files().row_count(), 0, "the link attached something");
+    assert!(view.activity.cancelled_navigations.borrow().iter().any(|url| url.starts_with("mailto:")));
+    controller.finish_writing();
 }
 
 fn main() {
@@ -286,11 +399,12 @@ fn main() {
     let (port, hits) = canary();
     let plain = b"From: a@example.com\r\nSubject: x\r\nContent-Type: text/html\r\n\r\n<p>Plain</p>\r\n".to_vec();
     let bodies =
-        [("Warm up", plain.clone()), ("Plain page", plain), ("Fresh", newsletter("fresh")), ("Left", newsletter("left")), ("Gone", newsletter("gone")), ("Sneaky", sneaky(port))];
+        [("Warm up", plain.clone()), ("Plain page", plain), ("Fresh", newsletter("fresh")), ("Left", newsletter("left")), ("Gone", newsletter("gone")), ("Sneaky", sneaky(port)),
+         ("Slow to clean", nested(16_000)), ("Too deep", nested(400_000)), ("Links", LINKS.to_vec())];
     let messages: Vec<NewMessage> = bodies.iter().zip(1..).map(|((subject, _), uid)| mail(uid, subject)).collect();
     store.save_messages(&inbox, &messages).unwrap();
     let reader = Reader::open(&dir).unwrap();
-    for row in reader.messages(&[inbox.label_id], 0, 10).unwrap() {
+    for row in reader.messages(&[inbox.label_id], 0, 20).unwrap() {
         let (_, raw) = bodies.iter().find(|(subject, _)| *subject == row.subject).unwrap();
         store.save_body(row.id, raw).unwrap();
     }

@@ -57,6 +57,7 @@ fn message(uid: u32, thread: u64, date: i64) -> NewMessage {
         subject: format!("Subject {uid}"),
         from_name: "Ann".into(),
         from_addr: "ann@example.com".into(),
+        verified: false,
         date,
         size: 100,
         seen: false,
@@ -586,5 +587,51 @@ fn a_store_from_before_the_queue_migrates_with_its_mail() {
     assert_eq!(reader.settings(), Settings::default());
     assert_eq!(reader.identity(account.id).unwrap(), Identity::default());
     drop((store, reader));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Whether these words are anywhere in the store's files, as anyone with a disk tool would see.
+fn on_disk(dir: &std::path::Path, words: &[u8]) -> Vec<String> {
+    let files = std::fs::read_dir(dir).unwrap().flatten();
+    let found = files.filter(|file| std::fs::read(file.path()).unwrap().windows(words.len()).any(|w| w == words));
+    found.map(|file| file.file_name().to_string_lossy().into_owned()).collect()
+}
+
+#[test]
+fn a_removed_account_leaves_no_mail_in_the_files() {
+    let dir = std::env::temp_dir().join(format!("mailfunction-erased-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Store::open(&dir).unwrap();
+    let account = store
+        .add_account(&Account {
+            id: 0,
+            email: "me@example.com".into(),
+            host: "localhost".into(),
+            port: 993,
+            security: Security::Tls,
+            auth: AuthKind::Password,
+            smtp_host: "localhost".into(),
+            smtp_port: 465,
+        })
+        .unwrap();
+    let inbox = store.folder(account, "INBOX", &LabelSpec::system(Role::Inbox)).unwrap();
+    let mut mail = message(1, 1, 10);
+    mail.subject = "Xylophonesubject".into();
+    mail.from_name = "Xylophonesender".into();
+    let id = store.save_messages(&inbox, &[mail]).unwrap()[0];
+    let raw = "From: a@example.com\r\nSubject: x\r\n\r\nXylophonebody and more\r\n";
+    store.save_body(id, raw.as_bytes()).unwrap();
+    let reader = Reader::open(&dir).unwrap();
+    assert_eq!(reader.search(account, "xylophonesubject", 10).unwrap().len(), 1);
+    for word in [&b"Xylophonesubject"[..], b"xylophonesender", b"xylophonebody"] {
+        assert!(!on_disk(&dir, word).is_empty(), "{} was never there to remove", String::from_utf8_lossy(word));
+    }
+
+    store.remove_account(account).unwrap();
+    // Closing the last connection folds the log into the databases, as ending the app would.
+    drop((store, reader));
+    for word in [&b"Xylophonesubject"[..], b"xylophonesubject", b"xylophonesender", b"xylophonebody"] {
+        assert_eq!(on_disk(&dir, word), Vec::<String>::new(), "{} is still on disk", String::from_utf8_lossy(word));
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

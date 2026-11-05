@@ -28,7 +28,14 @@ struct Script {
 }
 
 fn fetch_line(seq: u32, uid: u32, labels: &str, flags: &str, subject: &str) -> String {
-    let header = format!("From: An <an@example.com>\r\nSubject: {subject}\r\nMessage-ID: <{uid}@x>\r\n\r\n");
+    // Message 1 is genuine, and message 2 brought a verdict of its own for Gmail's to sit above.
+    let results = match uid {
+        1 => "Authentication-Results: mx.google.com;\r\n       dkim=pass header.i=@example.com;\r\n       \
+              dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=example.com\r\n",
+        _ => "Authentication-Results: mx.google.com;\r\n       dmarc=fail (p=NONE) header.from=example.com\r\n\
+              Authentication-Results: mx.google.com; dmarc=pass header.from=example.com\r\n",
+    };
+    let header = format!("{results}From: An <an@example.com>\r\nSubject: {subject}\r\nMessage-ID: <{uid}@x>\r\n\r\n");
     format!(
         "* {seq} FETCH (X-GM-THRID {} X-GM-MSGID {} X-GM-LABELS ({labels}) UID {uid} MODSEQ (100) \
          FLAGS ({flags}) INTERNALDATE \"04-Nov-2026 10:00:0{uid} +0700\" RFC822.SIZE 500 \
@@ -216,6 +223,56 @@ async fn gmail_labels_ids_and_folders_map_onto_the_store() {
 
 /// What Gmail's write commands look like. Nothing here can prove Gmail accepts them, which only
 /// a real account can do, but it pins exactly what goes on the wire.
+/// Mail synced before the app kept Gmail's verdict goes round again to learn it, in full, on a
+/// real socket, through the real migration, and nothing else about it changes.
+#[tokio::test]
+async fn mail_already_here_learns_its_verdict_after_the_migration() {
+    let (port, _script) = start_server().await;
+    let dir = std::env::temp_dir().join(format!("mailfunction-verdict-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Store::open(&dir).unwrap();
+    let mut account = Account {
+        id: 0,
+        email: "me@gmail.com".into(),
+        host: "127.0.0.1".into(),
+        port,
+        security: Security::Plain,
+        auth: AuthKind::Password,
+        smtp_host: "localhost".into(),
+        smtp_port: 25,
+    };
+    account.id = store.add_account(&account).unwrap();
+    let credential = Credential::Password("x".into());
+    let mut imap = Imap::connect(&account, &credential).await.unwrap();
+    sync_account(&mut imap, &store, account.id, |_| {}).await.unwrap();
+
+    let verdicts = |reader: &Reader| {
+        let all = reader.labels(account.id).unwrap().into_iter().find(|l| l.name == "All Mail").unwrap().id;
+        let rows = reader.messages(&[all], 0, 10).unwrap();
+        rows.into_iter().map(|m| (m.subject, m.verified)).collect::<Vec<_>>()
+    };
+    let learned = vec![("Second".to_string(), false), ("First".to_string(), true)];
+    assert_eq!(verdicts(&Reader::open(&dir).unwrap()), learned, "Gmail's topmost verdict is the one that counts");
+
+    // Back to how the last version left it.
+    drop(store);
+    let conn = rusqlite::Connection::open(dir.join("meta.db")).unwrap();
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    conn.execute_batch(&format!("ALTER TABLE message DROP COLUMN verified; PRAGMA user_version = {}", version - 1)).unwrap();
+    drop(conn);
+
+    let store = Store::open(&dir).unwrap();
+    let reader = Reader::open(&dir).unwrap();
+    assert_eq!(verdicts(&reader), [("Second".to_string(), false), ("First".to_string(), false)], "nothing is believed yet");
+    let mut imap = Imap::connect(&account, &credential).await.unwrap();
+    sync_account(&mut imap, &store, account.id, |_| {}).await.unwrap();
+    assert_eq!(verdicts(&reader), learned);
+    assert_eq!(reader.labels(account.id).unwrap().iter().filter(|l| l.name == "Receipts").count(), 1);
+
+    drop((store, reader));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn actions_reach_gmail_as_flags_labels_and_moves() {
     let (port, script) = start_server().await;

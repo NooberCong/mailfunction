@@ -187,6 +187,10 @@ const MIGRATIONS: &[&str] = &["
         id INTEGER PRIMARY KEY CHECK (id = 1),
         json TEXT NOT NULL
     );
+", "
+    -- Whether the server vouches for the From line. Mail already here goes round again to learn it.
+    ALTER TABLE message ADD COLUMN verified INTEGER NOT NULL DEFAULT 0;
+    UPDATE folder SET backfill_uid = next_uid;
 "];
 
 /// The migration that added search. Bodies stored before it are indexed once, on opening.
@@ -352,6 +356,8 @@ pub struct NewMessage {
     pub subject: String,
     pub from_name: String,
     pub from_addr: String,
+    /// The server has established that this really came from `from_addr`'s domain.
+    pub verified: bool,
     pub date: i64,
     pub size: u32,
     pub seen: bool,
@@ -405,6 +411,8 @@ pub struct MessageRow {
     pub thread_id: i64,
     pub from_name: String,
     pub from_addr: String,
+    /// Anyone can write a From line, so only this says it can be believed.
+    pub verified: bool,
     pub subject: String,
     pub date: i64,
     /// In a list these two speak for the thread: read only if all of it is, and starred if any
@@ -431,6 +439,8 @@ fn configure(conn: &Connection, dir: &Path, cache_kib: i64) -> Result<()> {
          PRAGMA synchronous = NORMAL;
          PRAGMA bodies.synchronous = NORMAL;
          PRAGMA foreign_keys = ON;
+         PRAGMA secure_delete = ON;
+         PRAGMA bodies.secure_delete = ON;
          PRAGMA cache_size = -{cache_kib};"
     ))?;
     Ok(())
@@ -520,6 +530,8 @@ impl Store {
             tx.execute("DELETE FROM account WHERE id = ?1", [account_id])?;
             // Logos are shared between accounts, but the last one out leaves no trace of who wrote.
             tx.execute("DELETE FROM logo WHERE NOT EXISTS (SELECT 1 FROM account)", [])?;
+            // The index only hides what is deleted until its segments are merged.
+            tx.execute("INSERT INTO fts (fts) VALUES ('optimize')", [])?;
             Ok(())
         })
     }
@@ -611,10 +623,10 @@ impl Store {
                 threads.extend(known.flatten());
                 tx.execute(
                     "INSERT INTO message
-                       (account_id, remote_id, thread_id, subject, from_name, from_addr, date, size, seen, flagged, mid)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                       (account_id, remote_id, thread_id, subject, from_name, from_addr, date, size, seen, flagged, mid, verified)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                      ON CONFLICT (account_id, remote_id) DO UPDATE
-                     SET seen = ?9, flagged = ?10, thread_id = coalesce(?3, thread_id), mid = coalesce(?11, mid)",
+                     SET seen = ?9, flagged = ?10, thread_id = coalesce(?3, thread_id), mid = coalesce(?11, mid), verified = ?12",
                     params![
                         account,
                         m.remote_id,
@@ -627,6 +639,7 @@ impl Store {
                         m.seen,
                         m.flagged,
                         m.mid,
+                        m.verified,
                     ],
                 )?;
                 let (id, thread): (i64, Option<i64>) = tx.query_row(
@@ -1015,7 +1028,7 @@ static THREAD_COLUMNS: LazyLock<String> = LazyLock::new(|| {
          coalesce((SELECT min(t.seen) {peers}), m.seen),
          coalesce((SELECT max(t.flagged) {peers}), m.flagged),
          (SELECT count(*) {peers}),
-         m.account_id"
+         m.account_id, m.verified"
     )
 });
 
@@ -1031,6 +1044,7 @@ fn thread_row(r: &Row) -> rusqlite::Result<MessageRow> {
         flagged: r.get(7)?,
         count: r.get(8)?,
         account_id: r.get(9)?,
+        verified: r.get(10)?,
     })
 }
 
@@ -1115,7 +1129,7 @@ impl Reader {
     /// Those of `ids` that are unread in the Inbox, newest first.
     pub fn unread_in_inbox(&self, ids: &[i64]) -> Result<Vec<MessageRow>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT m.id, m.thread_id, m.from_name, m.from_addr, m.subject, m.date, m.seen, m.flagged, 1, m.account_id FROM message m
+            "SELECT m.id, m.thread_id, m.from_name, m.from_addr, m.subject, m.date, m.seen, m.flagged, 1, m.account_id, m.verified FROM message m
              WHERE m.id = ?1 AND m.seen = 0 AND EXISTS (
                  SELECT 1 FROM message_label ml JOIN label l ON l.id = ml.label_id
                  WHERE ml.message_id = m.id AND l.role = 'inbox')",
@@ -1268,7 +1282,7 @@ impl Reader {
     /// Trash or Spam instead of the rest, because a thread can be split between the two.
     pub fn thread(&self, account_id: i64, thread_id: i64, binned: bool) -> Result<Vec<MessageRow>> {
         let mut stmt = self.conn.prepare_cached(&format!(
-            "SELECT t.id, t.thread_id, t.from_name, t.from_addr, t.subject, t.date, t.seen, t.flagged, 1, t.account_id
+            "SELECT t.id, t.thread_id, t.from_name, t.from_addr, t.subject, t.date, t.seen, t.flagged, 1, t.account_id, t.verified
              FROM message t INDEXED BY message_thread
              WHERE t.account_id = ?1 AND t.thread_id = ?2 AND {READABLE} AND {IN_BIN} = ?3
              ORDER BY t.date, t.id"
@@ -1471,6 +1485,7 @@ mod tests {
             subject: format!("Subject {uid}"),
             from_name: "Ann".into(),
             from_addr: "ann@example.com".into(),
+            verified: false,
             date,
             size: 100,
             seen: false,

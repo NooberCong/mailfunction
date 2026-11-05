@@ -15,6 +15,7 @@ use crate::{Error, Result};
 
 const SCOPE: &str = "https://mail.google.com/ openid email profile";
 const USER_INFO: &str = "https://openidconnect.googleapis.com/v1/userinfo";
+const REVOKE: &str = "https://oauth2.googleapis.com/revoke";
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
@@ -93,6 +94,11 @@ fn encode(s: &str) -> String {
 }
 
 fn decode(s: &str) -> String {
+    percent_decode(&s.replace('+', " "))
+}
+
+/// Undoes `%XX`, keeping anything that is not one as it stands.
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -104,7 +110,7 @@ fn decode(s: &str) -> String {
                 i += 3;
             }
             None => {
-                out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+                out.push(bytes[i]);
                 i += 1;
             }
         }
@@ -249,6 +255,17 @@ fn picture_from(url: &str, access_token: &str) -> Result<Option<String>> {
     let mut response = agent.get(url).header("Authorization", format!("Bearer {access_token}")).call()?;
     let info: UserInfo = response.body_mut().read_json()?;
     Ok(info.picture.filter(|p| p.starts_with("https://")))
+}
+
+/// Ends the grant behind a refresh token at Google, so that a copy of it is worth nothing.
+pub fn revoke(refresh_token: &str) -> Result<()> {
+    revoke_at(REVOKE, refresh_token)
+}
+
+fn revoke_at(url: &str, refresh_token: &str) -> Result<()> {
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15))).build().into();
+    agent.post(url).send_form([("token", refresh_token)])?;
+    Ok(())
 }
 
 pub fn refresh(client: &Client, refresh_token: &str) -> Result<AccessToken> {
@@ -418,6 +435,22 @@ mod tests {
         let (url, _form) = token_server("503 Service Unavailable", "busy".into());
         let error = refresh(&client(url), "r").unwrap_err();
         assert!(matches!(error, Error::Protocol(_)), "an outage must not ask the user to sign in");
+    }
+
+    #[test]
+    fn revoking_sends_the_token_and_a_refusal_is_reported() {
+        let (url, form) = token_server("200 OK", "{}".into());
+        revoke_at(&url, "1//secret").unwrap();
+        assert_eq!(query_value(&form.recv().unwrap(), "token").unwrap(), "1//secret");
+
+        let (url, _form) = token_server("400 Bad Request", r#"{"error":"invalid_token"}"#.into());
+        assert!(revoke_at(&url, "gone").is_err());
+    }
+
+    #[test]
+    fn a_plus_is_a_space_in_a_form_and_only_there() {
+        assert_eq!(decode("a+b%2Bc"), "a b+c");
+        assert_eq!(percent_decode("a+b%2Bc%zz"), "a+b+c%zz");
     }
 
     #[test]

@@ -66,6 +66,7 @@ fn mail(uid: u32, subject: &str, from: &str, hours_ago: i64, labels: Vec<LabelSp
         subject: subject.into(),
         from_name: "Someone".into(),
         from_addr: from.into(),
+        verified: true,
         date: 1_793_000_000 - hours_ago * 3600,
         size: 100,
         seen: false,

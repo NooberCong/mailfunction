@@ -67,6 +67,7 @@ fn is_public(ip: IpAddr) -> bool {
 fn is_public_v4(ip: Ipv4Addr) -> bool {
     let [a, b, ..] = ip.octets();
     let shared = a == 100 && (64..128).contains(&b);
+    let benchmarking = a == 198 && (18..20).contains(&b);
     !(ip.is_private()
         || ip.is_loopback()
         || ip.is_link_local()
@@ -75,15 +76,26 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
         || ip.is_unspecified()
         || ip.is_documentation()
         || shared
+        || benchmarking
         || a == 0
         || a >= 240)
 }
 
 fn is_public_v6(ip: Ipv6Addr) -> bool {
-    let first = ip.segments()[0];
+    let segments = ip.segments();
+    let v4 = |high: u16, low: u16| Ipv4Addr::from(u32::from(high) << 16 | u32::from(low));
+    // These carry an IPv4 address inside, so it is that address that would be reached.
+    match segments {
+        [0, 0, 0, 0, 0, 0, high, low] | [0x64, 0xff9b, 0, 0, 0, 0, high, low] | [0x2002, high, low, ..] => {
+            return is_public_v4(v4(high, low));
+        }
+        _ => {}
+    }
+    let first = segments[0];
     let unique_local = first & 0xfe00 == 0xfc00;
     let link_local = first & 0xffc0 == 0xfe80;
-    !(ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || unique_local || link_local)
+    let site_local = first & 0xffc0 == 0xfec0;
+    !(ip.is_multicast() || unique_local || link_local || site_local)
 }
 
 /// Checks addresses at the moment of connecting, which is the only check that holds: one made
@@ -199,11 +211,12 @@ mod tests {
         for private in [
             "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0",
             "224.0.0.1", "255.255.255.255", "::1", "::", "fe80::1", "fc00::1", "fd12::1", "ff02::1",
-            "::ffff:127.0.0.1", "::ffff:192.168.1.1",
+            "::ffff:127.0.0.1", "::ffff:192.168.1.1", "198.18.0.1", "198.19.255.1", "fec0::1",
+            "::127.0.0.1", "::10.0.0.1", "64:ff9b::7f00:1", "64:ff9b::c0a8:101", "2002:7f00:1::", "2002:c0a8:101::1",
         ] {
             assert!(!is_public(private.parse().unwrap()), "{private} passed");
         }
-        for public in ["1.1.1.1", "8.8.8.8", "142.250.1.1", "2606:4700::1111", "::ffff:8.8.8.8"] {
+        for public in ["1.1.1.1", "8.8.8.8", "142.250.1.1", "198.20.0.1", "2606:4700::1111", "::ffff:8.8.8.8", "64:ff9b::808:808", "2002:808:808::"] {
             assert!(is_public(public.parse().unwrap()), "{public} refused");
         }
     }

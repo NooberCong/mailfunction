@@ -46,7 +46,8 @@ impl Queue {
 fn look_up(queue: &Queue, network: &dyn Network, store: &Weak<Store>) {
     loop {
         let domain = queue.next();
-        // A logo is a stranger's file, so one that breaks a decoder costs that logo and no more.
+        // A logo is a stranger's file, so one that panics a decoder costs that logo and no more.
+        // This cannot catch a stack overflow, which `logo` has to prevent for itself.
         let found = catch_unwind(AssertUnwindSafe(|| network.logo(&domain))).unwrap_or(Logo::Missing);
         let Some(store) = store.upgrade() else { return };
         let saved = match found {
@@ -101,22 +102,22 @@ impl Logos {
         self.stored(domain, size)
     }
 
-    /// A domain's logo as a round PNG of `size` pixels, if it has one yet.
+    /// A domain's logo as a round PNG of `size` pixels, if one is already held. This never asks,
+    /// as it serves notifications, and mail arriving must not tell its sender anything.
     pub fn png(&self, domain: &str, size: u32) -> Option<Vec<u8>> {
-        let stored = self.look_up(domain)?;
+        if !self.enabled.get() {
+            return None;
+        }
+        let stored = self.reader.logo(domain).ok().flatten()?.0?;
         logo::png(logo::avatar(&stored, size)?.into_raw(), size)
     }
 
     /// What the store has for a domain, asking in the background if that may be out of date.
-    fn look_up(&self, domain: &str) -> Option<Vec<u8>> {
-        if !self.enabled.get() {
-            return None;
-        }
+    fn look_up(&self, domain: &str) {
         let known = self.reader.logo(domain).ok().flatten();
-        if known.as_ref().is_none_or(|(_, checked)| now() - checked > RECHECK_SECONDS) {
+        if known.is_none_or(|(_, checked)| now() - checked > RECHECK_SECONDS) {
             self.ask(domain);
         }
-        known?.0
     }
 
     /// As [`Self::image`], for what the store already has, without looking anything up.

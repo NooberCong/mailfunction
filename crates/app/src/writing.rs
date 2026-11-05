@@ -13,6 +13,7 @@ use mailfunction_core::draft::MAX_ATTACHMENTS;
 use mailfunction_core::store::Store;
 use rfd::FileDialog;
 use slint::{ModelRc, SharedString, TimerMode, VecModel};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::actions::Reversible;
 use crate::editor::EditorEvent;
@@ -104,8 +105,10 @@ fn file_tone(extension: &str) -> i32 {
     }
 }
 
-/// A file as the chips show it.
-pub(crate) fn file_item(name: String, size: usize) -> FileItem {
+/// A file as the chips show it. Names from a Mac spell each Korean syllable or accented letter out
+/// in parts, which measure narrower than they draw, so they are put together to be shown.
+pub(crate) fn file_item(name: &str, size: usize) -> FileItem {
+    let name: String = name.nfc().collect();
     let badge = extension(&name).filter(|extension| extension.len() <= LONGEST_BADGE);
     FileItem {
         size: human_size(size).into(),
@@ -127,6 +130,14 @@ pub fn save_dialog(name: &str) -> FileDialog {
     }
 }
 
+/// Tells Windows this file came from the internet, as a browser would, so that SmartScreen and
+/// Office treat it as they should. Some file systems have no place for this, and nothing is lost.
+fn mark_as_downloaded(path: &Path) {
+    let mut mark = path.as_os_str().to_os_string();
+    mark.push(":Zone.Identifier");
+    let _ = std::fs::write(mark, "[ZoneTransfer]\r\nZoneId=3\r\n");
+}
+
 /// The address being typed in a recipients field: whatever follows the last separator.
 fn last_address(field: &str) -> &str {
     field.rsplit([',', ';']).next().unwrap_or(field).trim_start()
@@ -134,9 +145,18 @@ fn last_address(field: &str) -> &str {
 
 impl Controller {
     pub(crate) fn compose_new(self: &Rc<Self>) {
+        self.start_writing(None, Compose::default());
+    }
+
+    /// Starts what a link in a message asks for, from the account that message came to.
+    pub fn compose_to(self: &Rc<Self>, fields: Compose) {
+        self.start_writing(self.selected_with_account().map(|(_, account)| account), fields);
+    }
+
+    fn start_writing(self: &Rc<Self>, account: Option<i64>, fields: Compose) {
         let first = self.accounts.borrow().first().map(|m| m.account.id);
-        let Some(account) = self.shown.get().or(first) else { return };
-        let fields = self.signed(account, Compose::default());
+        let Some(account) = account.or(self.shown.get()).or(first) else { return };
+        let fields = self.signed(account, fields);
         self.open_composer(account, fields, None, None, &[]);
         if let Some(writing) = self.writing.borrow_mut().as_mut() {
             writing.new = true;
@@ -516,7 +536,7 @@ impl Controller {
         let files = draft.and_then(|id| self.reader.draft_attachments(id).ok()).unwrap_or_default();
         let items: Vec<_> = files
             .into_iter()
-            .map(|file| file_item(file.name, file.size))
+            .map(|file| file_item(&file.name, file.size))
             .collect();
         self.app.set_draft_files(ModelRc::new(VecModel::from(items)));
     }
@@ -651,6 +671,9 @@ impl Controller {
             let chosen = save_dialog(&file.name).set_parent(&parent).save_file();
             let Some(path) = chosen else { return };
             let saved = std::fs::write(&path, &file.data).is_ok();
+            if saved {
+                mark_as_downloaded(&path);
+            }
             on_ui_thread(move |this| {
                 let text = if saved { format!("Saved {}", file.name) } else { format!("{} couldn't be saved", file.name) };
                 this.show_notice(&text, "", NOTICE_TIME);
@@ -682,10 +705,15 @@ mod tests {
 
     #[test]
     fn a_file_wears_its_extension_while_it_fits() {
-        let sheet = file_item("보고서.XLSX".into(), 2048);
+        let sheet = file_item("보고서.XLSX", 2048);
         assert_eq!((sheet.extension.as_str(), sheet.tone, sheet.size.as_str()), ("XLSX", 3, "2 KB"));
-        assert_eq!(file_item("Attachment".into(), 1).extension, "");
-        assert_eq!(file_item("seeds.torrent".into(), 1).extension, "");
+        assert_eq!(file_item("Attachment", 1).extension, "");
+        assert_eq!(file_item("seeds.torrent", 1).extension, "");
+    }
+
+    #[test]
+    fn a_name_spelled_out_in_parts_is_shown_whole() {
+        assert_eq!(file_item("\u{1109}\u{116e}\u{110c}\u{1165}\u{11bc}\u{110b}\u{116d}\u{110e}\u{1165}\u{11bc}.pptx", 1).name, "수정요청.pptx");
     }
 
     #[test]
@@ -693,6 +721,17 @@ mod tests {
         assert_eq!(last_address("an"), "an");
         assert_eq!(last_address("a@x.example, bì"), "bì");
         assert_eq!(last_address("a@x.example; "), "");
+    }
+
+    #[test]
+    fn a_saved_file_is_marked_as_from_the_internet() {
+        let path = std::env::temp_dir().join(format!("mf-mark-{}.exe", std::process::id()));
+        std::fs::write(&path, b"MZ").unwrap();
+        mark_as_downloaded(&path);
+        let mark = std::fs::read_to_string(format!("{}:Zone.Identifier", path.display())).unwrap();
+        assert!(mark.contains("ZoneId=3"), "{mark}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"MZ", "the file itself is untouched");
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
