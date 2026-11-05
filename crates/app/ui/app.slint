@@ -84,17 +84,21 @@ export struct RowItem {
     starred: bool,
     initials: string,
     tone: int,
+    logo: image,
 }
 
 export struct AccountItem {
     email: string,
     initials: string,
     tone: int,
+    logo: image,
     unread: string,
     status: string,
 }
 
 export enum Pane { empty, loading, text, html, failed }
+
+export enum ImageBar { hidden, blocked, loading, failed, allowed }
 
 export struct MessageView {
     subject: string,
@@ -106,6 +110,7 @@ export struct MessageView {
     text: string,
     initials: string,
     tone: int,
+    logo: image,
 }
 
 component Icon inherits Path {
@@ -129,6 +134,7 @@ component Press inherits TouchArea {
 component Avatar inherits Rectangle {
     in property <string> initials;
     in property <int> tone;
+    in property <image> logo;
     in property <length> size: 38px;
 
     width: size;
@@ -141,6 +147,13 @@ component Avatar inherits Rectangle {
         color: Theme.tones[Math.mod(root.tone, Theme.tones.length)].ink;
         font-size: root.size * 0.36;
         font-weight: 600;
+    }
+
+    // Cut to a circle and sized to the pixel in Rust: the software renderer does neither well.
+    if root.logo.width > 0: Image {
+        source: root.logo;
+        width: root.size;
+        height: root.size;
     }
 }
 
@@ -273,6 +286,7 @@ component AccountRow inherits Rectangle {
                     size: 28px;
                     initials: root.item.initials;
                     tone: root.item.tone;
+                    logo: root.item.logo;
                 }
             }
 
@@ -503,6 +517,7 @@ component MessageRow inherits Rectangle {
             Avatar {
                 initials: root.item.initials;
                 tone: root.item.tone;
+                logo: root.item.logo;
             }
         }
 
@@ -757,6 +772,177 @@ component Sheet inherits Rectangle {
     border-top-left-radius: 14px;
 }
 
+/// Checks for mail now. The software renderer cannot rotate an element, so the spin turns the
+/// icon's points instead, and the path is only rebuilt while syncing.
+component BarAction inherits Rectangle {
+    in property <string> text;
+    callback clicked <=> touch.clicked;
+
+    width: label.preferred-width + 20px;
+    height: 28px;
+    border-radius: 7px;
+    background: touch.has-hover ? Theme.faint : transparent;
+
+    label := Text {
+        text: root.text;
+        color: Theme.accent;
+        font-size: Theme.small;
+        font-weight: 600;
+    }
+    touch := Press { }
+}
+
+/// Offers the remote images a message asks for. They stay out until someone says otherwise,
+/// because fetching one tells the sender the mail was opened.
+component ImagesBar inherits Rectangle {
+    in property <ImageBar> state;
+    callback load();
+    callback always();
+    callback stop();
+
+    height: 40px;
+    background: Theme.hover;
+
+    HorizontalLayout {
+        padding-left: Theme.gutter;
+        padding-right: Theme.gutter - 10px;
+        spacing: 4px;
+
+        Text {
+            text: root.state == ImageBar.loading ? "Loading images\u{2026}"
+                : root.state == ImageBar.failed ? "Images could not be loaded"
+                : root.state == ImageBar.allowed ? "Images load for this sender"
+                : "Images hidden to protect your privacy";
+            color: Theme.muted;
+            font-size: Theme.small;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        if root.state == ImageBar.blocked || root.state == ImageBar.failed: VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            BarAction {
+                text: root.state == ImageBar.failed ? "Try again" : "Load images";
+                clicked => { root.load(); }
+            }
+        }
+        if root.state == ImageBar.blocked: VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            BarAction {
+                text: "Always for this sender";
+                clicked => { root.always(); }
+            }
+        }
+        if root.state == ImageBar.allowed: VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            BarAction {
+                text: "Stop";
+                clicked => { root.stop(); }
+            }
+        }
+    }
+}
+
+component SyncButton inherits Rectangle {
+    in property <bool> syncing;
+    callback clicked();
+
+    private property <angle> turn: root.syncing && Theme.motion ? Math.mod(animation-tick() / 1000ms, 1) * 360deg : 0deg;
+    private property <angle> tip: 285deg;
+
+    pure function ring-x(at: angle) -> float { 12 + 8 * Math.cos(at + root.turn) }
+    pure function ring-y(at: angle) -> float { 12 + 8 * Math.sin(at + root.turn) }
+    pure function barb-x(side: angle) -> float { root.ring-x(root.tip) + 4.5 * Math.cos(root.tip + root.turn + side) }
+    pure function barb-y(side: angle) -> float { root.ring-y(root.tip) + 4.5 * Math.sin(root.tip + root.turn + side) }
+
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    background: touch.has-hover && !root.syncing ? Theme.hover : transparent;
+    animate background { duration: Theme.fast; }
+
+    Icon {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 16px;
+        height: 16px;
+        tint: root.syncing ? Theme.accent : Theme.muted;
+        commands: "M" + root.ring-x(0deg) + " " + root.ring-y(0deg)
+            + "A8 8 0 1 1 " + root.ring-x(root.tip) + " " + root.ring-y(root.tip)
+            + "M" + root.barb-x(235deg) + " " + root.barb-y(235deg)
+            + "L" + root.ring-x(root.tip) + " " + root.ring-y(root.tip)
+            + "L" + root.barb-x(305deg) + " " + root.barb-y(305deg);
+    }
+
+    touch := Press {
+        enabled: !root.syncing;
+        clicked => { root.clicked(); }
+    }
+}
+
+/// Stands in for the list and the reader while an account has no folders to show them with.
+component NoMail inherits Sheet {
+    in property <string> email;
+    in property <bool> syncing;
+    in property <bool> needs-sign-in;
+    callback sign-in();
+
+    // Nothing behind this should answer the pointer.
+    TouchArea { }
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 0;
+
+        HorizontalLayout {
+            alignment: center;
+            Mark { }
+        }
+        Rectangle { height: 20px; }
+        Text {
+            text: root.needs-sign-in ? "Sign in to get your mail"
+                : root.syncing ? "Getting your mail"
+                : "Waiting to connect";
+            color: Theme.text;
+            font-size: Theme.heading;
+            font-weight: 600;
+            horizontal-alignment: center;
+        }
+        Rectangle { height: 6px; }
+        Text {
+            text: root.email;
+            color: Theme.muted;
+            font-size: Theme.body;
+            horizontal-alignment: center;
+            overflow: elide;
+        }
+        if root.needs-sign-in: Rectangle { height: 24px; }
+        if root.needs-sign-in: HorizontalLayout {
+            alignment: center;
+            Rectangle {
+                width: 150px;
+                height: 40px;
+                border-radius: 10px;
+                background: Theme.accent;
+                opacity: touch.has-hover ? 0.88 : 1;
+                animate opacity { duration: Theme.fast; }
+                Text {
+                    text: "Sign in";
+                    color: Theme.sheet;
+                    font-size: Theme.body;
+                    font-weight: 600;
+                }
+                touch := Press {
+                    clicked => { root.sign-in(); }
+                }
+            }
+        }
+    }
+}
+
 export component App inherits Window {
     title: "mailfunction";
     preferred-width: 1280px;
@@ -782,6 +968,7 @@ export component App inherits Window {
     in property <[RowItem]> rows;
     in-out property <int> selected-row: -1;
     in property <Pane> pane: Pane.empty;
+    in property <ImageBar> image-bar: ImageBar.hidden;
     in property <MessageView> message;
     /// Bumped to replay the entrance of the list, the message header and the message body.
     in property <int> list-key;
@@ -803,6 +990,10 @@ export component App inherits Window {
     callback add-account();
     callback cancel-add-account();
     callback sign-in-again();
+    callback sync-now();
+    callback load-images();
+    callback always-load-images();
+    callback stop-loading-images();
     callback select-account(int);
     callback remove-account(int);
     callback select-label(int);
@@ -907,6 +1098,8 @@ export component App inherits Window {
 
             Sheet {
                 HorizontalLayout {
+                    visible: root.labels.length > 0;
+
                     VerticalLayout {
                         width: 348px;
 
@@ -933,6 +1126,19 @@ export component App inherits Window {
                                     font-weight: 500;
                                     vertical-alignment: center;
                                     horizontal-stretch: 0;
+                                }
+                                // The padding lines it up with the letters, which sit low in their box.
+                                if !root.needs-sign-in: VerticalLayout {
+                                    alignment: center;
+                                    padding-top: 4px;
+                                    horizontal-stretch: 0;
+                                    SyncButton {
+                                        syncing: root.syncing;
+                                        clicked => {
+                                            root.sync-now();
+                                            keys.focus();
+                                        }
+                                    }
                                 }
                             }
 
@@ -1023,7 +1229,7 @@ export component App inherits Window {
                             }
 
                             if root.rows.length == 0 && root.label.name != "": Text {
-                                text: root.label.name + " is empty";
+                                text: root.syncing ? "Getting your mail" : root.label.name + " is empty";
                                 color: Theme.muted;
                                 font-size: Theme.body;
                             }
@@ -1061,6 +1267,7 @@ export component App inherits Window {
                                             size: 40px;
                                             initials: root.message.initials;
                                             tone: root.message.tone;
+                                            logo: root.message.logo;
                                         }
                                     }
                                     VerticalLayout {
@@ -1136,6 +1343,13 @@ export component App inherits Window {
                             }
                         }
 
+                        if root.pane != Pane.empty && root.image-bar != ImageBar.hidden: ImagesBar {
+                            state: root.image-bar;
+                            load => { root.load-images(); }
+                            always => { root.always-load-images(); }
+                            stop => { root.stop-loading-images(); }
+                        }
+
                         // The webview is a child window placed over this slot.
                         slot := Rectangle {
                             vertical-stretch: 1;
@@ -1150,7 +1364,6 @@ export component App inherits Window {
                                     alignment: center;
                                     Mark {
                                         size: 52px;
-                                        opacity: 0.3;
                                     }
                                 }
                                 Text {
@@ -1194,6 +1407,16 @@ export component App inherits Window {
                                 width: parent.width - 2 * Theme.gutter;
                             }
                         }
+                    }
+                }
+
+                if root.labels.length == 0: NoMail {
+                    email: root.accounts[root.active-account].email;
+                    syncing: root.syncing;
+                    needs-sign-in: root.needs-sign-in;
+                    sign-in => {
+                        root.sign-in-again();
+                        keys.focus();
                     }
                 }
             }

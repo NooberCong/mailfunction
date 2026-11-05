@@ -3,20 +3,24 @@
 
 pub mod chrome;
 pub mod list;
+pub mod logos;
 pub mod webview;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use list::{MessageList, display_name, full_date, initials, tone};
+use logos::Logos;
 use mailfunction_core::engine::{Engine, Event};
-use mailfunction_core::{oauth, secrets};
-use mailfunction_core::render::{self, Body};
+use mailfunction_core::remote::Network;
+use mailfunction_core::{logo, oauth, secrets};
+use mailfunction_core::render::{self, Body, Rendered};
 use mailfunction_core::store::{Account, AuthKind, LabelRow, MessageRow, Reader, Role, Security, Store};
-use slint::{Model, ModelRc, Timer, TimerMode, VecModel};
+use slint::{ComponentHandle, Image, Model, ModelRc, Timer, TimerMode, VecModel};
 
 slint::include_modules!();
 
@@ -29,6 +33,10 @@ const FLICKING: Duration = Duration::from_millis(180);
 
 const GMAIL_HOST: &str = "imap.gmail.com";
 const IMAPS_PORT: u16 = 993;
+
+/// Avatar sizes, matching app.slint, so that a logo is cut to exactly the pixels it fills.
+const HEADER_AVATAR: f32 = 40.0;
+const ACCOUNT_AVATAR: f32 = 28.0;
 
 thread_local! {
     /// The controller, for work that finishes on another thread. `Rc` cannot cross threads,
@@ -88,6 +96,8 @@ pub struct Controller {
     store: Arc<Store>,
     reader: Rc<Reader>,
     list: Rc<MessageList>,
+    logos: Rc<Logos>,
+    network: Arc<dyn Network>,
     labels: RefCell<Vec<LabelRow>>,
     label_items: Rc<VecModel<LabelItem>>,
     /// Every signed-in account. Mail stays local to its account; only one is on screen.
@@ -97,6 +107,8 @@ pub struct Controller {
     /// The account on screen has changed since its list was last read.
     list_stale: Cell<bool>,
     selected: Cell<Option<i64>>,
+    /// The address the selected message is from.
+    selected_sender: RefCell<String>,
     last_open: Cell<Option<Instant>>,
     pane: Box<dyn HtmlPane>,
     engine: RefCell<Option<Engine>>,
@@ -110,10 +122,12 @@ impl Controller {
         dir: &Path,
         client: Option<oauth::Client>,
         pane: Box<dyn HtmlPane>,
+        network: Arc<dyn Network>,
     ) -> mailfunction_core::Result<Rc<Self>> {
         let store = Arc::new(Store::open(dir)?);
         let reader = Rc::new(Reader::open(dir)?);
-        let list = Rc::new(MessageList::new(reader.clone()));
+        let logos = Rc::new(Logos::new(reader.clone(), &store, network.clone(), app.as_weak()));
+        let list = Rc::new(MessageList::new(reader.clone(), logos.clone()));
         app.set_rows(ModelRc::from(list.clone()));
         let label_items = Rc::new(VecModel::default());
         app.set_labels(ModelRc::from(label_items.clone()));
@@ -125,6 +139,8 @@ impl Controller {
             store,
             reader,
             list,
+            logos,
+            network,
             labels: RefCell::default(),
             label_items,
             accounts: RefCell::default(),
@@ -132,6 +148,7 @@ impl Controller {
             shown: Cell::new(None),
             list_stale: Cell::new(false),
             selected: Cell::new(None),
+            selected_sender: RefCell::default(),
             last_open: Cell::new(None),
             pane,
             engine: RefCell::default(),
@@ -175,6 +192,12 @@ impl Controller {
             }
         });
         let weak = Rc::downgrade(self);
+        self.app.on_sync_now(move || {
+            if let Some(this) = weak.upgrade() {
+                this.sync_now();
+            }
+        });
+        let weak = Rc::downgrade(self);
         self.app.on_cancel_add_account(move || {
             if let Some(this) = weak.upgrade() {
                 this.close_sign_in();
@@ -190,6 +213,24 @@ impl Controller {
         self.app.on_remove_account(move |index| {
             if let Some(this) = weak.upgrade() {
                 this.remove_account(index as usize);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.app.on_load_images(move || {
+            if let Some(this) = weak.upgrade() {
+                this.load_images();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.app.on_always_load_images(move || {
+            if let Some(this) = weak.upgrade() {
+                this.set_images_allowed(true);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.app.on_stop_loading_images(move || {
+            if let Some(this) = weak.upgrade() {
+                this.set_images_allowed(false);
             }
         });
         let weak = Rc::downgrade(self);
@@ -387,6 +428,13 @@ impl Controller {
         self.publish_accounts();
     }
 
+    /// Syncs the shown account now. The engine reports back with [`Event::Syncing`].
+    fn sync_now(&self) {
+        if let Some((account, engine)) = self.shown.get().zip(self.engine.borrow().as_ref()) {
+            engine.sync_now(account);
+        }
+    }
+
     /// Brings the sidebar's accounts and the state of the shown one up to date.
     fn publish_accounts(&self) {
         let unread = self.reader.inbox_unread().unwrap_or_default();
@@ -397,6 +445,8 @@ impl Controller {
                 email: m.account.email.as_str().into(),
                 initials: initials(&m.account.email).into(),
                 tone: tone(&m.account.email),
+                logo: logo::account_domain(&m.account.email)
+                    .map_or_else(Image::default, |domain| self.logos.image(&domain, ACCOUNT_AVATAR)),
                 unread: unread.get(&m.account.id).map_or_else(Default::default, |n| n.to_string().into()),
                 status: match m.link {
                     Link::Offline => "Offline".into(),
@@ -482,9 +532,9 @@ impl Controller {
 
     pub fn select_label(&self, index: usize) {
         // A new account has no labels until it syncs, and no label id matches no mail.
-        let id = self.labels.borrow().get(index).map_or(0, |l| l.id);
+        let (id, role) = self.labels.borrow().get(index).map_or((0, Role::None), |l| (l.id, l.role));
         self.app.set_active_label(index as i32);
-        self.list.show_label(id);
+        self.list.show_label(id, role != Role::Spam);
         self.app.invoke_scroll_to_top();
         self.app.set_list_key(self.app.get_list_key() + 1);
         self.clear_message();
@@ -492,7 +542,9 @@ impl Controller {
 
     fn clear_message(&self) {
         self.selected.set(None);
+        self.selected_sender.borrow_mut().clear();
         self.app.set_selected_row(-1);
+        self.app.set_image_bar(ImageBar::Hidden);
         self.app.set_pane(Pane::Empty);
         self.pane.hide();
     }
@@ -500,10 +552,14 @@ impl Controller {
     pub fn select_row(&self, row: usize) {
         let Some(message) = self.list.message(row) else { return };
         self.selected.set(Some(message.id));
+        self.selected_sender.replace(message.from_addr.clone());
         self.app.set_selected_row(row as i32);
+        self.app.set_image_bar(ImageBar::Hidden);
         // The old message goes in the same frame as the click, whatever the new one takes.
         self.pane.hide();
-        self.app.set_message(header(&message));
+        let mut view = header(&message);
+        view.logo = self.list.logo(&message.from_addr, HEADER_AVATAR);
+        self.app.set_message(view);
         let now = Instant::now();
         if self.last_open.replace(Some(now)).is_none_or(|last| now - last > FLICKING) {
             self.app.set_header_key(self.app.get_header_key() + 1);
@@ -530,6 +586,84 @@ impl Controller {
             self.app.set_pane(Pane::Failed);
             return;
         };
+        if rendered.remote_images.is_empty() {
+            self.display(rendered, ImageBar::Hidden);
+        } else if self.sender_allowed() {
+            self.app.set_pane(Pane::Loading);
+            self.fetch_images(id, rendered.remote_images);
+        } else {
+            self.display(rendered, ImageBar::Blocked);
+        }
+    }
+
+    fn sender_allowed(&self) -> bool {
+        let sender = self.selected_sender.borrow();
+        self.shown.get().is_some_and(|account| self.reader.images_allowed(account, &sender).unwrap_or(false))
+    }
+
+    /// Fetches the selected message's images, because the user asked for them.
+    fn load_images(&self) {
+        let Some(id) = self.selected.get() else { return };
+        let rendered = self.reader.body(id).ok().flatten().and_then(|raw| render::message(&raw));
+        if let Some(rendered) = rendered {
+            self.fetch_images(id, rendered.remote_images);
+        }
+    }
+
+    fn set_images_allowed(&self, allowed: bool) {
+        let Some(account) = self.shown.get() else { return };
+        let saved = self.store.set_images_allowed(account, &self.selected_sender.borrow(), allowed);
+        match (saved.is_ok(), allowed, self.selected.get()) {
+            (true, true, _) => self.load_images(),
+            (true, false, Some(id)) => self.show_body(id),
+            _ => {}
+        }
+    }
+
+    /// The webview has no network, so the images are fetched here and go in as `data:` URLs.
+    fn fetch_images(&self, id: i64, urls: Vec<String>) {
+        self.app.set_image_bar(ImageBar::Loading);
+        let network = self.network.clone();
+        std::thread::spawn(move || {
+            let images = network.images(&urls);
+            on_ui_thread(move |this| this.images_fetched(id, &images));
+        });
+    }
+
+    /// Shows a message with the images that arrived, unless the user has moved on from it.
+    pub fn images_fetched(&self, id: i64, images: &HashMap<String, String>) {
+        if self.selected.get() != Some(id) {
+            return;
+        }
+        let rendered = self.reader.body(id).ok().flatten().and_then(|raw| render::message_with_images(&raw, images));
+        let Some(rendered) = rendered else { return };
+        let bar = match (images.is_empty(), self.sender_allowed()) {
+            (true, _) => ImageBar::Failed,
+            (false, true) => ImageBar::Allowed,
+            (false, false) => ImageBar::Hidden,
+        };
+        self.display(rendered, bar);
+    }
+
+    pub fn selected_message(&self) -> Option<i64> {
+        self.selected.get()
+    }
+
+    /// Fits a logo that has just arrived wherever its domain is on screen.
+    pub fn logo_ready(&self, domain: &str) {
+        self.logos.forget(domain);
+        self.list.logo_changed(domain);
+        self.publish_accounts();
+        let sender = self.selected_sender.borrow();
+        if logo::sender_domain(&sender).as_deref() == Some(domain) {
+            let mut view = self.app.get_message();
+            view.logo = self.list.logo(&sender, HEADER_AVATAR);
+            self.app.set_message(view);
+        }
+    }
+
+    fn display(&self, rendered: Rendered, bar: ImageBar) {
+        self.app.set_image_bar(bar);
         let mut view = self.app.get_message();
         view.recipients = rendered.recipients.into();
         view.attachments = rendered.attachments.join(", ").into();
@@ -573,6 +707,7 @@ fn header(m: &MessageRow) -> MessageView {
         date: full_date(m.date).into(),
         initials: initials(name).into(),
         tone: tone(&m.from_addr),
+        logo: Image::default(),
         recipients: "".into(),
         attachments: "".into(),
         text: "".into(),

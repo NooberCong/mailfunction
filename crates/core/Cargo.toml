@@ -11,9 +11,12 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 futures = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = "0.3"
+image = { version = "0.25", default-features = false, features = ["gif", "ico", "jpeg", "png", "webp"] }
 keyring-core = "1"
 # mail-parser 1.0 is a recent rewrite, so stay on an exact version until it has been diffed on a real mailbox.
 mail-parser = "=1.0.1"
+psl = "2"
+resvg = { version = "0.48", default-features = false }
 rusqlite = { version = "0.41", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
@@ -24,5 +27,6 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 ureq = { version = "3", features = ["json"] }
 webpki-roots = "1"
+windows = { version = "0.62", features = ["Win32_NetworkManagement_Dns"] }
 windows-native-keyring-store = "1"
 zstd = "0.14"

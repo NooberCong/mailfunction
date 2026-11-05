@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use mailfunction::webview::Webview;
 use mailfunction::{App, Controller, Pane, Theme, chrome};
+use mailfunction_core::remote::Offline;
 use mailfunction_core::render;
 use mailfunction_core::secrets;
 use mailfunction_core::store::{Account, AuthKind, Reader, Security, Store};
@@ -600,7 +601,7 @@ fn main() {
 
     let app = App::new().unwrap();
     let view = Rc::new(Webview::new(dir.join("webview")));
-    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(view.clone())).unwrap();
+    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(view.clone()), Arc::new(Offline)).unwrap();
     controller.load_accounts().unwrap();
     app.show().unwrap();
     chrome::set_icon(&app);

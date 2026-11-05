@@ -3,6 +3,7 @@
 //! scripts off and answers every network request with a refusal.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use ammonia::{Builder, UrlRelative};
 use base64::Engine as _;
@@ -28,7 +29,7 @@ const SHEET: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><style>\
     </style></head><body>";
 
 /// Inline images larger than this are dropped rather than embedded in the page.
-const MAX_INLINE_IMAGE: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_INLINE_IMAGE: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {
@@ -42,16 +43,26 @@ pub struct Rendered {
     pub body: Body,
     pub recipients: String,
     pub attachments: Vec<String>,
+    /// Images the body asks for that were not supplied, and so are not in it.
+    pub remote_images: Vec<String>,
 }
 
 /// A message's body and details, or `None` if the bytes are not a message at all.
 pub fn message(raw: &[u8]) -> Option<Rendered> {
+    message_with_images(raw, &HashMap::new())
+}
+
+/// As [`message`], with the remote images that have been fetched, as `data:` URLs by URL.
+pub fn message_with_images(raw: &[u8], fetched: &HashMap<String, String>) -> Option<Rendered> {
     let parsed = MessageParser::default().parse(raw)?;
     let message = parsed.root();
     let html = message.html_body().find(|p| matches!(p.kind(), PartKind::Html));
-    let body = match html.and_then(|_| message.body_html(0)) {
-        Some(html) => Body::Html(document(&html, &inline_images(message))),
-        None => Body::Text(message.body_text(0).map(|t| t.into_owned()).unwrap_or_default()),
+    let (body, remote_images) = match html.and_then(|_| message.body_html(0)) {
+        Some(html) => {
+            let (document, remote) = sanitise(&html, &inline_images(message), fetched);
+            (Body::Html(document), remote)
+        }
+        None => (Body::Text(message.body_text(0).map(|t| t.into_owned()).unwrap_or_default()), Vec::new()),
     };
     let recipients = message
         .to()
@@ -67,7 +78,7 @@ pub fn message(raw: &[u8]) -> Option<Rendered> {
         .filter(|p| !(p.is_inline() && p.content_id().is_some()))
         .map(|p| p.attachment_name().unwrap_or("Attachment").to_string())
         .collect();
-    Some(Rendered { body, recipients, attachments })
+    Some(Rendered { body, recipients, attachments, remote_images })
 }
 
 /// `cid:` targets as `data:` URLs, restricted to image types a browser cannot run code from.
@@ -88,6 +99,23 @@ fn inline_images(message: MessageRef) -> HashMap<String, String> {
     images
 }
 
+/// An image from the network as a `data:` URL, going by its bytes, because a server can claim
+/// anything. Nothing that a browser could run code from gets through, SVG included.
+pub(crate) fn data_url(bytes: &[u8]) -> Option<String> {
+    let kind = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "png"
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        "jpeg"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "gif"
+    } else if bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        "webp"
+    } else {
+        return None;
+    };
+    Some(format!("data:image/{kind};base64,{}", STANDARD.encode(bytes)))
+}
+
 fn is_safe_data_image(value: &str) -> bool {
     ["png", "jpeg", "jpg", "gif", "webp"]
         .iter()
@@ -96,7 +124,20 @@ fn is_safe_data_image(value: &str) -> bool {
 
 /// Sanitises mail HTML into a complete document.
 pub fn document(html: &str, inline_images: &HashMap<String, String>) -> String {
+    sanitise(html, inline_images, &HashMap::new()).0
+}
+
+/// A complete document, and the remote images it had to leave out. Those in `fetched` go in as
+/// `data:` URLs, so the page still loads nothing from anywhere.
+fn sanitise(
+    html: &str,
+    inline_images: &HashMap<String, String>,
+    fetched: &HashMap<String, String>,
+) -> (String, Vec<String>) {
     let images = inline_images.clone();
+    let fetched = fetched.clone();
+    let blocked = Arc::new(Mutex::new(Vec::new()));
+    let seen = blocked.clone();
     let cleaned = Builder::default()
         .add_tags(["center", "font", "style", "tbody", "thead", "tfoot"])
         .rm_clean_content_tags(["style"])
@@ -109,10 +150,23 @@ pub fn document(html: &str, inline_images: &HashMap<String, String>) -> String {
         .url_relative(UrlRelative::Deny)
         .attribute_filter(move |tag, attribute, value| match (tag, attribute) {
             // Remote images are the classic tracking pixel, so they go first of all.
-            ("img", "src") => match value.strip_prefix("cid:") {
-                Some(id) => images.get(id).cloned().map(Into::into),
-                None => is_safe_data_image(value).then(|| value.to_string().into()),
-            },
+            ("img", "src") => {
+                let lower = value.trim_start().to_ascii_lowercase();
+                if let Some(id) = value.strip_prefix("cid:") {
+                    images.get(id).cloned().map(Into::into)
+                } else if lower.starts_with("https://") || lower.starts_with("http://") {
+                    let image = fetched.get(value).cloned();
+                    if image.is_none() {
+                        let mut blocked = seen.lock().expect("blocked images");
+                        if !blocked.iter().any(|url| url == value) {
+                            blocked.push(value.to_string());
+                        }
+                    }
+                    image.map(Into::into)
+                } else {
+                    is_safe_data_image(value).then(|| value.to_string().into())
+                }
+            }
             ("a", "href") => {
                 let lower = value.trim_start().to_ascii_lowercase();
                 let allowed = ["http:", "https:", "mailto:"].iter().any(|s| lower.starts_with(s));
@@ -123,7 +177,8 @@ pub fn document(html: &str, inline_images: &HashMap<String, String>) -> String {
         })
         .clean(html)
         .to_string();
-    format!("{SHEET}{cleaned}</body></html>")
+    let blocked = std::mem::take(&mut *blocked.lock().expect("blocked images"));
+    (format!("{SHEET}{cleaned}</body></html>"), blocked)
 }
 
 #[cfg(test)]
@@ -180,6 +235,32 @@ mod tests {
         let out = clean("<img src='https://tracker.example/p.gif' width=1 height=1 alt=logo>");
         assert!(!out.contains("tracker.example"));
         assert!(out.contains("alt=\"logo\""));
+    }
+
+    #[test]
+    fn remote_images_are_listed_once_until_they_are_supplied() {
+        let html = "<img src='https://a.example/1.png?x=1&amp;y=2'><img src='https://a.example/1.png?x=1&amp;y=2'>\
+                    <img src='HTTP://b.example/2.gif'><img src='data:image/gif;base64,AAAA'>";
+        let (out, blocked) = sanitise(html, &HashMap::new(), &HashMap::new());
+        assert_eq!(blocked, ["https://a.example/1.png?x=1&y=2", "HTTP://b.example/2.gif"]);
+        assert!(!out.contains("a.example") && !out.contains("b.example"), "{out}");
+
+        let fetched = HashMap::from([(blocked[0].clone(), "data:image/png;base64,BBBB".to_string())]);
+        let (out, blocked) = sanitise(html, &HashMap::new(), &fetched);
+        assert_eq!(out.matches("data:image/png;base64,BBBB").count(), 2, "{out}");
+        assert_eq!(blocked, ["HTTP://b.example/2.gif"]);
+        assert!(!out.contains("a.example"), "{out}");
+    }
+
+    #[test]
+    fn only_real_images_become_data_urls() {
+        assert!(data_url(b"\x89PNG\r\n\x1a\nA").unwrap().starts_with("data:image/png;"));
+        assert!(data_url(b"\xff\xd8\xffA").unwrap().starts_with("data:image/jpeg;"));
+        assert!(data_url(b"GIF89aA").unwrap().starts_with("data:image/gif;"));
+        assert!(data_url(b"RIFF0000WEBPVP8").unwrap().starts_with("data:image/webp;"));
+        for not_an_image in [&b"<svg onload=alert(1)>"[..], b"<html>", b""] {
+            assert_eq!(data_url(not_an_image), None);
+        }
     }
 
     #[test]

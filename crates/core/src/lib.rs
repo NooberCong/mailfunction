@@ -5,7 +5,9 @@
 
 pub mod engine;
 pub mod imap;
+pub mod logo;
 pub mod oauth;
+pub mod remote;
 pub mod render;
 pub mod secrets;
 pub mod store;

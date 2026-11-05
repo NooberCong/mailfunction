@@ -2,10 +2,12 @@
 
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use mailfunction::webview::Webview;
 use mailfunction::{App, Controller, Theme, chrome};
 use mailfunction_core::oauth;
+use mailfunction_core::remote::Web;
 use slint::ComponentHandle;
 
 fn env_path(name: &str) -> PathBuf {
@@ -27,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.set_sign_in_message(format!("Google client file not found:\n{}", client_file.display()).into());
     }
     let pane = Rc::new(Webview::new(data.join("webview")));
-    let controller = Controller::new(app.clone_strong(), &data, client, Box::new(pane))?;
+    let controller = Controller::new(app.clone_strong(), &data, client, Box::new(pane), Arc::new(Web::default()))?;
     controller.load_accounts()?;
     controller.start_engine();
     app.show()?;

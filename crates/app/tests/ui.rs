@@ -1,13 +1,16 @@
 //! The real UI and controller on a seeded store, in an offscreen software window. Key presses
 //! go straight into Slint, so no input reaches the desktop. Screenshots land in `target/ui`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mailfunction::{App, Controller, HtmlPane, Pane, Theme};
+use mailfunction::{App, Controller, HtmlPane, ImageBar, Pane, Theme};
 use mailfunction_core::engine::Event;
+use mailfunction_core::remote::Offline;
 use mailfunction_core::store::{Account, AuthKind, Folder, LabelSpec, NewMessage, Reader, Role, Security, Store};
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
 use slint::platform::{Platform, PlatformError, PointerEventButton, WindowAdapter, WindowEvent};
@@ -136,6 +139,16 @@ const HTML_BODY: &[u8] = b"From: Linear <n@linear.example>\r\nSubject: x\r\nCont
 --b\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<h1>Issues</h1><script>alert(1)</script><img src=\"https://t.example/p.gif\">\r\n\
 --b\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=report.pdf\r\n\r\nPDF\r\n--b--\r\n";
 
+/// A stored logo: a solid tile, as `logo::find` would leave it.
+fn logo_png(colour: [u8; 3]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut encoder = png::Encoder::new(&mut bytes, 128, 128);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.write_header().unwrap().write_image_data(&colour.repeat(128 * 128)).unwrap();
+    bytes
+}
+
 fn seed(store: &Store, inbox: &Folder) {
     seed_from(store, inbox, MAIL);
 }
@@ -172,7 +185,7 @@ fn the_whole_window() {
     window.set_size(PhysicalSize::new(1280, 760));
     let pane = RecordingPane::default();
     let html_shown = pane.shown.clone();
-    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(pane)).unwrap();
+    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(pane), Arc::new(Offline)).unwrap();
     app.show().unwrap();
     window.dispatch_event(WindowEvent::WindowActiveChanged(true));
 
@@ -195,6 +208,10 @@ fn the_whole_window() {
     let inbox_rows = reader.messages(inbox.label_id, 0, 20).unwrap();
     store.save_body(inbox_rows[0].id, &plain_body()).unwrap();
     store.save_body(inbox_rows[1].id, HTML_BODY).unwrap();
+    // Logos are looked up by the brand's domain, and checked far enough ahead never to go stale.
+    let fresh = i64::MAX / 2;
+    store.save_logo("linear.example", Some(&logo_png([94, 106, 210])), fresh).unwrap();
+    store.save_logo("example.com", Some(&logo_png([196, 18, 47])), fresh).unwrap();
 
     controller.load_accounts().unwrap();
     assert!(app.get_signed_in());
@@ -228,6 +245,78 @@ fn the_whole_window() {
     assert!(!html_shown.borrow()[0].contains("alert") && !html_shown.borrow()[0].contains("t.example"));
     assert_eq!(app.get_message().attachments, "report.pdf");
     shot(&app, "03-html-message");
+
+    // A known sender's logo replaces the initials, in the row and in the header, at the size each
+    // draws it. Everyone else keeps their initials, and so does the account's row without one.
+    let linear = (0..MAIL.len()).find(|&i| MAIL[i].from.1.ends_with("@linear.example")).unwrap();
+    assert_eq!(app.get_rows().row_data(linear).unwrap().logo.size().width, 38);
+    assert_eq!(app.get_message().logo.size().width, 40);
+    let stranger = (0..MAIL.len()).find(|&i| !MAIL[i].from.1.ends_with("@linear.example")).unwrap();
+    assert_eq!(app.get_rows().row_data(stranger).unwrap().logo.size().width, 0);
+    assert_eq!(app.get_accounts().row_data(0).unwrap().logo.size().width, 28);
+
+    // Remote images stay out until asked for, and nothing is fetched by opening the message.
+    let opened = controller.selected_message().unwrap();
+    let sender = reader.messages(inbox.label_id, 0, 20).unwrap()[1].from_addr.clone();
+    let fetched = HashMap::from([("https://t.example/p.gif".to_string(), "data:image/gif;base64,R0lG".to_string())]);
+    assert_eq!(app.get_image_bar(), ImageBar::Blocked);
+    shot(&app, "03-images-blocked");
+    app.global::<Theme>().set_dark(true);
+    settle();
+    shot(&app, "03-images-blocked-dark");
+    app.global::<Theme>().set_dark(false);
+    window.set_size(PhysicalSize::new(900, 480));
+    settle();
+    shot(&app, "03-images-blocked-narrow");
+    window.set_size(PhysicalSize::new(1280, 760));
+    settle();
+
+    click(&app, 1055.0, 176.0);
+    assert_eq!(app.get_image_bar(), ImageBar::Loading);
+    controller.images_fetched(opened, &HashMap::new());
+    assert_eq!(app.get_image_bar(), ImageBar::Failed);
+    settle();
+    shot(&app, "03-images-failed");
+    app.invoke_load_images();
+    controller.images_fetched(opened, &fetched);
+    assert_eq!(app.get_image_bar(), ImageBar::Hidden);
+    assert!(html_shown.borrow().last().unwrap().contains("data:image/gif;base64,R0lG"));
+    assert!(!html_shown.borrow().last().unwrap().contains("t.example"));
+
+    // Once only: coming back to the message blocks them again.
+    press(&app, "k");
+    assert_eq!(app.get_image_bar(), ImageBar::Hidden);
+    press(&app, "j");
+    assert_eq!(app.get_image_bar(), ImageBar::Blocked);
+    assert!(!reader.images_allowed(account, &sender).unwrap());
+
+    // Always: from now on the message waits for its images, and the bar offers a way back.
+    app.invoke_always_load_images();
+    assert!(reader.images_allowed(account, &sender.to_uppercase()).unwrap());
+    controller.images_fetched(opened, &fetched);
+    assert_eq!(app.get_image_bar(), ImageBar::Allowed);
+    settle();
+    shot(&app, "03-images-allowed");
+    press(&app, "k");
+    let shown_before = html_shown.borrow().len();
+    press(&app, "j");
+    assert_eq!((app.get_pane(), app.get_image_bar()), (Pane::Loading, ImageBar::Loading));
+    assert_eq!(html_shown.borrow().len(), shown_before);
+    controller.images_fetched(opened, &fetched);
+    assert_eq!((app.get_pane(), app.get_image_bar()), (Pane::Html, ImageBar::Allowed));
+
+    // A late answer for a message the user has left changes nothing.
+    press(&app, "k");
+    controller.images_fetched(opened, &fetched);
+    assert_eq!((app.get_pane(), app.get_image_bar()), (Pane::Text, ImageBar::Hidden));
+    press(&app, "j");
+    controller.images_fetched(opened, &fetched);
+
+    app.invoke_stop_loading_images();
+    assert!(!reader.images_allowed(account, &sender).unwrap());
+    assert_eq!(app.get_image_bar(), ImageBar::Blocked);
+    assert!(!html_shown.borrow().last().unwrap().contains("R0lG"));
+    settle();
 
     // No local body and no engine: the pane says so rather than sitting empty forever.
     press(&app, "j");
@@ -304,6 +393,25 @@ fn the_whole_window() {
     settle();
     shot(&app, "05-empty");
 
+    // The sync button beside the title asks for a sync, unless one is already running.
+    let syncs = Rc::new(Cell::new(0));
+    app.on_sync_now({
+        let syncs = syncs.clone();
+        move || syncs.set(syncs.get() + 1)
+    });
+    click(&app, 546.0, 39.0);
+    assert_eq!(syncs.get(), 1);
+
+    // While it runs an empty list may only be waiting for its mail, so it does not say empty.
+    controller.on_event(account, Event::Syncing);
+    settle();
+    shot(&app, "05-empty-syncing");
+    click(&app, 546.0, 39.0);
+    assert_eq!(syncs.get(), 1, "a running sync needs no second one");
+    controller.on_event(account, Event::UpToDate);
+    settle();
+    shot(&app, "05-sync-button");
+
     // A second account: the first stays where it is, and each keeps to its own mail.
     let second = Account { email: "work@studio.example".into(), ..account_row() };
     controller.add_account(second).unwrap();
@@ -314,7 +422,23 @@ fn the_whole_window() {
     settle();
     shot(&app, "08-new-account");
 
+    // With no folders yet there is no list to show, so one message takes their place.
     let work = reader.accounts().unwrap()[1].id;
+    controller.on_event(work, Event::Syncing);
+    settle();
+    shot(&app, "08-first-sync");
+    controller.on_event(work, Event::SignInRequired("token revoked".into()));
+    settle();
+    shot(&app, "08-no-mail-signed-out");
+    app.global::<Theme>().set_dark(true);
+    settle();
+    shot(&app, "08-no-mail-signed-out-dark");
+    app.global::<Theme>().set_dark(false);
+    click(&app, 756.0, 456.0);
+    assert!(app.get_adding(), "the sign-in button");
+    press(&app, "\u{1b}");
+    controller.on_event(work, Event::Syncing);
+
     let work_inbox = store.folder(work, "INBOX", &LabelSpec::system(Role::Inbox)).unwrap();
     store.folder(work, "Sent", &LabelSpec::system(Role::Sent)).unwrap();
     seed_from(&store, &work_inbox, &MAIL[3..7]);
@@ -430,6 +554,35 @@ fn the_whole_window() {
     shot(&app, "07-smallest");
 
     // The last account going leaves the sign-in screen. Its data goes on a background thread.
+    // Spam gets no logos, even from a sender whose logo is already known.
+    let last = reader.accounts().unwrap()[0].id;
+    let spam = store.folder(last, "[Gmail]/Spam", &LabelSpec::system(Role::Spam)).unwrap();
+    let all = store.folder(last, "Linear mail", &LabelSpec::user("Linear mail")).unwrap();
+    for (folder, id) in [(&spam, "from-spam"), (&all, "from-linear")] {
+        let message = NewMessage {
+            uid: 1,
+            remote_id: id.into(),
+            gm_thread_id: None,
+            subject: id.into(),
+            from_name: "Linear".into(),
+            from_addr: "n@linear.example".into(),
+            date: NOW,
+            size: 1000,
+            seen: false,
+            flagged: false,
+            labels: Vec::new(),
+        };
+        store.save_messages(folder, &[message]).unwrap();
+    }
+    controller.refresh_now();
+    let label = |name: &str| app.get_labels().iter().position(|l| l.name == name).unwrap();
+    controller.select_label(label("Linear mail"));
+    let row = app.get_rows().row_data(0).unwrap();
+    assert_eq!((row.subject.as_str(), row.logo.size().width), ("from-linear", 38));
+    controller.select_label(label("Spam"));
+    let row = app.get_rows().row_data(0).unwrap();
+    assert_eq!((row.subject.as_str(), row.logo.size().width), ("from-spam", 0));
+
     controller.remove_account(0);
     assert!(!app.get_signed_in());
     assert_eq!(app.get_accounts().row_count(), 0);
@@ -439,6 +592,8 @@ fn the_whole_window() {
         assert!(Instant::now() < deadline, "the accounts were not deleted");
         std::thread::sleep(Duration::from_millis(20));
     }
+    // With nobody signed in, nothing is left to say who wrote.
+    assert!(reader.logo("linear.example").unwrap().is_none());
 
     drop(controller);
     drop(reader);

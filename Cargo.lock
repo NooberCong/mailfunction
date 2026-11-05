@@ -2629,6 +2629,9 @@ checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
 dependencies = [
  "bytemuck",
  "byteorder-lite",
+ "color_quant",
+ "gif",
+ "image-webp",
  "moxcms",
  "num-traits",
  "png",
@@ -3100,8 +3103,11 @@ dependencies = [
  "chrono",
  "futures",
  "getrandom 0.3.4",
+ "image",
  "keyring-core",
  "mail-parser",
+ "psl",
+ "resvg",
  "rusqlite",
  "rustls",
  "serde",
@@ -3112,6 +3118,7 @@ dependencies = [
  "tokio-rustls",
  "ureq",
  "webpki-roots",
+ "windows",
  "windows-native-keyring-store",
  "zstd",
 ]
@@ -4217,6 +4224,21 @@ name = "profiling"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
+
+[[package]]
+name = "psl"
+version = "2.1.246"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27d58bd13c235442118460335daf360f0fefaa9035ec4ad957f851d738e7b7d6"
+dependencies = [
+ "psl-types",
+]
+
+[[package]]
+name = "psl-types"
+version = "2.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac"
 
 [[package]]
 name = "pulldown-cmark"

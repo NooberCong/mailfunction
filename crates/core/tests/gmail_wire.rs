@@ -57,12 +57,13 @@ fn respond(tag: &str, command: &str, script: &mut Script) -> String {
     }
     if upper.contains("CHANGEDSINCE") {
         return format!(
-            "* 1 FETCH (X-GM-LABELS (\\Inbox) UID 1 MODSEQ (200) FLAGS (\\Seen \\Flagged))\r\n{ok}"
+            "* 1 FETCH (X-GM-LABELS (\"\\\\Inbox\") UID 1 MODSEQ (200) FLAGS (\\Seen \\Flagged))\r\n{ok}"
         );
     }
     if upper.starts_with("UID FETCH") {
-        let inbox = fetch_line(1, 1, "\\Inbox \\Important \"H&APM-a &AREBoQ-n\" Receipts", "\\Seen", "First");
-        let sent = fetch_line(2, 2, "\\Sent", "", "Second");
+        // Gmail quotes system labels and escapes the backslash, unlike its documentation's examples.
+        let inbox = fetch_line(1, 1, "\"\\\\Inbox\" \"\\\\Important\" \"H&APM-a &AREBoQ-n\" Receipts", "\\Seen", "First");
+        let sent = fetch_line(2, 2, "\"\\\\Sent\"", "", "Second");
         return format!("{inbox}{sent}{ok}");
     }
     ok

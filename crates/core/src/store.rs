@@ -73,6 +73,18 @@ const MIGRATIONS: &[&str] = &["
         message_id INTEGER PRIMARY KEY,
         raw BLOB NOT NULL
     );
+", "
+    CREATE TABLE image_sender (
+        account_id INTEGER NOT NULL REFERENCES account ON DELETE CASCADE,
+        address TEXT NOT NULL,
+        PRIMARY KEY (account_id, address)
+    ) WITHOUT ROWID;
+    -- `image` is NULL for a domain that was asked and has no logo.
+    CREATE TABLE logo (
+        domain TEXT PRIMARY KEY,
+        image BLOB,
+        checked INTEGER NOT NULL
+    );
 "];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,6 +315,34 @@ impl Store {
                 [account_id],
             )?;
             tx.execute("DELETE FROM account WHERE id = ?1", [account_id])?;
+            // Logos are shared between accounts, but the last one out leaves no trace of who wrote.
+            tx.execute("DELETE FROM logo WHERE NOT EXISTS (SELECT 1 FROM account)", [])?;
+            Ok(())
+        })
+    }
+
+    /// Loads remote images in this sender's mail from now on, or stops.
+    pub fn set_images_allowed(&self, account_id: i64, address: &str, allowed: bool) -> Result<()> {
+        let address = address.to_lowercase();
+        self.with_tx(|tx| {
+            let sql = if allowed {
+                "INSERT OR IGNORE INTO image_sender (account_id, address) VALUES (?1, ?2)"
+            } else {
+                "DELETE FROM image_sender WHERE account_id = ?1 AND address = ?2"
+            };
+            tx.execute(sql, params![account_id, address])?;
+            Ok(())
+        })
+    }
+
+    /// Records what a domain's logo is, or that it has none, as of `checked` (Unix seconds).
+    pub fn save_logo(&self, domain: &str, image: Option<&[u8]>, checked: i64) -> Result<()> {
+        self.with_tx(|tx| {
+            tx.execute(
+                "INSERT INTO logo (domain, image, checked) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (domain) DO UPDATE SET image = ?2, checked = ?3",
+                params![domain, image, checked],
+            )?;
             Ok(())
         })
     }
@@ -580,6 +620,17 @@ impl Reader {
         configure(&conn, dir, 2048)?;
         conn.execute_batch("PRAGMA query_only = ON")?;
         Ok(Self { conn })
+    }
+
+    pub fn images_allowed(&self, account_id: i64, address: &str) -> Result<bool> {
+        let mut stmt = self.conn.prepare_cached("SELECT 1 FROM image_sender WHERE account_id = ?1 AND address = ?2")?;
+        Ok(stmt.exists(params![account_id, address.to_lowercase()])?)
+    }
+
+    /// What is known of a domain's logo and when it was learned, if anyone has asked.
+    pub fn logo(&self, domain: &str) -> Result<Option<(Option<Vec<u8>>, i64)>> {
+        let mut stmt = self.conn.prepare_cached("SELECT image, checked FROM logo WHERE domain = ?1")?;
+        Ok(stmt.query_row([domain], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)
     }
 
     pub fn accounts(&self) -> Result<Vec<Account>> {

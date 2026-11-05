@@ -14,6 +14,16 @@ and cannot change a mailbox: folders are opened read-only and messages are never
 The UI reads only from the local store, so it never waits on the network. One background thread
 syncs every account at once, with two connections each: one for sync and IDLE, and one for bodies.
 
+The webview has no network at all. Remote images stay out of a message until the user loads them,
+once or always for that sender. The app then fetches them itself and hands them to the page as
+`data:` URLs, so the page's lockdown never changes. Loading them can still tell the sender the
+mail was opened.
+
+Avatars show a logo where one can be found: the domain's BIMI record first, then its website's
+icon, and initials otherwise. Each domain is asked directly, once, and the answer is kept for 30
+days. That shows the domain this machine's IP address, but no message content or address. Shared
+domains like gmail.com and anything in Spam are never looked up as senders.
+
 ## Run it
 
 1. In Google Cloud, create a project, enable the Gmail API, set the OAuth app to External and

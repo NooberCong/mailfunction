@@ -6,36 +6,66 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use chrono::{DateTime, Datelike, Local, TimeZone};
+use mailfunction_core::logo;
 use mailfunction_core::store::{MessageRow, Reader};
-use slint::{Model, ModelNotify, ModelTracker};
+use slint::{Image, Model, ModelNotify, ModelTracker};
 
 use crate::RowItem;
+use crate::logos::Logos;
 
 const PAGE: usize = 100;
 const MAX_PAGES: usize = 8;
+/// The size of a row's avatar, matching `Avatar` in app.slint.
+const AVATAR: f32 = 38.0;
 
 pub struct MessageList {
     reader: Rc<Reader>,
     label: Cell<i64>,
     count: Cell<usize>,
     pages: RefCell<HashMap<usize, Rc<Vec<MessageRow>>>>,
+    logos: Rc<Logos>,
+    /// False in Spam: a lookup would tell a spammer's domain that the address is alive, and a
+    /// familiar logo is the last thing a forgery should get.
+    show_logos: Cell<bool>,
     notify: ModelNotify,
 }
 
 impl MessageList {
-    pub fn new(reader: Rc<Reader>) -> Self {
+    pub fn new(reader: Rc<Reader>, logos: Rc<Logos>) -> Self {
         Self {
             reader,
             label: Cell::new(0),
             count: Cell::new(0),
             pages: RefCell::default(),
+            logos,
+            show_logos: Cell::new(true),
             notify: ModelNotify::default(),
         }
     }
 
-    pub fn show_label(&self, label: i64) {
+    pub fn show_label(&self, label: i64, show_logos: bool) {
         self.label.set(label);
+        self.show_logos.set(show_logos);
         self.refresh();
+    }
+
+    /// The logo of a message's sender, for an avatar of `size` logical pixels.
+    pub fn logo(&self, address: &str, size: f32) -> Image {
+        match logo::sender_domain(address) {
+            Some(domain) if self.show_logos.get() => self.logos.image(&domain, size),
+            _ => Image::default(),
+        }
+    }
+
+    /// Redraws the rows from a domain whose logo has just arrived.
+    pub fn logo_changed(&self, domain: &str) {
+        for (index, page) in self.pages.borrow().iter() {
+            for (offset, row) in page.iter().enumerate() {
+                if logo::sender_domain(&row.from_addr).as_deref() == Some(domain) {
+                    self.notify.row_changed(index * PAGE + offset);
+                }
+            }
+        }
     }
 
     /// Picks up changes in the store.
@@ -81,6 +111,7 @@ impl Model for MessageList {
             starred: m.flagged,
             initials: initials(display_name(&m)).into(),
             tone: tone(&m.from_addr),
+            logo: self.logo(&m.from_addr, AVATAR),
         })
     }
 

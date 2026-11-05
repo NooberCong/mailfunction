@@ -8,10 +8,12 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mailfunction::{App, Controller, HtmlPane, Pane, Theme};
 use mailfunction_core::engine::Event;
+use mailfunction_core::remote::Offline;
 use mailfunction_core::store::{Account, AuthKind, LabelSpec, NewMessage, Reader, Role, Security, Store};
 use slint::platform::software_renderer::{MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType};
 use slint::platform::{Platform, PlatformError, PointerEventButton, WindowAdapter, WindowEvent};
@@ -196,7 +198,7 @@ fn motion_is_cheap_and_stops() {
     let app = App::new().unwrap();
     window.dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: SCALE });
     window.set_size(PhysicalSize::new(SIZE.0, SIZE.1));
-    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(NoHtml)).unwrap();
+    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(NoHtml), Arc::new(Offline)).unwrap();
     app.show().unwrap();
     window.dispatch_event(WindowEvent::WindowActiveChanged(true));
     controller.load_accounts().unwrap();

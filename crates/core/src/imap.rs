@@ -99,6 +99,12 @@ pub struct Fetched {
     pub data: Option<Vec<u8>>,
 }
 
+/// imap-proto hands back quoted strings still escaped, so `"\\Inbox"` arrives with two backslashes.
+/// A bare `\Inbox` has nothing to undo: only `\\` and `\"` are escapes.
+fn unescape(quoted: &str) -> String {
+    quoted.replace("\\\\", "\\").replace("\\\"", "\"")
+}
+
 impl Fetched {
     fn parse(attrs: &[AttributeValue]) -> Self {
         let mut f = Self::default();
@@ -109,7 +115,7 @@ impl Fetched {
                 AttributeValue::GmailMsgId(id) => f.gm_message_id = Some(*id),
                 AttributeValue::GmailThrId(id) => f.gm_thread_id = Some(*id),
                 AttributeValue::GmailLabels(labels) => {
-                    f.labels = Some(labels.iter().map(|l| decode_utf7(l)).collect());
+                    f.labels = Some(labels.iter().map(|l| decode_utf7(&unescape(l))).collect());
                 }
                 AttributeValue::InternalDate(date) => {
                     f.date = chrono::DateTime::parse_from_str(date.trim(), "%d-%b-%Y %H:%M:%S %z")
