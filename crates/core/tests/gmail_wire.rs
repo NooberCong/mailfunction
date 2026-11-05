@@ -240,6 +240,16 @@ async fn actions_reach_gmail_as_flags_labels_and_moves() {
     let first = reader.messages(label("Inbox").id, 0, 1).unwrap()[0].id;
     let second = reader.messages(label("Sent").id, 0, 1).unwrap()[0].id;
 
+    // Read state goes out in bulk, as marking a whole label read would otherwise take minutes.
+    let start = script.lock().unwrap().commands.len();
+    store.act(account.id, &[first, second], Triage::Seen(false)).unwrap();
+    sync_account(&mut imap, &store, account.id, |_| {}).await.unwrap();
+    store.act(account.id, &[first, second], Triage::Seen(true)).unwrap();
+    sync_account(&mut imap, &store, account.id, |_| {}).await.unwrap();
+    let commands = script.lock().unwrap().commands[start..].to_vec();
+    let flags: Vec<_> = commands.iter().filter(|c| c.starts_with("UID STORE")).map(String::as_str).collect();
+    assert_eq!(flags, ["UID STORE 1 -FLAGS.SILENT (\\Seen)", "UID STORE 1,2 +FLAGS.SILENT (\\Seen)"], "the second was unread already");
+
     // Everything queued while offline goes out in order at the next pass.
     let start = script.lock().unwrap().commands.len();
     store.act(account.id, &[first], Triage::Seen(false)).unwrap();

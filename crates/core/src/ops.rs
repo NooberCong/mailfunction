@@ -6,7 +6,7 @@
 //! Actions say what the user meant in terms that fit any provider. How each maps to commands is
 //! decided here, at the last moment, by [`replay`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,8 @@ const MAX_ATTEMPTS: i64 = 50;
 /// After this many tries an action waits until the pass is over, so that one that keeps failing
 /// cannot stop mail coming in.
 const STUBBORN_AFTER: i64 = 3;
+/// How many messages one command marks read. It keeps the command to a few kilobytes.
+const SEEN_BATCH: usize = 1000;
 
 /// What the user asked for, before it is known what that means for a given message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,6 +274,16 @@ impl Store {
         })
     }
 
+    fn finish_ops(&self, ids: impl Iterator<Item = i64>) -> Result<()> {
+        self.with_tx(|tx| {
+            let mut delete = tx.prepare_cached("DELETE FROM pending_op WHERE id = ?1")?;
+            for id in ids {
+                delete.execute([id])?;
+            }
+            Ok(())
+        })
+    }
+
     fn retry_op(&self, id: i64) -> Result<()> {
         self.with_tx(|tx| {
             tx.execute("UPDATE pending_op SET attempts = attempts + 1 WHERE id = ?1", [id])?;
@@ -364,6 +376,9 @@ enum Outcome {
 /// `stubborn` picks which actions run: those that have failed repeatedly go after the pass, the
 /// rest before it, so that a pass always gets as far as fetching mail.
 pub async fn replay(imap: &mut Imap, store: &Store, account_id: i64, stubborn: bool) -> Result<usize> {
+    if !stubborn {
+        replay_seen(imap, store, account_id).await?;
+    }
     let mut held: HashSet<i64> = HashSet::new();
     let mut refused = 0;
     for op in store.pending_ops(account_id)? {
@@ -397,6 +412,41 @@ pub async fn replay(imap: &mut Imap, store: &Store, account_id: i64, stubborn: b
     Ok(refused)
 }
 
+/// Sends read and unread in bulk, as marking a whole folder one message at a time would keep new
+/// mail waiting for minutes. This only takes the plain case: whatever goes wrong here stays in
+/// the queue for [`replay`], which knows what to do about each message.
+async fn replay_seen(imap: &mut Imap, store: &Store, account_id: i64) -> Result<()> {
+    loop {
+        let mut reached = HashSet::new();
+        let mut batches: HashMap<(String, u32, bool), Vec<(i64, u32)>> = HashMap::new();
+        for op in store.pending_ops(account_id)? {
+            // A message's actions keep their order, so only its first can go ahead.
+            if reached.insert(op.message_id)
+                && op.attempts == 0
+                && let Action::Seen(on) = op.action
+                && let Some(placed) = store.placed(op.message_id)?
+            {
+                batches.entry((placed.path, placed.validity, on)).or_default().push((op.id, placed.uid));
+            }
+        }
+        if batches.is_empty() {
+            return Ok(());
+        }
+        for ((path, validity, on), ops) in batches {
+            if imap.select(&path).await.ok() != Some(validity) {
+                return Ok(());
+            }
+            for batch in ops.chunks(SEEN_BATCH) {
+                let uids: Vec<u32> = batch.iter().map(|(_, uid)| *uid).collect();
+                if imap.store_flag(&uids, "\\Seen", on).await.is_err() {
+                    return Ok(());
+                }
+                store.finish_ops(batch.iter().map(|(id, _)| *id))?;
+            }
+        }
+    }
+}
+
 async fn run(imap: &mut Imap, store: &Store, op: &Op) -> Result<Outcome> {
     match &op.action {
         Action::SaveDraft => return crate::draft::upload(imap, store, op.message_id).await.map(|()| Outcome::Done),
@@ -411,8 +461,8 @@ async fn run(imap: &mut Imap, store: &Store, op: &Op) -> Result<Outcome> {
         return Ok(Outcome::Later);
     }
     match &op.action {
-        Action::Seen(on) => imap.store_flag(uid, "\\Seen", *on).await?,
-        Action::Starred(on) => imap.store_flag(uid, "\\Flagged", *on).await?,
+        Action::Seen(on) => imap.store_flag(&[uid], "\\Seen", *on).await?,
+        Action::Starred(on) => imap.store_flag(&[uid], "\\Flagged", *on).await?,
         Action::Label { label, on } => {
             let (name, role) = store.label_name(*label)?;
             imap.store_label(uid, &gmail_label(&name, role), *on).await?;

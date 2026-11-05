@@ -97,6 +97,11 @@ fn a_large_mailbox_stays_within_budget() {
     let ids: Vec<i64> = thread.iter().map(|m| m.id).collect();
     let undo = timed("archiving a thread", 20, || store.act(account, &ids, Triage::Archive).unwrap());
     timed("taking it back", 20, || store.undo(account, &undo).unwrap());
+    // The button: one click, but it writes a row to the queue for each message, on the UI thread.
+    let unread = timed("finding what is unread", 100, || reader.unread_in_label(everything).unwrap());
+    println!("{} unread", unread.len());
+    let undo = timed("marking all of it read", 500, || store.act(account, &unread, Triage::Seen(true)).unwrap());
+    timed("taking that back", 500, || store.undo(account, &undo).unwrap());
     let body = "Subject: x\r\nContent-Type: text/plain\r\n\r\nSome words to index.\r\n".repeat(50);
     timed("storing and indexing a body", 20, || store.save_body(ids[0], body.as_bytes()).unwrap());
 

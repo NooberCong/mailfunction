@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use common::{RecordingNotifier, RecordingPane, click, fresh_dir, linger, offscreen, press, settle, shot, typed, with_control};
 use mailfunction::notify::Opens;
-use mailfunction::{App, Controller, Pane, Theme};
+use mailfunction::{App, Controller, Pane, Theme, Tip};
 use mailfunction_core::engine::Event;
 use mailfunction_core::remote::Offline;
 use mailfunction_core::store::{Account, AuthKind, LabelSpec, NewMessage, Reader, Role, Security, Store};
@@ -303,6 +303,7 @@ fn a_day_of_mail() {
     press(app, "i");
     assert_eq!(app.get_active_label(), 0);
 
+    tips_and_mark_all(&s);
     writing(&s);
     searching(&s);
     across_accounts(&s);
@@ -321,6 +322,60 @@ impl Scene {
         let label = self.reader.labels(self.account).unwrap().into_iter().find(|l| l.role == Role::Drafts).unwrap();
         self.reader.messages(label.id, 0, 10).unwrap().into_iter().map(|m| m.subject).collect()
     }
+}
+
+/// Rests the pointer on a spot, for as long as a tooltip takes to appear.
+fn hover(app: &App, x: f32, y: f32) -> String {
+    let position = slint::LogicalPosition::new(x, y);
+    app.window().dispatch_event(slint::platform::WindowEvent::PointerMoved { position });
+    linger();
+    app.global::<Tip>().get_text().to_string()
+}
+
+fn tips_and_mark_all(s: &Scene) {
+    let app = &s.app;
+    press(app, "j");
+    assert_ne!(app.get_pane(), Pane::Empty);
+
+    // Icons say what they are, and the key, and nothing is written beside the buttons any more.
+    assert_eq!(hover(app, 625.0, 28.0), "Reply (r)");
+    assert_eq!(hover(app, 1066.0, 28.0), "Star (s)");
+    shot(app, "25-tooltip");
+    app.global::<Theme>().set_dark(true);
+    settle();
+    shot(app, "25-tooltip-dark");
+    app.global::<Theme>().set_dark(false);
+    // At the window's edge it stays whole.
+    assert_eq!(hover(app, 1236.0, 28.0), "Delete (#)");
+    shot(app, "25-tooltip-edge");
+    assert_eq!(hover(app, 800.0, 500.0), "");
+
+    // Pressing a key or a button ends a tip, and it does not outstay its welcome.
+    assert_eq!(hover(app, 1066.0, 28.0), "Star (s)");
+    press(app, "?");
+    press(app, "?");
+    assert_eq!(app.global::<Tip>().get_text(), "");
+    assert_eq!(hover(app, 800.0, 500.0), "");
+
+    // The count is a button that clears itself, and `z` takes that back.
+    press(app, "u");
+    let unread = s.unread();
+    assert_ne!(unread, "");
+    assert_eq!(hover(app, 470.0, 39.0), "Mark all as read");
+    shot(app, "26-mark-all-read");
+    click(app, 470.0, 39.0);
+    assert_eq!(s.unread(), "");
+    assert_eq!(app.global::<Tip>().get_text(), "");
+    assert_eq!(app.get_notice(), "Marked as read");
+    assert!((0..app.get_rows().row_count()).all(|row| !app.get_rows().row_data(row).unwrap().unread));
+    let inbox = s.reader.labels(s.account).unwrap().into_iter().find(|l| l.role == Role::Inbox).unwrap();
+    assert!(s.reader.unread_in_label(inbox.id).unwrap().is_empty());
+    shot(app, "26-marked-read");
+    hover(app, 800.0, 500.0);
+    press(app, "z");
+    assert_eq!(s.unread(), unread);
+    press(app, "u");
+    assert_eq!(s.unread(), "");
 }
 
 fn writing(s: &Scene) {

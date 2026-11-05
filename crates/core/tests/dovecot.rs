@@ -16,7 +16,7 @@ use mailfunction_core::engine::{Engine, Event};
 use mailfunction_core::imap::{Credential, Imap};
 use mailfunction_core::ops::Triage;
 use mailfunction_core::secrets;
-use mailfunction_core::store::{Account, AuthKind, Folder, LabelRow, MessageRow, Reader, Security, Store};
+use mailfunction_core::store::{Account, AuthKind, Folder, LabelRow, MessageRow, Reader, Role, Security, Store};
 use mailfunction_core::sync::{folders_to_sync, label_of, sync_account, sync_folder};
 use tokio::net::TcpStream;
 
@@ -358,6 +358,39 @@ async fn mail_that_arrives_after_the_body_connection_opened_its_folder_can_be_re
     wait_for(&mut events, Event::BodyReady(late)).await;
 
     secrets::delete(&h.account.email).unwrap();
+}
+
+/// More than one command's worth, which a change of mind then has to chase through the queue.
+#[tokio::test]
+#[ignore = "needs a local Dovecot: scripts/test-imap.ps1"]
+async fn marking_everything_read_reaches_the_server_in_bulk() {
+    let mut h = harness("mark-all").await;
+    const MAIL: usize = 1200;
+    for n in 0..MAIL {
+        h.deliver("INBOX", &format!("m{n}"), &format!("Mail {n}")).await;
+    }
+    h.sync().await;
+    let inbox = h.reader.labels(h.account.id).unwrap().into_iter().find(|l| l.role == Role::Inbox).unwrap();
+    let unread = h.reader.unread_in_label(inbox.id).unwrap();
+    assert_eq!(unread.len(), MAIL);
+
+    let undo = h.store.act(h.account.id, &unread, Triage::Seen(true)).unwrap();
+    let started = std::time::Instant::now();
+    h.sync().await;
+    println!("{MAIL} marked read and synced in {:?}", started.elapsed());
+    assert_eq!(h.store.pending_count(h.account.id).unwrap(), 0);
+    h.admin.select("INBOX").await.unwrap();
+    assert_eq!(h.admin.uid_search("UNSEEN").await.unwrap().len(), 0);
+
+    // Both ways in one pass, in the order they were asked for.
+    h.store.undo(h.account.id, &undo).unwrap();
+    let undo = h.store.act(h.account.id, &unread[..10], Triage::Seen(true)).unwrap();
+    assert!(!undo.is_empty());
+    h.sync().await;
+    assert_eq!(h.store.pending_count(h.account.id).unwrap(), 0);
+    h.admin.noop().await.unwrap();
+    assert_eq!(h.admin.uid_search("UNSEEN").await.unwrap().len(), MAIL - 10);
+    assert_eq!(h.reader.unread_in_label(inbox.id).unwrap().len(), MAIL - 10);
 }
 
 #[tokio::test]

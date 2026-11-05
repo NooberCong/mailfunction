@@ -787,7 +787,7 @@ impl Controller {
     }
 
     /// The label on screen, if a list of one is what is showing.
-    fn current_label(&self) -> Option<i64> {
+    pub(crate) fn current_label(&self) -> Option<i64> {
         self.labels.borrow().get(self.app.get_active_label() as usize).map(|l| l.id)
     }
 

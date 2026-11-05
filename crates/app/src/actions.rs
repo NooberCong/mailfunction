@@ -35,6 +35,7 @@ impl Controller {
             Verb::Spam => self.triage(Triage::Spam, "Reported as spam"),
             Verb::Star => self.toggle_star(),
             Verb::Unread => self.toggle_unread(),
+            Verb::ReadAll => self.mark_all_read(),
             Verb::Reply => self.reply(false),
             Verb::ReplyAll => self.reply(true),
             Verb::Forward => self.forward(),
@@ -131,6 +132,20 @@ impl Controller {
             self.list.refresh();
             self.reload_thread();
         }
+    }
+
+    /// Marks everything under the current label read, however much of it is in the list.
+    fn mark_all_read(self: &Rc<Self>) {
+        let (Some(account), Some(label)) = (self.shown.get(), self.current_label()) else { return };
+        let unread = self.reader.unread_in_label(label).unwrap_or_default();
+        let Ok(undo) = self.store.act(account, &unread, Triage::Seen(true)) else { return };
+        if undo.is_empty() {
+            return;
+        }
+        self.queued();
+        *self.reversible.borrow_mut() = Some(Reversible::Action(account, undo));
+        self.show_notice("Marked as read", "Undo", NOTICE_TIME);
+        self.after_list_change();
     }
 
     /// Marks the open thread read, once it has been open long enough to mean it.

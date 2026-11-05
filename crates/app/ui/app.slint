@@ -103,7 +103,7 @@ export enum Pane { empty, loading, text, html, failed }
 export enum ImageBar { hidden, blocked, loading, failed, allowed }
 
 /// What the user can ask of the open thread, or of the app, from a button or a key.
-export enum Verb { archive, inbox, trash, spam, star, unread, reply, reply-all, forward, compose, undo }
+export enum Verb { archive, inbox, trash, spam, star, unread, read-all, reply, reply-all, forward, compose, undo }
 
 /// A file on a message: its name, and its size for reading.
 export struct FileItem {
@@ -156,6 +156,35 @@ component Icon inherits Path {
 /// Everything clickable is one of these, so that everything clickable shows the hand.
 component Press inherits TouchArea {
     mouse-cursor: pointer;
+}
+
+/// The tooltip showing now, with the edges of its button. There is one, drawn over everything
+/// else, because a button's own child would be covered by whatever comes after the button. The
+/// webview is a window of its own and covers even this, which is why tips go under the toolbar,
+/// onto the message's heading.
+export global Tip {
+    in-out property <string> text;
+    in-out property <length> centre;
+    in-out property <length> top;
+    in-out property <length> bottom;
+}
+
+/// A button that says what it does when the pointer rests on it.
+component TipPress inherits Press {
+    in property <string> tip;
+
+    changed has-hover => {
+        if (self.has-hover) {
+            Tip.centre = self.absolute-position.x + self.width / 2;
+            Tip.top = self.absolute-position.y;
+            Tip.bottom = self.absolute-position.y + self.height;
+            Tip.text = self.tip;
+        } else if (Tip.text == self.tip) {
+            // The next button may already have spoken.
+            Tip.text = "";
+        }
+    }
+    changed pressed => { Tip.text = ""; }
 }
 
 component Avatar inherits Rectangle {
@@ -942,6 +971,27 @@ component ImagesBar inherits Rectangle {
     }
 }
 
+/// The unread count, which also clears it.
+component MarkAllRead inherits Rectangle {
+    in property <string> unread;
+    callback clicked <=> touch.clicked;
+
+    width: count.preferred-width + 16px;
+    height: 28px;
+    border-radius: 8px;
+    background: touch.has-hover ? Theme.hover : transparent;
+    animate background { duration: Theme.fast; }
+
+    count := Text {
+        text: root.unread + " unread";
+        color: Theme.accent;
+        font-size: Theme.small;
+        font-weight: 500;
+    }
+
+    touch := TipPress { tip: "Mark all as read"; }
+}
+
 component SyncButton inherits Rectangle {
     in property <bool> syncing;
     callback clicked();
@@ -973,18 +1023,18 @@ component SyncButton inherits Rectangle {
             + "L" + root.barb-x(305deg) + " " + root.barb-y(305deg);
     }
 
-    touch := Press {
+    touch := TipPress {
+        tip: "Sync now";
         enabled: !root.syncing;
         clicked => { root.clicked(); }
     }
 }
 
-/// One action of the reader. `hint` is what the toolbar says while the pointer is on it.
+/// A button that is only an icon, so `hint` is all that says what it is.
 component Tool inherits Rectangle {
     in property <string> icon;
     in property <string> hint;
     in property <bool> filled;
-    out property <bool> hovered: touch.has-hover;
     callback clicked <=> touch.clicked;
 
     width: 32px;
@@ -1003,7 +1053,7 @@ component Tool inherits Rectangle {
         commands: root.icon;
     }
 
-    touch := Press { }
+    touch := TipPress { tip: root.hint; }
 }
 
 /// What can be done with the open thread. In Trash and Spam, leaving is the only way to go.
@@ -1017,14 +1067,6 @@ component Toolbar inherits Rectangle {
     callback pick-label();
 
     private property <string> inbox-icon: "M3 13h5l2 3h4l2-3h5M5.8 5h12.4L21 13v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5z";
-    private property <string> hint: reply.hovered ? reply.hint
-        : reply-all.hovered ? reply-all.hint
-        : forward.hovered ? forward.hint
-        : star.hovered ? star.hint
-        : unread.hovered ? unread.hint
-        : spam.hovered ? spam.hint
-        : trash.hovered ? trash.hint
-        : "";
 
     height: 50px;
 
@@ -1035,62 +1077,57 @@ component Toolbar inherits Rectangle {
         spacing: 2px;
         alignment: stretch;
 
-        reply := Tool {
-            hint: "Reply  r";
+        Tool {
+            hint: "Reply (r)";
             icon: "M9 7l-5 5 5 5M4 12h11a5 5 0 0 1 5 5v2";
             clicked => { root.verb(Verb.reply); }
         }
-        reply-all := Tool {
-            hint: "Reply all  a";
+        Tool {
+            hint: "Reply all (a)";
             icon: "M12 7l-5 5 5 5M7 7l-5 5 5 5M7 12h9a5 5 0 0 1 5 5v2";
             clicked => { root.verb(Verb.reply-all); }
         }
-        forward := Tool {
-            hint: "Forward  f";
+        Tool {
+            hint: "Forward (f)";
             icon: "M15 7l5 5-5 5M20 12H9a5 5 0 0 0-5 5v2";
             clicked => { root.verb(Verb.forward); }
         }
 
-        Text {
-            text: root.hint;
-            color: Theme.muted;
-            font-size: Theme.small;
-            vertical-alignment: center;
-            horizontal-alignment: right;
-            horizontal-stretch: 1;
-        }
-        Rectangle { width: 10px; }
+        Rectangle { horizontal-stretch: 1; }
 
-        star := Tool {
-            hint: root.starred ? "Remove star  s" : "Star  s";
+        Tool {
+            hint: root.starred ? "Remove star (s)" : "Star (s)";
             filled: root.starred;
             icon: "M12 3.5l2.6 5.4 5.9.8-4.3 4.1 1 5.9-5.2-2.8-5.2 2.8 1-5.9-4.3-4.1 5.9-.8z";
             clicked => { root.verb(Verb.star); }
         }
-        unread := Tool {
-            hint: "Mark unread  u";
+        Tool {
+            hint: "Mark unread (u)";
             icon: "M3 6h18v13H3zM3 7l9 6.5L21 7";
             clicked => { root.verb(Verb.unread); }
         }
         if root.can-label: Tool {
+            hint: "Labels (l)";
             icon: "M3.5 12V4.5a1 1 0 0 1 1-1H12l8.5 8.5a1.5 1.5 0 0 1 0 2.1l-6.4 6.4a1.5 1.5 0 0 1-2.1 0zM8 8v.01";
             clicked => { root.pick-label(); }
         }
         if !root.in-trash && !root.in-spam && root.in-inbox: Tool {
+            hint: "Archive (e)";
             icon: "M3 5h18v4H3zM5 9v10h14V9M10 13h4";
             clicked => { root.verb(Verb.archive); }
         }
         if !root.in-trash && !root.in-spam && !root.in-inbox: Tool {
+            hint: "Move to Inbox";
             icon: root.inbox-icon;
             clicked => { root.verb(Verb.inbox); }
         }
-        spam := Tool {
-            hint: root.in-spam ? "Not spam  !" : "Report spam  !";
+        Tool {
+            hint: root.in-spam ? "Not spam (!)" : "Report spam (!)";
             icon: root.in-spam ? root.inbox-icon : "M8 3h8l5 5v8l-5 5H8l-5-5V8zM12 8v5M12 16.5v.01";
             clicked => { root.verb(root.in-spam ? Verb.inbox : Verb.spam); }
         }
-        trash := Tool {
-            hint: root.in-trash ? "Restore  #" : "Delete  #";
+        Tool {
+            hint: root.in-trash ? "Restore (#)" : "Delete (#)";
             icon: root.in-trash ? root.inbox-icon : "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v5M14 11v5";
             clicked => { root.verb(root.in-trash ? Verb.inbox : Verb.trash); }
         }
@@ -1492,6 +1529,7 @@ component Composer inherits Rectangle {
                 alignment: center;
                 horizontal-stretch: 0;
                 Tool {
+                    hint: "Attach files";
                     icon: "M16.5 7.5v9a4.5 4.5 0 0 1-9 0V6a3 3 0 0 1 6 0v9.5a1.5 1.5 0 0 1-3 0V8";
                     clicked => { root.attach(); }
                 }
@@ -1508,6 +1546,7 @@ component Composer inherits Rectangle {
                 alignment: center;
                 horizontal-stretch: 0;
                 Tool {
+                    hint: "Discard draft";
                     icon: "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v5M14 11v5";
                     clicked => { root.discard(); }
                 }
@@ -1592,6 +1631,7 @@ component SearchField inherits Rectangle {
             alignment: center;
             horizontal-stretch: 0;
             Tool {
+                hint: "Close (Esc)";
                 icon: "M6 6l12 12M18 6L6 18";
                 width: 28px;
                 height: 28px;
@@ -2068,6 +2108,7 @@ export component App inherits Window {
 
         // Before any field sees them, because these mean the same wherever the cursor is.
         capture-key-pressed(event) => {
+            Tip.text = "";
             if (!root.signed-in || root.adding) {
                 return reject;
             }
@@ -2158,15 +2199,19 @@ export component App inherits Window {
                                     overflow: elide;
                                     horizontal-stretch: 1;
                                 }
-                                if !root.searching && root.label.unread != "": Text {
-                                    text: root.label.unread + " unread";
-                                    color: Theme.accent;
-                                    font-size: Theme.small;
-                                    font-weight: 500;
-                                    vertical-alignment: center;
-                                    horizontal-stretch: 0;
-                                }
                                 // The padding lines these up with the letters, which sit low in their box.
+                                if !root.searching && root.label.unread != "": VerticalLayout {
+                                    alignment: center;
+                                    padding-top: 4px;
+                                    horizontal-stretch: 0;
+                                    MarkAllRead {
+                                        unread: root.label.unread;
+                                        clicked => {
+                                            root.verb(Verb.read-all);
+                                            keys.focus();
+                                        }
+                                    }
+                                }
                                 if !root.searching: VerticalLayout {
                                     alignment: center;
                                     padding-top: 4px;
@@ -2174,6 +2219,7 @@ export component App inherits Window {
                                     Tool {
                                         width: 28px;
                                         height: 28px;
+                                        hint: "Search (/)";
                                         icon: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM16.5 16.5L21 21";
                                         clicked => {
                                             root.searching = true;
@@ -2560,6 +2606,40 @@ export component App inherits Window {
                     }
                 }
             }
+        }
+    }
+
+    Rectangle {
+        // Under its button, unless that would run off the window.
+        private property <length> below: Tip.bottom + 6px;
+
+        x: Math.clamp(Tip.centre - self.width / 2, 6px, root.width - self.width - 6px);
+        y: self.below + self.height > root.height ? Tip.top - self.height - 6px : self.below;
+        width: tip-text.preferred-width + 16px;
+        height: 26px;
+        border-radius: 6px;
+        background: Theme.text;
+        opacity: 0;
+
+        states [
+            showing when Tip.text != "": {
+                opacity: 1;
+                in { animate opacity { delay: 400ms; duration: Theme.fast; } }
+            }
+        ]
+
+        tip-text := Text {
+            text: Tip.text;
+            color: Theme.sheet;
+            font-size: Theme.small;
+            font-weight: 500;
+        }
+
+        // As Windows does, and it clears a tip whose button went away under the pointer.
+        Timer {
+            interval: 5s;
+            running: Tip.text != "";
+            triggered => { Tip.text = ""; }
         }
     }
 }

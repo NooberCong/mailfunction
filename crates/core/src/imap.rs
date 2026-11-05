@@ -354,9 +354,10 @@ impl Imap {
         Ok(validity)
     }
 
-    pub async fn store_flag(&mut self, uid: u32, flag: &str, on: bool) -> Result<()> {
+    pub async fn store_flag(&mut self, uids: &[u32], flag: &str, on: bool) -> Result<()> {
         let sign = if on { '+' } else { '-' };
-        self.run(&format!("UID STORE {uid} {sign}FLAGS.SILENT ({flag})"), |_| {}).await
+        let uids = uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        self.run(&format!("UID STORE {uids} {sign}FLAGS.SILENT ({flag})"), |_| {}).await
     }
 
     /// Adds or removes a Gmail label, spelled as in X-GM-LABELS.

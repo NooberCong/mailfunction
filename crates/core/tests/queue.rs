@@ -294,6 +294,28 @@ fn a_server_copy_of_a_draft_stays_the_same_message() {
     assert!(f.reader.draft(id).unwrap().is_some());
 }
 
+/// Gmail files mail sent to oneself as one message, in Sent and in the Inbox, which comes back
+/// as the row made here for sending it. It is still mail that arrived.
+#[test]
+fn mail_to_oneself_is_news_and_mail_to_others_is_not() {
+    let f = fixture("to-oneself");
+    let server_copy = |uid, labels: Vec<LabelSpec>| {
+        let id = f.store.create_draft(f.account, &compose(), None, &[]).unwrap();
+        f.store.upload_draft(id).unwrap();
+        let raw = f.reader.body(id).unwrap().unwrap();
+        let mid = mail_parser::MessageParser::default().parse(&raw).unwrap().root().message_id().unwrap().to_string();
+        (id, NewMessage { mid: Some(mid), labels, ..message(uid, uid.into(), 10) })
+    };
+
+    let (mine, copy) = server_copy(50, vec![LabelSpec::system(Role::Inbox), LabelSpec::system(Role::Sent)]);
+    let arrived = f.store.save_messages(&f.all, &[copy]).unwrap();
+    assert_eq!(f.reader.unread_in_inbox(&arrived).unwrap().iter().map(|m| m.id).collect::<Vec<_>>(), [mine]);
+
+    let (_, copy) = server_copy(51, vec![LabelSpec::system(Role::Sent)]);
+    let arrived = f.store.save_messages(&f.all, &[copy]).unwrap();
+    assert!(f.reader.unread_in_inbox(&arrived).unwrap().is_empty());
+}
+
 #[test]
 fn a_draft_from_another_client_can_be_taken_over() {
     let f = fixture("foreign-draft");

@@ -1,6 +1,8 @@
 # Runs the tests that need real servers (sync, sending, and the live window) against Dovecot and
 # mailpit in Docker. Mailpit takes mail for example.com only, so a test can see a refusal too.
 $ErrorActionPreference = 'Stop'
+# It would answer the live test's notification clicks, and open that test's messages as its own.
+if (Get-Process mailfunction -ErrorAction SilentlyContinue) { throw 'Close mailfunction first.' }
 docker rm -f mf-dovecot mf-mailpit 2>$null | Out-Null
 docker run -d --name mf-dovecot -e USER_PASSWORD=pass -p 127.0.0.1:14143:31143 `
     -v "$PSScriptRoot/dovecot-test.conf:/etc/dovecot/conf.d/99-test.conf:ro" dovecot/dovecot:2.4.5 | Out-Null

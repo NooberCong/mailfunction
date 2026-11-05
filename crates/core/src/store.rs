@@ -533,13 +533,14 @@ impl Store {
             let mut added = Vec::new();
             for m in messages {
                 // Our own sent mail or draft, back from the server: it stays one message.
+                let mut adopted = false;
                 if let Some(mid) = &m.mid {
                     let mut adopt = tx.prepare_cached(
                         "UPDATE message SET remote_id = ?3
                          WHERE account_id = ?1 AND mid = ?2 AND remote_id <> ?3
                            AND (remote_id LIKE 'local:%' OR id IN (SELECT message_id FROM draft))",
                     )?;
-                    adopt.execute(params![account, mid, m.remote_id])?;
+                    adopted = adopt.execute(params![account, mid, m.remote_id])? > 0;
                 }
                 // Before the write, because a new thread id leaves the old thread needing a head.
                 let mut previous = tx.prepare_cached("SELECT thread_id FROM message WHERE account_id = ?1 AND remote_id = ?2")?;
@@ -571,8 +572,8 @@ impl Store {
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
                 threads.extend(thread);
-                // What was adopted above is our own mail coming back, which is no news.
-                if known.is_none() {
+                // Adopted mail counts too: sent to oneself, it reached the Inbox like any other.
+                if known.is_none() || adopted {
                     added.push(id);
                 }
                 if m.gm_thread_id.is_none() {
@@ -1055,6 +1056,16 @@ impl Reader {
         }
         rows.sort_by_key(|m| std::cmp::Reverse((m.date, m.id)));
         Ok(rows)
+    }
+
+    /// Every unread message with this label, loaded in the list or not.
+    pub fn unread_in_label(&self, label: i64) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT m.id FROM message_label ml JOIN message m ON m.id = ml.message_id
+             WHERE ml.label_id = ?1 AND m.seen = 0",
+        )?;
+        let ids = stmt.query_map([label], |r| r.get(0))?;
+        Ok(ids.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Labels in sidebar order: system labels first, then user labels by name.

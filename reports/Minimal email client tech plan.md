@@ -158,7 +158,7 @@ An independent review of the write path then found ten bugs that the tests had n
 
 Still open:
 
-- **Nothing here has written to real Gmail.** Every write is proved on Dovecot, and Gmail's own commands (X-GM-LABELS, moves through its special folders, deleting a draft by way of Trash) are pinned by a scripted server. That shows what is sent, not what Gmail does with it. Check archive, delete, send and a draft edited twice on a real account before relying on any of them.
+- Real Gmail has been tried once, by hand, on 5 November 2026: read, star, archive, delete, one send to oneself and a draft edited twice all landed as they should, with no duplicates. That is one run of each, not a soak.
 - The exit criterion is 30 days as the only client with no data loss, and that clock has not started.
 - Compose is plain text. Rich text, signatures and aliases are not built, and neither is printing or a `mailto:` handler. A rich draft from another client survives being looked at, but editing one here replaces it with plain text and drops its inline images.
 - A thread can only be acted on as a whole, and there is no selecting several at once.
