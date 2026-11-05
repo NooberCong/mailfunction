@@ -1,0 +1,28 @@
+[package]
+name = "mailfunction-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ammonia = "4"
+async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
+getrandom = "0.3"
+keyring-core = "1"
+# mail-parser 1.0 is a recent rewrite, so stay on an exact version until it has been diffed on a real mailbox.
+mail-parser = "=1.0.1"
+rusqlite = { version = "0.41", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+ureq = { version = "3", features = ["json"] }
+webpki-roots = "1"
+windows-native-keyring-store = "1"
+zstd = "0.14"

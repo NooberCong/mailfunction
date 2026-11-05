@@ -1,0 +1,1202 @@
+import { ListView, Palette } from "std-widgets.slint";
+import "fonts/BeVietnamPro-Regular.ttf";
+import "fonts/BeVietnamPro-Medium.ttf";
+import "fonts/BeVietnamPro-SemiBold.ttf";
+
+struct Tone {
+    back: color,
+    ink: color,
+}
+
+export global Theme {
+    in-out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+    /// Off when Windows is set not to show animations.
+    in-out property <bool> motion: true;
+
+    // The frame: title bar, sidebar and sign-in. The title bar is painted to match `frame-top`.
+    out property <color> frame-top: dark ? #5c1524 : #b01730;
+    out property <color> frame-bottom: dark ? #3a0e18 : #8c1026;
+    out property <brush> frame: @linear-gradient(180deg, frame-top 0%, frame-bottom 100%);
+    out property <brush> on-frame: dark ? #f4e4e6 : #ffffff;
+    out property <brush> on-frame-muted: dark ? #e0bcc2 : #f6cdd3;
+    out property <brush> frame-hover: dark ? #ffffff12 : #ffffff1f;
+    out property <brush> frame-chip: dark ? #ffffff1a : #ffffff2e;
+    out property <brush> marker: dark ? #f4e4e6 : #ffffff;
+    out property <brush> on-marker: dark ? #7a1a2c : #a8132b;
+
+    // The sheet: everything mail sits on. Red only ever means unread or selected here.
+    out property <brush> sheet: dark ? #1b1516 : #ffffff;
+    out property <brush> line: dark ? #2f2527 : #f1e8e9;
+    out property <brush> hover: dark ? #261d1f : #faf5f5;
+    out property <brush> selected: dark ? #47202a : #fcecee;
+    out property <brush> text: dark ? #f3eaeb : #231417;
+    out property <brush> muted: dark ? #a8979a : #7d6a6e;
+    out property <brush> accent: dark ? #ff6b7d : #c4122f;
+    out property <brush> faint: dark ? #3a2e30 : #f0e4e5;
+
+    out property <[Tone]> tones: dark ? [
+        { back: #4a1c24, ink: #ffb3bc },
+        { back: #4a2a18, ink: #f6bd94 },
+        { back: #43361a, ink: #e8cf85 },
+        { back: #213a29, ink: #a3d9b1 },
+        { back: #173a3a, ink: #93dbd5 },
+        { back: #27324a, ink: #adc2ea },
+        { back: #3c2545, ink: #dcb5e8 },
+    ] : [
+        { back: #fbe3e6, ink: #a8132b },
+        { back: #fbe8da, ink: #a2480f },
+        { back: #f7eecf, ink: #836406 },
+        { back: #e2f0e2, ink: #2c6c3f },
+        { back: #dbf0ee, ink: #0e6a66 },
+        { back: #e3e9f3, ink: #3a5280 },
+        { back: #f0e3f3, ink: #7a3889 },
+    ];
+
+    out property <length> small: 11.5px;
+    out property <length> body: 13px;
+    out property <length> reading: 14px;
+    out property <length> heading: 20px;
+    out property <length> title: 22px;
+
+    out property <duration> fast: motion ? 90ms : 0ms;
+    out property <duration> glide: motion ? 170ms : 0ms;
+    out property <duration> settle: motion ? 220ms : 0ms;
+
+    out property <length> row: 68px;
+    out property <length> rail-step: 38px;
+    out property <length> rail-gap: 18px;
+    out property <length> gutter: 36px;
+}
+
+export enum LabelKind { inbox, starred, sent, drafts, all, spam, trash, custom }
+
+export struct LabelItem {
+    name: string,
+    unread: string,
+    kind: LabelKind,
+}
+
+export struct RowItem {
+    sender: string,
+    subject: string,
+    date: string,
+    unread: bool,
+    starred: bool,
+    initials: string,
+    tone: int,
+}
+
+export struct AccountItem {
+    email: string,
+    initials: string,
+    tone: int,
+    unread: string,
+    status: string,
+}
+
+export enum Pane { empty, loading, text, html, failed }
+
+export struct MessageView {
+    subject: string,
+    sender: string,
+    address: string,
+    date: string,
+    recipients: string,
+    attachments: string,
+    text: string,
+    initials: string,
+    tone: int,
+}
+
+component Icon inherits Path {
+    in property <brush> tint;
+    width: 18px;
+    height: 18px;
+    viewbox-width: 24;
+    viewbox-height: 24;
+    stroke: tint;
+    stroke-width: 1.6px;
+    stroke-line-cap: round;
+    stroke-line-join: round;
+    fill: transparent;
+}
+
+/// Everything clickable is one of these, so that everything clickable shows the hand.
+component Press inherits TouchArea {
+    mouse-cursor: pointer;
+}
+
+component Avatar inherits Rectangle {
+    in property <string> initials;
+    in property <int> tone;
+    in property <length> size: 38px;
+
+    width: size;
+    height: size;
+    border-radius: size / 2;
+    background: Theme.tones[Math.mod(tone, Theme.tones.length)].back;
+
+    Text {
+        text: root.initials;
+        color: Theme.tones[Math.mod(root.tone, Theme.tones.length)].ink;
+        font-size: root.size * 0.36;
+        font-weight: 600;
+    }
+}
+
+/// Fades its content in each time `key` goes up. `progress` is an animated copy of the key, so
+/// the gap between them jumps to 1 and eases back to 0. Opacity is one alpha multiply in the
+/// software renderer, so this costs no more than painting the content.
+component Reveal inherits Rectangle {
+    in property <int> key;
+    in property <length> rise: 0px;
+    in property <duration> length: Theme.glide;
+
+    private property <float> progress: root.key;
+    private property <float> remaining: Math.clamp(root.key - root.progress, 0, 1);
+    animate progress { duration: root.length; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+
+    min-height: layout.min-height;
+    preferred-height: layout.preferred-height;
+
+    Rectangle {
+        y: root.rise * root.remaining;
+        opacity: 1 - root.remaining;
+        layout := VerticalLayout {
+            @children
+        }
+    }
+}
+
+component RailItem inherits Rectangle {
+    in property <LabelItem> item;
+    in property <bool> active;
+    in property <bool> compact;
+    callback clicked <=> touch.clicked;
+
+    private property <brush> ink: active ? Theme.on-marker : Theme.on-frame;
+
+    height: 36px;
+    border-radius: 9px;
+    background: !active && touch.has-hover ? Theme.frame-hover : transparent;
+    animate background { duration: Theme.fast; }
+
+    HorizontalLayout {
+        padding-left: root.compact ? 0 : 12px;
+        padding-right: root.compact ? 0 : 10px;
+        spacing: 11px;
+        alignment: root.compact ? center : stretch;
+
+        Rectangle {
+            width: 18px;
+            Icon {
+                y: (parent.height - self.height) / 2;
+                tint: root.ink;
+                commands: root.item.kind == LabelKind.inbox ? "M3 13h5l2 3h4l2-3h5M5.8 5h12.4L21 13v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5z"
+                    : root.item.kind == LabelKind.starred ? "M12 3.5l2.6 5.4 5.9.8-4.3 4.1 1 5.9-5.2-2.8-5.2 2.8 1-5.9-4.3-4.1 5.9-.8z"
+                    : root.item.kind == LabelKind.sent ? "M21 3L10.5 13.5M21 3l-6.5 18-4-7.5L3 9.5z"
+                    : root.item.kind == LabelKind.drafts ? "M4 20l1-4L16 5a2.1 2.1 0 0 1 3 3L8 19zM14 7l3 3"
+                    : root.item.kind == LabelKind.all ? "M3 5h18v4H3zM5 9v10h14V9M10 13h4"
+                    : root.item.kind == LabelKind.spam ? "M8 3h8l5 5v8l-5 5H8l-5-5V8zM12 8v5M12 16.5v.01"
+                    : root.item.kind == LabelKind.trash ? "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v5M14 11v5"
+                    : "M3.5 12V4.5a1 1 0 0 1 1-1H12l8.5 8.5a1.5 1.5 0 0 1 0 2.1l-6.4 6.4a1.5 1.5 0 0 1-2.1 0zM8 8v.01";
+            }
+        }
+
+        if !root.compact: Text {
+            text: root.item.name;
+            color: root.ink;
+            font-size: Theme.body;
+            font-weight: root.active ? 600 : 500;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+            animate color { duration: Theme.fast; }
+        }
+
+        if !root.compact && root.item.unread != "": Text {
+            text: root.item.unread;
+            color: root.ink;
+            font-size: Theme.small;
+            font-weight: 600;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+        }
+    }
+
+    if root.compact && root.item.unread != "": Rectangle {
+        x: parent.width / 2 + 5px;
+        y: 7px;
+        width: 7px;
+        height: 7px;
+        border-radius: 3.5px;
+        background: root.ink;
+    }
+
+    touch := Press { }
+}
+
+/// One account in the sidebar. Hovering offers removal, which takes a second click to confirm.
+component AccountRow inherits Rectangle {
+    in property <AccountItem> item;
+    in property <bool> active;
+    in property <bool> compact;
+    callback clicked();
+    callback remove();
+
+    private property <bool> confirming;
+
+    height: 44px;
+    border-radius: 9px;
+    background: active ? Theme.frame-chip : touch.has-hover ? Theme.frame-hover : transparent;
+    animate background { duration: Theme.fast; }
+
+    // The buttons sit inside this area, so the row stays hovered while the pointer is on them.
+    touch := Press {
+        clicked => { root.clicked(); }
+        changed has-hover => {
+            if (!self.has-hover) {
+                root.confirming = false;
+            }
+        }
+
+        HorizontalLayout {
+            padding-left: root.compact ? 0 : 8px;
+            padding-right: root.compact ? 0 : 8px;
+            spacing: 10px;
+            alignment: root.compact ? center : stretch;
+
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 0;
+                Avatar {
+                    size: 28px;
+                    initials: root.item.initials;
+                    tone: root.item.tone;
+                }
+            }
+
+            if !root.compact: VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 1;
+                Text {
+                    text: root.item.email;
+                    color: root.active ? Theme.on-frame : Theme.on-frame-muted;
+                    font-size: Theme.small;
+                    font-weight: root.active ? 500 : 400;
+                    overflow: elide;
+                }
+                if root.item.status != "": Text {
+                    text: root.item.status;
+                    color: Theme.on-frame;
+                    font-size: Theme.small;
+                    font-weight: 500;
+                }
+            }
+
+            if !root.compact && !touch.has-hover && root.item.unread != "": Text {
+                text: root.item.unread;
+                color: Theme.on-frame;
+                font-size: Theme.small;
+                font-weight: 600;
+                vertical-alignment: center;
+                horizontal-stretch: 0;
+            }
+
+            if !root.compact && touch.has-hover && !root.confirming: Rectangle {
+                width: 24px;
+                horizontal-stretch: 0;
+                Rectangle {
+                    y: (parent.height - self.height) / 2;
+                    height: 24px;
+                    border-radius: 6px;
+                    background: offer.has-hover ? Theme.frame-hover : transparent;
+                    Icon {
+                        width: 14px;
+                        height: 14px;
+                        tint: Theme.on-frame;
+                        commands: "M6 6l12 12M18 6L6 18";
+                    }
+                    offer := Press {
+                        clicked => { root.confirming = true; }
+                    }
+                }
+            }
+
+            if !root.compact && root.confirming: Rectangle {
+                width: 62px;
+                horizontal-stretch: 0;
+                Rectangle {
+                    y: (parent.height - self.height) / 2;
+                    height: 26px;
+                    border-radius: 7px;
+                    background: Theme.marker;
+                    Text {
+                        text: "Remove";
+                        color: Theme.on-marker;
+                        font-size: Theme.small;
+                        font-weight: 600;
+                    }
+                    Press {
+                        clicked => { root.remove(); }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.compact && (root.item.unread != "" || root.item.status != ""): Rectangle {
+        x: parent.width / 2 + 8px;
+        y: 8px;
+        width: 7px;
+        height: 7px;
+        border-radius: 3.5px;
+        background: Theme.on-frame;
+    }
+}
+
+component AddAccount inherits Rectangle {
+    in property <bool> compact;
+    callback clicked <=> touch.clicked;
+
+    height: 36px;
+    border-radius: 9px;
+    background: touch.has-hover ? Theme.frame-hover : transparent;
+    animate background { duration: Theme.fast; }
+
+    HorizontalLayout {
+        padding-left: root.compact ? 0 : 13px;
+        spacing: 16px;
+        alignment: root.compact ? center : stretch;
+
+        Rectangle {
+            width: 18px;
+            horizontal-stretch: 0;
+            Icon {
+                y: (parent.height - self.height) / 2;
+                width: 18px;
+                height: 18px;
+                tint: Theme.on-frame-muted;
+                commands: "M12 5v14M5 12h14";
+            }
+        }
+        if !root.compact: Text {
+            text: "Add account";
+            color: Theme.on-frame-muted;
+            font-size: Theme.small;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+    }
+
+    touch := Press { }
+}
+
+component Rail inherits Rectangle {
+    in property <[LabelItem]> labels;
+    in property <int> active-label;
+    in property <int> first-custom;
+    in property <bool> compact;
+    in property <[AccountItem]> accounts;
+    in property <int> active-account;
+    callback select(int);
+    callback select-account(int);
+    callback remove-account(int);
+    callback add-account();
+
+    private property <length> account-step: 46px;
+
+    function offset(index: int) -> length {
+        index * Theme.rail-step + (index >= root.first-custom ? Theme.rail-gap : 0px)
+    }
+
+    width: compact ? 68px : 232px;
+    background: Theme.frame;
+
+    VerticalLayout {
+        padding-top: 8px;
+        padding-bottom: 8px;
+
+        Flickable {
+            vertical-stretch: 1;
+            content-height: root.offset(root.labels.length) + 8px;
+
+            Rectangle {
+                x: 12px;
+                y: root.offset(root.active-label);
+                width: parent.width - 24px;
+                height: 36px;
+                border-radius: 9px;
+                background: Theme.marker;
+                visible: root.labels.length > 0;
+                animate y { duration: Theme.settle; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+            }
+
+            for label[index] in root.labels: RailItem {
+                x: 12px;
+                y: root.offset(index);
+                width: parent.width - 24px;
+                item: label;
+                active: index == root.active-label;
+                compact: root.compact;
+                clicked => { root.select(index); }
+            }
+        }
+
+        Rectangle { height: 8px; }
+
+        // Every account stays in view, so switching is one click. Past four, this part scrolls.
+        Flickable {
+            height: Math.min(root.accounts.length, 4) * root.account-step;
+            vertical-stretch: 0;
+            content-height: root.accounts.length * root.account-step;
+
+            for account[index] in root.accounts: AccountRow {
+                x: 12px;
+                y: index * root.account-step;
+                width: parent.width - 24px;
+                item: account;
+                active: index == root.active-account;
+                compact: root.compact;
+                clicked => { root.select-account(index); }
+                remove => { root.remove-account(index); }
+            }
+        }
+
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            AddAccount {
+                compact: root.compact;
+                clicked => { root.add-account(); }
+            }
+        }
+    }
+}
+
+component MessageRow inherits Rectangle {
+    in property <RowItem> item;
+    in property <bool> active;
+    callback clicked <=> touch.clicked;
+
+    height: Theme.row;
+
+    Rectangle {
+        x: 8px;
+        y: 2px;
+        width: parent.width - 16px;
+        height: parent.height - 4px;
+        border-radius: 10px;
+        background: !root.active && touch.has-hover ? Theme.hover : transparent;
+        animate background { duration: Theme.fast; }
+    }
+
+    HorizontalLayout {
+        padding-left: 18px;
+        padding-right: 20px;
+        spacing: 12px;
+        alignment: stretch;
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            Avatar {
+                initials: root.item.initials;
+                tone: root.item.tone;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 3px;
+            horizontal-stretch: 1;
+
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: root.item.sender;
+                    color: Theme.text;
+                    font-size: Theme.body;
+                    font-weight: root.item.unread ? 600 : 500;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                Text {
+                    text: root.item.date;
+                    color: root.item.unread ? Theme.accent : Theme.muted;
+                    font-size: Theme.small;
+                    font-weight: root.item.unread ? 600 : 400;
+                    vertical-alignment: center;
+                    horizontal-stretch: 0;
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: root.item.subject;
+                    color: root.item.unread ? Theme.text : Theme.muted;
+                    font-size: Theme.body;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                if root.item.starred: Rectangle {
+                    width: 13px;
+                    horizontal-stretch: 0;
+                    Path {
+                        y: (parent.height - self.height) / 2;
+                        width: 13px;
+                        height: 13px;
+                        viewbox-width: 24;
+                        viewbox-height: 24;
+                        commands: "M12 2.5l2.9 6 6.6.9-4.8 4.6 1.2 6.5-5.9-3.2-5.9 3.2 1.2-6.5L2.5 9.4l6.6-.9z";
+                        fill: Theme.accent;
+                    }
+                }
+                if root.item.unread: Rectangle {
+                    width: 8px;
+                    horizontal-stretch: 0;
+                    Rectangle {
+                        y: (parent.height - self.height) / 2;
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 4px;
+                        background: Theme.accent;
+                    }
+                }
+            }
+        }
+    }
+
+    touch := Press { }
+}
+
+/// The app's logo: the ribbons of the window icon from `scripts/make-icon.py`. These are paths
+/// because the software renderer scales images without smoothing. One translucent red stands in
+/// for the icon's multiplied colours, and darkens the same way where ribbons overlap.
+component Mark inherits Rectangle {
+    in property <length> size: 64px;
+
+    width: size;
+    height: size;
+    border-radius: size * 0.22;
+    background: #ffffff;
+
+    for ribbon in [
+        { color: #d80d2073, commands: "M112 230H52" },
+        { color: #d80d20cc, commands: "M52 230A52 52 0 0 1 0 178" },
+        { color: #d80d2099, commands: "M0 178V52" },
+        { color: #d80d20f2, commands: "M0 52A52 52 0 0 1 52 0" },
+        { color: #d80d20cc, commands: "M52 0H185" },
+        { color: #d80d2073, commands: "M185 0A45 45 0 0 1 230 45" },
+        { color: #d80d20b3, commands: "M230 45V125" },
+        { color: #d80d20f2, commands: "M230 125A45 45 0 0 1 140 125" },
+        { color: #d80d2059, commands: "M140 125V72" },
+        { color: #d80d2066, commands: "M50 125A45 45 0 0 1 140 125" },
+        { color: #d80d20bf, commands: "M140 125A45 45 0 0 1 50 125" },
+    ]: Path {
+        width: root.size;
+        height: root.size;
+        viewbox-x: -88;
+        viewbox-y: -88;
+        viewbox-width: 406;
+        viewbox-height: 406;
+        commands: ribbon.commands;
+        stroke: ribbon.color;
+        stroke-width: root.size * 30 / 406;
+        stroke-line-cap: round;
+        fill: transparent;
+    }
+}
+
+component GoogleMark inherits Rectangle {
+    width: 18px;
+    height: 18px;
+    for part in [
+        { color: #ea4335, commands: "M9 3.48c1.69 0 2.83.73 3.48 1.34l2.54-2.48C13.46.89 11.43 0 9 0 5.48 0 2.44 2.02.96 4.96l2.91 2.26C4.6 5.05 6.62 3.48 9 3.48z" },
+        { color: #4285f4, commands: "M17.64 9.2c0-.74-.06-1.28-.19-1.84H9v3.34h4.96c-.1.83-.64 2.08-1.84 2.92l2.84 2.2c1.7-1.57 2.68-3.88 2.68-6.62z" },
+        { color: #fbbc05, commands: "M3.88 10.78A5.54 5.54 0 0 1 3.58 9c0-.62.11-1.22.29-1.78L.96 4.96A9 9 0 0 0 0 9c0 1.45.35 2.82.96 4.04l2.92-2.26z" },
+        { color: #34a853, commands: "M9 18c2.43 0 4.47-.8 5.96-2.18l-2.84-2.2c-.76.53-1.78.9-3.12.9-2.38 0-4.4-1.57-5.12-3.74L.97 13.04C2.44 15.98 5.48 18 9 18z" },
+    ]: Path {
+        width: 18px;
+        height: 18px;
+        viewbox-width: 18;
+        viewbox-height: 18;
+        commands: part.commands;
+        fill: part.color;
+    }
+}
+
+component SignIn inherits Rectangle {
+    in property <string> message;
+    in property <bool> enabled;
+    in property <int> entrance;
+    in property <bool> can-go-back;
+    callback sign-in();
+    callback back();
+
+    background: Theme.frame;
+
+    Reveal {
+        key: root.entrance;
+        rise: 14px;
+        length: Theme.motion ? 420ms : 0ms;
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 0;
+
+            HorizontalLayout {
+                alignment: center;
+                Mark { }
+            }
+            Rectangle { height: 20px; }
+            Text {
+                text: "mailfunction";
+                color: Theme.on-frame;
+                font-size: 28px;
+                font-weight: 600;
+                horizontal-alignment: center;
+            }
+            Rectangle { height: 36px; }
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 244px;
+                    height: 44px;
+                    border-radius: 10px;
+                    opacity: root.enabled ? 1 : 0.55;
+                    background: touch.pressed ? #f3e6e8 : touch.has-hover ? #fbf3f4 : #ffffff;
+                    animate background { duration: Theme.fast; }
+                    animate opacity { duration: Theme.glide; }
+
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 12px;
+                        VerticalLayout {
+                            alignment: center;
+                            GoogleMark { }
+                        }
+                        Text {
+                            text: "Sign in with Google";
+                            color: #231417;
+                            font-size: Theme.body;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    touch := Press {
+                        enabled: root.enabled;
+                        clicked => { root.sign-in(); }
+                    }
+                }
+            }
+            Rectangle { height: 18px; }
+            HorizontalLayout {
+                alignment: center;
+                Text {
+                    width: 420px;
+                    text: root.message;
+                    color: Theme.on-frame-muted;
+                    font-size: Theme.small;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+
+    if root.can-go-back: Rectangle {
+        x: 12px;
+        y: 10px;
+        width: 72px;
+        height: 34px;
+        border-radius: 9px;
+        background: back.has-hover ? Theme.frame-hover : transparent;
+        animate background { duration: Theme.fast; }
+        Text {
+            text: "Back";
+            color: Theme.on-frame;
+            font-size: Theme.body;
+            font-weight: 500;
+        }
+        back := Press {
+            clicked => { root.back(); }
+        }
+    }
+}
+
+/// The lines of a message that is on its way. A soft wave runs down them for as long as this
+/// exists, and it exists only while a message loads, so the app paints nothing once it arrives.
+component Skeleton inherits VerticalLayout {
+    padding-left: Theme.gutter;
+    padding-top: 26px;
+    spacing: 15px;
+    alignment: start;
+
+    // Shown only if the wait is long enough to notice, so fast opens do not flicker.
+    private property <float> shown: 0;
+    init => { self.shown = 1; }
+    animate shown { delay: Theme.motion ? 120ms : 0ms; duration: Theme.glide; }
+
+    private property <float> phase: Theme.motion ? animation-tick() / 1300ms : 0;
+
+    for width[index] in [84%, 94%, 71%, 89%, 52%]: Rectangle {
+        private property <float> wave: Theme.motion ? 0.5 + 0.5 * Math.sin((root.phase - index * 0.13) * 360deg) : 1;
+        width: Math.min(620px, root.width - 2 * Theme.gutter) * width;
+        height: 11px;
+        border-radius: 5.5px;
+        background: Theme.faint;
+        opacity: root.shown * (0.4 + 0.6 * self.wave);
+    }
+}
+
+component Sheet inherits Rectangle {
+    background: Theme.sheet;
+    border-top-left-radius: 14px;
+}
+
+export component App inherits Window {
+    title: "mailfunction";
+    preferred-width: 1280px;
+    preferred-height: 760px;
+    min-width: 900px;
+    min-height: 480px;
+    background: Theme.frame-top;
+    default-font-family: "Be Vietnam Pro";
+    forward-focus: keys;
+
+    in property <bool> signed-in;
+    in property <bool> can-sign-in: true;
+    in property <string> sign-in-message;
+    /// Signing in to one more account, over the mail of those already here.
+    in property <bool> adding;
+    in property <[AccountItem]> accounts;
+    in property <int> active-account;
+    in property <bool> syncing;
+    in property <bool> needs-sign-in;
+    in property <[LabelItem]> labels;
+    in property <int> first-custom-label;
+    in property <int> active-label;
+    in property <[RowItem]> rows;
+    in-out property <int> selected-row: -1;
+    in property <Pane> pane: Pane.empty;
+    in property <MessageView> message;
+    /// Bumped to replay the entrance of the list, the message header and the message body.
+    in property <int> list-key;
+    in property <int> header-key;
+    in property <int> body-key;
+    in property <int> entrance-key;
+
+    out property <length> slot-x: slot.absolute-position.x;
+    out property <length> slot-y: slot.absolute-position.y;
+    out property <length> slot-w: slot.width;
+    out property <length> slot-h: slot.height;
+
+    private property <bool> dark: Theme.dark;
+    // Set by a handler, not a binding: the rail's width feeds the window's size constraints.
+    private property <bool> compact;
+    private property <LabelItem> label: root.labels[root.active-label];
+
+    callback sign-in();
+    callback add-account();
+    callback cancel-add-account();
+    callback sign-in-again();
+    callback select-account(int);
+    callback remove-account(int);
+    callback select-label(int);
+    callback select-row(int);
+    callback slot-changed();
+    callback theme-changed();
+
+    changed dark => { root.theme-changed(); }
+    changed width => { self.compact = self.width < 1060px; }
+
+    /// Scrolls the list so that `row` is visible.
+    public function reveal(row: int) {
+        let top = row * Theme.row;
+        if (top + list.content-y < 0) {
+            list.content-y = -top;
+        } else if (top + Theme.row + list.content-y > list.visible-height) {
+            list.content-y = list.visible-height - top - Theme.row;
+        }
+    }
+
+    public function scroll-to-top() { list.content-y = 0; }
+
+    function move(by: int) {
+        let next = Math.clamp(root.selected-row + by, 0, root.rows.length - 1);
+        if (root.rows.length > 0 && next != root.selected-row) {
+            root.select-row(next);
+            root.reveal(next);
+        }
+    }
+
+    keys := FocusScope {
+        key-pressed(event) => {
+            if (!root.signed-in || root.adding) {
+                if (event.text == Key.Return && root.can-sign-in) {
+                    root.sign-in();
+                    return accept;
+                }
+                if (event.text == Key.Escape && root.adding) {
+                    root.cancel-add-account();
+                    return accept;
+                }
+                return reject;
+            }
+            if (event.modifiers.control && event.text.is-float()) {
+                let index = event.text.to-float() - 1;
+                if (index >= 0 && index < root.accounts.length) {
+                    root.select-account(index);
+                    return accept;
+                }
+            }
+            if (event.text == Key.DownArrow || event.text == "j") {
+                root.move(1);
+                return accept;
+            }
+            if (event.text == Key.UpArrow || event.text == "k") {
+                root.move(-1);
+                return accept;
+            }
+            reject
+        }
+
+        SignIn {
+            visible: !root.signed-in || root.adding;
+            message: root.sign-in-message;
+            enabled: root.can-sign-in;
+            entrance: root.entrance-key;
+            can-go-back: root.adding;
+            sign-in => { root.sign-in(); }
+            back => {
+                root.cancel-add-account();
+                keys.focus();
+            }
+        }
+
+        HorizontalLayout {
+            visible: root.signed-in && !root.adding;
+
+            Rail {
+                labels: root.labels;
+                active-label: root.active-label;
+                first-custom: root.first-custom-label;
+                compact: root.compact;
+                accounts: root.accounts;
+                active-account: root.active-account;
+                select(index) => {
+                    root.select-label(index);
+                    keys.focus();
+                }
+                select-account(index) => {
+                    root.select-account(index);
+                    keys.focus();
+                }
+                remove-account(index) => {
+                    root.remove-account(index);
+                    keys.focus();
+                }
+                add-account => {
+                    root.add-account();
+                    keys.focus();
+                }
+            }
+
+            Sheet {
+                HorizontalLayout {
+                    VerticalLayout {
+                        width: 348px;
+
+                        Rectangle {
+                            height: 66px;
+                            HorizontalLayout {
+                                padding-left: 20px;
+                                padding-right: 20px;
+                                padding-top: 8px;
+                                spacing: 8px;
+                                Text {
+                                    text: root.label.name;
+                                    color: Theme.text;
+                                    font-size: Theme.heading;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                                if root.label.unread != "": Text {
+                                    text: root.label.unread + " unread";
+                                    color: Theme.accent;
+                                    font-size: Theme.small;
+                                    font-weight: 500;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 0;
+                                }
+                            }
+
+                            // Runs only while syncing, and touches two rows of pixels.
+                            if root.syncing: Rectangle {
+                                y: parent.height - 2px;
+                                height: 2px;
+                                clip: true;
+                                Rectangle {
+                                    private property <float> sweep: Math.mod(animation-tick() / 1300ms, 1);
+                                    x: (parent.width + self.width) * self.sweep - self.width;
+                                    width: 120px;
+                                    height: 2px;
+                                    background: @linear-gradient(90deg, Theme.accent.transparentize(1) 0%, Theme.accent 50%, Theme.accent.transparentize(1) 100%);
+                                }
+                            }
+                        }
+
+                        if root.needs-sign-in: Rectangle {
+                            height: 40px;
+                            background: Theme.selected;
+                            HorizontalLayout {
+                                padding-left: 20px;
+                                padding-right: 20px;
+                                Text {
+                                    text: "This account has stopped syncing";
+                                    color: Theme.text;
+                                    font-size: Theme.small;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                                Text {
+                                    text: "Sign in";
+                                    color: Theme.accent;
+                                    font-size: Theme.small;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 0;
+                                }
+                            }
+                            Press {
+                                clicked => {
+                                    root.sign-in-again();
+                                    keys.focus();
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            vertical-stretch: 1;
+                            clip: true;
+
+                            Reveal {
+                                key: root.list-key;
+                                length: Theme.glide;
+
+                                Rectangle {
+                                    // One marker slides between rows. It rides along with the
+                                    // scroll position, and animates only between rows.
+                                    Rectangle {
+                                        y: list.content-y;
+                                        height: 0;
+                                        Rectangle {
+                                            x: 8px;
+                                            y: Math.max(root.selected-row, 0) * Theme.row + 2px;
+                                            width: list.visible-width - 16px;
+                                            height: Theme.row - 4px;
+                                            border-radius: 10px;
+                                            background: Theme.selected;
+                                            opacity: root.selected-row >= 0 ? 1 : 0;
+                                            animate y { duration: Theme.glide; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                                            animate opacity { duration: Theme.fast; }
+                                        }
+                                    }
+
+                                    list := ListView {
+                                        for row[index] in root.rows: MessageRow {
+                                            item: row;
+                                            active: index == root.selected-row;
+                                            clicked => {
+                                                root.select-row(index);
+                                                keys.focus();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if root.rows.length == 0 && root.label.name != "": Text {
+                                text: root.label.name + " is empty";
+                                color: Theme.muted;
+                                font-size: Theme.body;
+                            }
+                        }
+                    }
+
+                    Rectangle { width: 1px; background: Theme.line; }
+
+                    VerticalLayout {
+                        Reveal {
+                            key: root.header-key;
+                            vertical-stretch: 0;
+
+                            if root.pane != Pane.empty: VerticalLayout {
+                                padding-left: Theme.gutter;
+                                padding-right: Theme.gutter;
+                                padding-top: 26px;
+                                padding-bottom: 18px;
+                                spacing: 14px;
+
+                                Text {
+                                    text: root.message.subject;
+                                    color: Theme.text;
+                                    font-size: Theme.title;
+                                    font-weight: 600;
+                                    wrap: word-wrap;
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 12px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        horizontal-stretch: 0;
+                                        Avatar {
+                                            size: 40px;
+                                            initials: root.message.initials;
+                                            tone: root.message.tone;
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 2px;
+                                        horizontal-stretch: 1;
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            Text {
+                                                text: root.message.sender;
+                                                color: Theme.text;
+                                                font-size: Theme.body;
+                                                font-weight: 600;
+                                                overflow: elide;
+                                                horizontal-stretch: 0;
+                                            }
+                                            Text {
+                                                text: root.message.address;
+                                                color: Theme.muted;
+                                                font-size: Theme.small;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                                horizontal-stretch: 1;
+                                            }
+                                            Text {
+                                                text: root.message.date;
+                                                color: Theme.muted;
+                                                font-size: Theme.small;
+                                                vertical-alignment: center;
+                                                horizontal-stretch: 0;
+                                            }
+                                        }
+                                        if root.message.recipients != "": Text {
+                                            text: "To " + root.message.recipients;
+                                            color: Theme.muted;
+                                            font-size: Theme.small;
+                                            overflow: elide;
+                                        }
+                                    }
+                                }
+
+                                if root.message.attachments != "": HorizontalLayout {
+                                    spacing: 7px;
+                                    Rectangle {
+                                        width: 15px;
+                                        horizontal-stretch: 0;
+                                        Icon {
+                                            y: (parent.height - self.height) / 2;
+                                            width: 15px;
+                                            height: 15px;
+                                            tint: Theme.muted;
+                                            stroke-width: 1.3px;
+                                            commands: "M16.5 7.5v9a4.5 4.5 0 0 1-9 0V6a3 3 0 0 1 6 0v9.5a1.5 1.5 0 0 1-3 0V8";
+                                        }
+                                    }
+                                    Text {
+                                        text: root.message.attachments;
+                                        color: Theme.muted;
+                                        font-size: Theme.small;
+                                        overflow: elide;
+                                        horizontal-stretch: 1;
+                                    }
+                                }
+                            }
+                        }
+
+                        if root.pane != Pane.empty: Rectangle {
+                            height: 1px;
+                            Rectangle {
+                                x: Theme.gutter;
+                                width: parent.width - 2 * Theme.gutter;
+                                background: Theme.line;
+                            }
+                        }
+
+                        // The webview is a child window placed over this slot.
+                        slot := Rectangle {
+                            vertical-stretch: 1;
+                            changed width => { root.slot-changed(); }
+                            changed height => { root.slot-changed(); }
+                            changed absolute-position => { root.slot-changed(); }
+
+                            if root.pane == Pane.empty: VerticalLayout {
+                                alignment: center;
+                                spacing: 14px;
+                                HorizontalLayout {
+                                    alignment: center;
+                                    Mark {
+                                        size: 52px;
+                                        opacity: 0.3;
+                                    }
+                                }
+                                Text {
+                                    text: root.rows.length > 0 ? "Select a message to read it" : "";
+                                    color: Theme.muted;
+                                    font-size: Theme.body;
+                                    horizontal-alignment: center;
+                                }
+                            }
+
+                            if root.pane == Pane.loading: Skeleton { }
+
+                            Reveal {
+                                key: root.body-key;
+                                rise: 6px;
+
+                                if root.pane == Pane.text: Flickable {
+                                    content-height: body.preferred-height + 52px;
+                                    body := TextInput {
+                                        x: Theme.gutter;
+                                        y: 22px;
+                                        width: Math.min(680px, parent.width - 2 * Theme.gutter);
+                                        text: root.message.text;
+                                        read-only: true;
+                                        wrap: word-wrap;
+                                        single-line: false;
+                                        color: Theme.text;
+                                        selection-background-color: Theme.selected;
+                                        selection-foreground-color: Theme.text;
+                                        font-size: Theme.reading;
+                                    }
+                                }
+                            }
+
+                            if root.pane == Pane.failed: Text {
+                                text: "This message could not be loaded. Check your connection and open it again.";
+                                color: Theme.muted;
+                                font-size: Theme.body;
+                                horizontal-alignment: center;
+                                wrap: word-wrap;
+                                width: parent.width - 2 * Theme.gutter;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

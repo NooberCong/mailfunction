@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["spikes/webview-host"]
+members = ["crates/core", "crates/app"]
 
 [profile.release]
 opt-level = 3

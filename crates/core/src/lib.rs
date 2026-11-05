@@ -1,0 +1,33 @@
+//! Everything that is not UI: the local store, IMAP sync, sign-in and message rendering.
+//!
+//! The UI reads only from the store through a [`store::Reader`] and hears about changes from
+//! the [`engine::Engine`], so it never waits on the network.
+
+pub mod engine;
+pub mod imap;
+pub mod oauth;
+pub mod render;
+pub mod secrets;
+pub mod store;
+pub mod sync;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("database: {0}")]
+    Sql(#[from] rusqlite::Error),
+    #[error("imap: {0}")]
+    Imap(#[from] async_imap::error::Error),
+    #[error("network: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("http: {0}")]
+    Http(#[from] ureq::Error),
+    #[error("credential store: {0}")]
+    Keyring(#[from] keyring_core::Error),
+    /// The server or user refused the credentials. Retrying will not help; sign in again.
+    #[error("sign-in failed: {0}")]
+    Auth(String),
+    #[error("{0}")]
+    Protocol(String),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;

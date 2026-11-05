@@ -103,6 +103,46 @@ Testing is what makes this survivable for one person, and nobody publishes a com
 
 Commercial use changes the paperwork but not the architecture, as long as no server touches mail. Passing 100 lifetime Google users triggers restricted-scope verification. **Whether a backend-free client also needs paid CASA remains unresolved**, because Google's developer docs tie it to server access ([verification](https://developers.google.com/identity/protocols/oauth2/production-readiness/restricted-scope-verification)) while its Help Center applies it to all restricted scopes ([security assessment](https://support.google.com/cloud/answer/13465431)). Unverified vendor figures run from a few hundred dollars to about $5,400 a year ([Deepstrike](https://deepstrike.io/blog/google-casa-security-assessment-2025)). Ask Google during verification. Adding a server to hide the client secret, or for send-later or cross-device state, is the clearest way into that requirement. Microsoft needs publisher verification for restrictive tenants. For distribution, the Store is free for individuals and its apps never hit SmartScreen warnings ([SmartScreen](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation), [Windows blog](https://blogs.windows.com/windowsdeveloper/2025/09/10/free-developer-registration-for-individual-developers-on-microsoft-store/)). Artifact Signing starts at $9.99 a month, but individuals must be in the US or Canada ([quickstart](https://learn.microsoft.com/en-us/azure/artifact-signing/quickstart)), which rules it out for an individual in Vietnam. The Store is therefore the primary public route (confirm Vietnam is among its supported markets), and direct downloads would need an OV certificate from a CA with a cloud HSM, roughly $180 to $430 or more a year, with [Velopack](https://github.com/velopack/velopack) as the updater. MSIX limits on a mail client are poorly evidenced, so try one throwaway package before the beta. No app can make itself the default mail handler: prompt once and open Settings ([default apps](https://learn.microsoft.com/en-us/windows/apps/develop/windows-integration/default-apps-platform)). Read Slint's current royalty-free terms too, since its licence file requires attribution while its pricing page may not ([LICENSE](https://cdn.jsdelivr.net/gh/slint-ui/slint@1.16.0/LICENSE.md), [pricing](https://slint.dev/pricing)), and have a lawyer review before launch.
 
+## Phase 0 results (November 2026)
+
+These replace the estimates above where they differ. Numbers are private bytes across the process tree, measured on one Windows 11 machine at 150% scale, with release builds unless noted.
+
+| Question | Result |
+|---|---|
+| Can wry's WebView2 live inside a Slint window? | Yes. Resize tracking holds to within 1.5 px. Slint's inline popups are covered by the webview, so the reading pane must not use them; a top-level window works. |
+| Memory with no webview | 12 MB, against a 150 MB target. The GPU renderer costs 87 to 168 MB, so use the software renderer. |
+| Memory with one webview open | 177 MB across 8 processes, against a 350 MB target. The earlier 248 MB floor was too high for this setup. |
+| First and warm HTML open | 286 ms including the IMAP fetch and webview creation (debug build, local server); 35 ms warm. Creating the webview blocks the UI for 0.24 to 0.4 s once per session, which is accepted for now. |
+| 100k-message mailbox | Deepest list page 14 ms, sidebar with unread counts 15 ms, `meta.db` 22 MB. |
+| Remote content | Zero TCP connections to a test server from a hostile page, with the CSP loosened to test the other layers alone. |
+
+Three findings change the design:
+
+- **A request hook is not a network block.** Chromium preconnects to hosts it sees in the HTML, so WebResourceRequested alone still let TCP connections out, and a bare connection tells a tracker the mail was opened. The spike missed this because it counted HTTP requests rather than connections. The webview now runs with a dead proxy and failing DNS as well.
+- **A sanitiser bypass must not be able to open a URL.** Links open in the browser only when `IsUserInitiated` is true, and all other navigation is cancelled.
+- **An expunge must not delete at once.** A message moved between folders looks like a delete followed by a new message, which lost its identity and body. Messages with no location are now hidden, and purged only after a full pass over every folder.
+
+Still open:
+
+- Gmail itself is untested. Its extensions are covered by a scripted server built from Google's documentation, so the real authenticated capability list, X-GM-THRID on a real mailbox, and the "In production" token test remain to be done.
+- `async-imap` needed no patch, because raw commands expose X-GM-THRID and `EXAMINE (CONDSTORE)`. Partial fetch is not built: opening a message downloads all of it, attachments included, and a hostile server could exhaust memory with an oversized body. Bodies are only ever fetched from the provider over verified TLS, so this waits for attachment handling in Phase 1.
+- The `https://mail.google.com/` scope grants full mailbox control, and IMAP has no narrower option, so "read-only" is enforced by this client rather than by Google. A stolen refresh token could do anything.
+- Two copies with the same Message-ID in one folder collapse into one placement on generic IMAP. Gmail cannot hit this, but iCloud can, so Phase 2 must fix it.
+- `j` and `k` do not work while focus is inside an HTML message; Esc or a click on the list returns it. Esc itself is untested, because it needs real input.
+- Other display scales are covered offscreen only. Multi-monitor, screen readers and real newsletters are untested. Vietnamese text renders correctly, and IME input is untested until search adds a text box.
+
+## Interface notes (November 2026)
+
+The software renderer ignores drop shadows, rotation, scaling and rounded clipping, so the look is built from flat tonal layers, gradients and vector paths. Opacity is a single alpha multiply, so a fade costs no more than painting the content.
+
+Animation cost, measured at 1920x1080 and 150% scale in a release build: under 2 ms a frame on average for the heaviest case (opening a message), about 1 ms for wheel scrolling, 0.2 ms for row hover and 0.07 ms for the sync line. The app paints nothing once motion ends, and `crates/app/tests/motion.rs` enforces both. All motion follows the Windows "Show animations" setting.
+
+The reading pane has one rule: the old message goes with the click. A webview keeps showing its old page until the next one paints, and Chromium can hold that frame for around 600 ms on a same-origin navigation. Hiding the webview does not fix this, because a hidden one paints nothing and flashes its last page when shown: in a pixel test on the real window, that failed about 3 runs in 10. So the view is never hidden. It waits outside the window, loads there, and comes in once a capture has completed, the only signal WebView2 offers that a frame exists. Paint holding is switched off. Moving between messages now takes about 150 ms, a loading animation (0.22 ms a frame) covers anything slower, and `crates/app/tests/live.rs` fails if the old message outlives the click.
+
+## Accounts (November 2026)
+
+One thread runs every account, with two tasks and two connections each, because the work is almost all waiting on sockets. An account adds sockets, not a thread. The schema was multi-account from the start and message ids are unique across accounts, so nothing about stored mail changed. An account that loses its sign-in stops alone, and its local mail stays readable. Unread counts for all accounts take 14 ms on a 100,000-message mailbox, and removing that mailbox takes about a second, so removal runs off the UI thread. Mail in an account that is not on screen updates its count and leaves the list alone. Unified inbox remains Phase 2 work.
+
 ## Conclusion
 
 The research changes the shape of the problem more than the choice of tools. "High performance, minimal footprint" sounds like a language decision, but the language is worth tens of megabytes while webview lifecycle policy is worth hundreds. Likewise, supporting the big three looks like it demands the most capable IMAP stack, yet the extension most worth having is the one to switch off. The durable investment is the part nobody can sell you: a correct local store, a boring operation queue and a test harness that proves convergence. Those survive a change of UI toolkit, IMAP library or even provider adapter.
