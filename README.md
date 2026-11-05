@@ -24,17 +24,10 @@ leave waits in the Outbox and tries again. If the connection dies while mail is 
 or the app stops, nobody can say whether it went, so it returns to Drafts for its author to decide.
 
 The webview has no network at all. Remote images stay out of a message until the user loads them,
-once or always for that sender. The app then fetches them itself and hands them to the page as
-`data:` URLs, so the page's lockdown never changes. Loading them can still tell the sender the
-mail was opened.
-
-Avatars show a logo where one can be found: the domain's BIMI record first, then its website's
-icon, and initials otherwise. Each domain is asked directly, once, and the answer is kept for 30
-days. That shows the domain this machine's IP address, but no message content or address. Shared
-domains like gmail.com and anything in Spam are never looked up as senders.
-
-Closing the window leaves the app running in the notification area, so new mail still shows a
-notification. Quit from the icon's menu. Starting the app again brings its window back.
+once or always for that sender. A message then goes up at once, and its images come in behind it
+through the same hook that serves the page: from a disk cache, or fetched by the app. So the page's
+lockdown never changes, and a message opened again touches no server. Loading images the first time
+can still tell the sender the mail was opened.
 
 Settings are in the sidebar, or `Ctrl+,`, and apply as they change. The app's own are one JSON
 document in the store, so a new one needs no migration. Each account's name, signature and

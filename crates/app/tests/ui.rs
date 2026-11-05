@@ -3,7 +3,6 @@
 mod common;
 
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -128,6 +127,7 @@ fn the_whole_window() {
     window.set_size(PhysicalSize::new(1280, 760));
     let pane = RecordingPane::default();
     let html_shown = pane.shown.clone();
+    let answered = pane.images.clone();
     let notifier = RecordingNotifier::default();
     let notices = notifier.shown.clone();
     let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(pane), Box::new(notifier), Arc::new(Offline)).unwrap();
@@ -215,10 +215,10 @@ fn the_whole_window() {
     assert_eq!(account_colour(), slint::Rgb8Pixel::new(20, 160, 90));
 
     // Remote images stay out until asked for, and nothing is fetched by opening the message.
-    let opened = controller.selected_message().unwrap();
     let sender = reader.messages(inbox.label_id, 0, 20).unwrap()[1].from_addr.clone();
-    let fetched = HashMap::from([("https://t.example/p.gif".to_string(), "data:image/gif;base64,R0lG".to_string())]);
+    let page_image = "https://message.invalid/image/0";
     assert_eq!(app.get_image_bar(), ImageBar::Blocked);
+    assert!(!html_shown.borrow().last().unwrap().contains(page_image));
     shot(&app, "03-images-blocked");
     app.global::<Theme>().set_dark(true);
     settle();
@@ -236,17 +236,33 @@ fn the_whole_window() {
     settle();
     assert_eq!(app.get_slot_y(), one_line);
 
+    // Asked for, the page comes back at once and names only itself.
     click(&app, 1055.0, 212.0);
-    assert_eq!(app.get_image_bar(), ImageBar::Loading);
-    controller.images_fetched(opened, &HashMap::new());
+    assert_eq!(app.get_image_bar(), ImageBar::Hidden);
+    assert!(html_shown.borrow().last().unwrap().contains(page_image));
+    assert!(!html_shown.borrow().last().unwrap().contains("t.example"));
+
+    // Each request gets an answer. One for an image the page does not have is turned down.
+    controller.image_wanted(7, 70);
+    assert_eq!(answered.borrow().last(), Some(&(70, None)));
+    let key = controller.page_key().unwrap();
+    controller.image_fetched(key, 1, Some(b"GIF89a".to_vec()));
+    assert_eq!(answered.borrow().last(), Some(&(1, Some(b"GIF89a".to_vec()))));
+    assert_eq!(app.get_image_bar(), ImageBar::Hidden);
+
+    // When nothing comes at all, the user can try again.
+    app.invoke_load_images();
+    let key = controller.page_key().unwrap();
+    controller.image_fetched(key, 2, None);
     assert_eq!(app.get_image_bar(), ImageBar::Failed);
     settle();
     shot(&app, "03-images-failed");
     app.invoke_load_images();
-    controller.images_fetched(opened, &fetched);
     assert_eq!(app.get_image_bar(), ImageBar::Hidden);
-    assert!(html_shown.borrow().last().unwrap().contains("data:image/gif;base64,R0lG"));
-    assert!(!html_shown.borrow().last().unwrap().contains("t.example"));
+
+    // An answer for a page that has gone changes nothing on this one.
+    controller.image_fetched(key, 3, None);
+    assert_eq!(app.get_image_bar(), ImageBar::Hidden);
 
     // Once only: coming back to the message blocks them again.
     press(&app, "k");
@@ -255,32 +271,33 @@ fn the_whole_window() {
     assert_eq!(app.get_image_bar(), ImageBar::Blocked);
     assert!(!reader.images_allowed(account, &sender).unwrap());
 
-    // Always: from now on the message waits for its images, and the bar offers a way back.
+    // Always: from now on the message opens with them, and the bar offers a way back.
     app.invoke_always_load_images();
     assert!(reader.images_allowed(account, &sender.to_uppercase()).unwrap());
-    controller.images_fetched(opened, &fetched);
     assert_eq!(app.get_image_bar(), ImageBar::Allowed);
     settle();
     shot(&app, "03-images-allowed");
     press(&app, "k");
-    let shown_before = html_shown.borrow().len();
     press(&app, "j");
-    assert_eq!((app.get_pane(), app.get_image_bar()), (Pane::Loading, ImageBar::Loading));
-    assert_eq!(html_shown.borrow().len(), shown_before);
-    controller.images_fetched(opened, &fetched);
     assert_eq!((app.get_pane(), app.get_image_bar()), (Pane::Html, ImageBar::Allowed));
+    assert!(html_shown.borrow().last().unwrap().contains(page_image));
 
-    // A late answer for a message the user has left changes nothing.
+    // A late answer for a message the user has left changes nothing, and the next page has
+    // nothing to answer from.
+    let key = controller.page_key().unwrap();
     press(&app, "k");
-    controller.images_fetched(opened, &fetched);
+    controller.image_fetched(key, 4, None);
     assert_eq!((app.get_pane(), app.get_image_bar()), (Pane::Text, ImageBar::Hidden));
+    assert_eq!(controller.page_key(), None);
+    controller.image_wanted(0, 80);
+    assert_eq!(answered.borrow().last(), Some(&(80, None)));
     press(&app, "j");
-    controller.images_fetched(opened, &fetched);
 
     app.invoke_stop_loading_images();
     assert!(!reader.images_allowed(account, &sender).unwrap());
     assert_eq!(app.get_image_bar(), ImageBar::Blocked);
-    assert!(!html_shown.borrow().last().unwrap().contains("R0lG"));
+    assert!(!html_shown.borrow().last().unwrap().contains(page_image));
+    assert_eq!(controller.page_key(), None);
     settle();
 
     // No local body and no engine: the pane says so rather than sitting empty forever.

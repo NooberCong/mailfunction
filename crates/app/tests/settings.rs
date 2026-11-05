@@ -2,7 +2,6 @@
 
 mod common;
 
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -27,10 +26,12 @@ struct Watched {
     logos: Mutex<Vec<String>>,
 }
 
+const GIF: &[u8] = b"GIF89a";
+
 impl Network for Watched {
-    fn images(&self, urls: &[String]) -> HashMap<String, String> {
-        self.images.lock().unwrap().extend_from_slice(urls);
-        HashMap::new()
+    fn image(&self, url: &str) -> Option<Vec<u8>> {
+        self.images.lock().unwrap().push(url.to_string());
+        None
     }
 
     fn logo(&self, domain: &str) -> Logo {
@@ -247,16 +248,17 @@ fn images(w: &World) {
     shot(&w.app, "41-all-images-on");
     press(&w.app, ESCAPE);
 
-    // Back at the message they load, with no bar coming and going around them.
-    assert_eq!((w.app.get_pane(), w.app.get_image_bar()), (Pane::Loading, ImageBar::Hidden));
-    let opened = w.controller.selected_message().unwrap();
-    let fetched = HashMap::from([(IMAGE.to_string(), "data:image/gif;base64,R0lG".to_string())]);
-    w.controller.images_fetched(opened, &fetched);
+    // Back at the message the page goes up at once, with no bar coming and going around it.
     assert_eq!((w.app.get_pane(), w.app.get_image_bar()), (Pane::Html, ImageBar::Hidden));
-    assert!(w.shown.borrow()[shown..].last().unwrap().contains("R0lG"));
+    assert!(w.shown.borrow()[shown..].last().unwrap().contains("https://message.invalid/image/0"));
+    let key = w.controller.page_key().unwrap();
+    w.controller.image_fetched(key, 1, Some(GIF.to_vec()));
+    assert_eq!(w.app.get_image_bar(), ImageBar::Hidden);
 
-    // A failure can still be retried.
-    w.controller.images_fetched(opened, &HashMap::new());
+    // A failure can still be retried, once nothing at all has come.
+    w.app.invoke_load_images();
+    let key = w.controller.page_key().unwrap();
+    w.controller.image_fetched(key, 2, None);
     assert_eq!(w.app.get_image_bar(), ImageBar::Failed);
 
     // Not in Spam, and that does not depend on how the message was reached.

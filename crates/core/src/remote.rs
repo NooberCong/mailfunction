@@ -4,12 +4,9 @@
 //! and it refuses private addresses: a message can name any URL, and without that check it could
 //! make this machine probe the router or anything else on its network.
 
-use std::collections::HashMap;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ureq::config::Config;
 use ureq::http::Uri;
@@ -17,17 +14,13 @@ use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver
 use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 use ureq::{Agent, Error, ResponseExt};
 
+use crate::images::FETCHES;
 use crate::logo;
-use crate::render::{MAX_INLINE_IMAGE, data_url};
+use crate::render::{MAX_INLINE_IMAGE, image_type};
 
 /// Some sites refuse anything that does not look like a browser, which would cost a logo.
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) mailfunction";
 const TIMEOUT: Duration = Duration::from_secs(8);
-/// A slow server must not hold a message back: what has arrived by then is shown.
-const IMAGES_DEADLINE: Duration = Duration::from_secs(10);
-const IMAGE_FETCHES: usize = 6;
-const MAX_IMAGES: usize = 100;
-const MAX_IMAGE_BYTES: usize = 48 * 1024 * 1024;
 
 /// What the search for a domain's logo found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,8 +35,8 @@ pub enum Logo {
 
 /// The app's way out to the web. Tests supply their own, so that none of them touches it.
 pub trait Network: Send + Sync {
-    /// Fetches images as `data:` URLs, by URL. Those that could not be fetched are left out.
-    fn images(&self, urls: &[String]) -> HashMap<String, String>;
+    /// An image's bytes, or nothing if it could not be fetched or is not an image.
+    fn image(&self, url: &str) -> Option<Vec<u8>>;
     fn logo(&self, domain: &str) -> Logo;
 }
 
@@ -51,8 +44,8 @@ pub trait Network: Send + Sync {
 pub struct Offline;
 
 impl Network for Offline {
-    fn images(&self, _: &[String]) -> HashMap<String, String> {
-        HashMap::new()
+    fn image(&self, _: &str) -> Option<Vec<u8>> {
+        None
     }
 
     fn logo(&self, _: &str) -> Logo {
@@ -134,6 +127,8 @@ impl Web {
             .proxy(None)
             .user_agent(USER_AGENT)
             .timeout_global(Some(TIMEOUT))
+            // A newsletter's images tend to share a host, and a new connection costs a handshake.
+            .max_idle_connections_per_host(FETCHES)
             .build();
         Self { agent: Agent::with_parts(config, DefaultConnector::default(), resolver) }
     }
@@ -153,26 +148,9 @@ impl Web {
 }
 
 impl Network for Web {
-    fn images(&self, urls: &[String]) -> HashMap<String, String> {
-        let deadline = Instant::now() + IMAGES_DEADLINE;
-        let urls = &urls[..urls.len().min(MAX_IMAGES)];
-        let (next, total) = (AtomicUsize::new(0), AtomicUsize::new(0));
-        let found = Mutex::new(HashMap::new());
-        std::thread::scope(|scope| {
-            for _ in 0..IMAGE_FETCHES {
-                scope.spawn(|| {
-                    while Instant::now() < deadline && total.load(Ordering::Relaxed) < MAX_IMAGE_BYTES {
-                        let Some(url) = urls.get(next.fetch_add(1, Ordering::Relaxed)) else { return };
-                        let Ok(image) = self.get(url, MAX_INLINE_IMAGE) else { continue };
-                        if let Some(data) = data_url(&image.bytes) {
-                            total.fetch_add(image.bytes.len(), Ordering::Relaxed);
-                            found.lock().expect("images lock").insert(url.clone(), data);
-                        }
-                    }
-                });
-            }
-        });
-        found.into_inner().expect("images lock")
+    fn image(&self, url: &str) -> Option<Vec<u8>> {
+        let bytes = self.get(url, MAX_INLINE_IMAGE).ok()?.bytes;
+        image_type(&bytes).map(|_| bytes)
     }
 
     fn logo(&self, domain: &str) -> Logo {
@@ -190,7 +168,7 @@ mod tests {
     use std::io::Write;
     use std::net::TcpListener;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
 
@@ -233,18 +211,17 @@ mod tests {
     #[test]
     fn a_local_address_in_a_message_is_never_contacted() {
         let (url, reached) = serve(PNG);
-        let found = Web::default().images(&[url]);
-        assert!(found.is_empty());
+        assert_eq!(Web::default().image(&url), None);
         assert!(!reached.load(Ordering::SeqCst), "the local server was contacted");
     }
 
     #[test]
-    fn images_arrive_as_data_urls_and_anything_else_is_dropped() {
+    fn only_images_arrive() {
         let (image, _) = serve(PNG);
         let (page, _) = serve(b"<svg onload=alert(1)>");
-        let found = web_for_local_tests().images(&[image.clone(), page.clone()]);
-        assert!(found[&image].starts_with("data:image/png;base64,"), "{found:?}");
-        assert!(!found.contains_key(&page));
+        let web = web_for_local_tests();
+        assert_eq!(web.image(&image).as_deref(), Some(PNG));
+        assert_eq!(web.image(&page), None);
     }
 
     #[test]

@@ -123,7 +123,7 @@ export struct AccountItem {
 
 export enum Pane { empty, loading, text, html, failed }
 
-export enum ImageBar { hidden, blocked, loading, failed, allowed }
+export enum ImageBar { hidden, blocked, failed, allowed }
 
 /// What the user can ask of the open thread, or of the app, from a button or a key.
 export enum Verb { archive, inbox, trash, spam, star, unread, read-all, reply, reply-all, forward, compose, undo }
@@ -981,8 +981,7 @@ component ImagesBar inherits Rectangle {
         spacing: 4px;
 
         Text {
-            text: root.state == ImageBar.loading ? "Loading images\u{2026}"
-                : root.state == ImageBar.failed ? "Images could not be loaded"
+            text: root.state == ImageBar.failed ? "Images could not be loaded"
                 : root.state == ImageBar.allowed ? "Images load for this sender"
                 : "Images hidden to protect your privacy";
             color: Theme.muted;

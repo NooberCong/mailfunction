@@ -16,7 +16,6 @@ pub mod webview;
 mod writing;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -25,6 +24,7 @@ use std::time::{Duration, Instant};
 use list::{MessageList, display_name, full_date, initials, tone};
 use logos::Logos;
 use mailfunction_core::engine::{Engine, Event};
+use mailfunction_core::images::{Images, Page};
 use mailfunction_core::remote::Network;
 use mailfunction_core::{logo, oauth, secrets};
 use mailfunction_core::compose;
@@ -95,8 +95,21 @@ pub trait HtmlPane {
     /// Starts loading a document, and sets [`Pane::Html`] once it is on screen. Until then the
     /// app shows that the message is loading. Returns false if the document cannot be shown.
     fn show(&self, app: &App, html: String) -> bool;
+    /// Answers a request the page made for an image, through [`Controller::image_wanted`].
+    fn image_ready(&self, ticket: u64, image: Option<Vec<u8>>);
     fn hide(&self);
     fn bounds_changed(&self, app: &App);
+}
+
+/// The remote images of the page on screen, which is what its requests are answered from. A page
+/// that has none of these has nothing fetched for it, whatever it asks for.
+struct PageImages {
+    page: Page,
+    /// Tells this page's answers from those of one the user has left.
+    key: u64,
+    urls: Vec<String>,
+    failed: usize,
+    arrived: bool,
 }
 
 /// How an account's connection is doing.
@@ -130,7 +143,6 @@ pub struct Controller {
     reader: Rc<Reader>,
     list: Rc<MessageList>,
     logos: Rc<Logos>,
-    network: Arc<dyn Network>,
     badge: badge::Badge,
     tray: tray::Tray,
     /// Unread Inbox mail across every account, as the taskbar button shows it.
@@ -166,6 +178,9 @@ pub struct Controller {
     /// A draft from elsewhere that opens in the composer once its body is here.
     opening_draft: Cell<Option<i64>>,
     pane: Box<dyn HtmlPane>,
+    images: Arc<Images>,
+    page_images: RefCell<Option<PageImages>>,
+    page_key: Cell<u64>,
     notifier: Box<dyn Notifier>,
     engine: RefCell<Option<Engine>>,
     client: Option<oauth::Client>,
@@ -189,7 +204,8 @@ impl Controller {
         let reader = Rc::new(Reader::open(dir)?);
         let settings = reader.settings();
         app.global::<Theme>().set_preferences(settings.into());
-        let logos = Rc::new(Logos::new(reader.clone(), &store, network.clone(), app.as_weak()));
+        let images = Images::new(dir.join("images"), network.clone());
+        let logos = Rc::new(Logos::new(reader.clone(), &store, network, app.as_weak()));
         logos.set_enabled(settings.sender_logos);
         let list = Rc::new(MessageList::new(reader.clone(), logos.clone()));
         app.set_rows(ModelRc::from(list.clone()));
@@ -208,7 +224,6 @@ impl Controller {
             reader,
             list,
             logos,
-            network,
             badge: badge::Badge::default(),
             tray: tray::Tray::default(),
             unread: Cell::new(0),
@@ -236,6 +251,9 @@ impl Controller {
             suggest_timer: Timer::default(),
             opening_draft: Cell::new(None),
             pane,
+            images,
+            page_images: RefCell::default(),
+            page_key: Cell::default(),
             notifier,
             engine: RefCell::default(),
             client,
@@ -486,11 +504,12 @@ impl Controller {
         if let Some(engine) = self.engine.borrow_mut().as_mut() {
             engine.remove(removed.id);
         }
-        let store = self.store.clone();
+        let (store, images) = (self.store.clone(), self.images.clone());
         std::thread::spawn(move || {
             // If either fails the account returns at the next launch, asking to sign in again.
             let _ = secrets::delete(&removed.email);
             let _ = store.remove_account(removed.id);
+            images.clear();
         });
         if self.accounts.borrow().is_empty() {
             self.leave_settings();
@@ -505,7 +524,7 @@ impl Controller {
     /// Covers the mail with the sign-in screen. The webview sits above everything else in the
     /// window, so it has to go first.
     fn open_sign_in(&self, message: &str) {
-        self.pane.hide();
+        self.hide_page();
         if self.client.is_some() {
             self.app.set_sign_in_message(message.into());
         }
@@ -667,7 +686,7 @@ impl Controller {
     fn close_window(&self) {
         self.save_identities();
         chrome::hide(&self.app);
-        self.pane.hide();
+        self.hide_page();
         if !self.settings.get().keep_running {
             let _ = slint::quit_event_loop();
         }
@@ -892,7 +911,7 @@ impl Controller {
         self.app.set_image_bar(ImageBar::Hidden);
         self.app.set_pane(Pane::Empty);
         self.app.set_picking(false);
-        self.pane.hide();
+        self.hide_page();
     }
 
     fn current_role(&self) -> Role {
@@ -983,7 +1002,7 @@ impl Controller {
         self.selected_sender.replace(message.from_addr.clone());
         self.app.set_image_bar(ImageBar::Hidden);
         // The old message goes in the same frame as the click, whatever the new one takes.
-        self.pane.hide();
+        self.hide_page();
         let mut view = header(&message);
         view.logo = self.list.logo(&message.from_addr, HEADER_AVATAR);
         self.app.set_message(view);
@@ -1026,24 +1045,39 @@ impl Controller {
     }
 
     fn show_body(&self, id: i64) {
-        let rendered = self.reader.body(id).ok().flatten().and_then(|raw| render::message(&raw));
-        let Some(rendered) = rendered else {
-            self.pane.hide();
+        self.show_page(id, self.all_images_load(id) || self.sender_allowed());
+    }
+
+    /// Puts a message up at once. Any remote images it loads come in behind it.
+    fn show_page(&self, id: i64, load_images: bool) {
+        let raw = self.reader.body(id).ok().flatten();
+        let render = if load_images { render::message_with_images } else { render::message };
+        let Some((raw, rendered)) = raw.and_then(|raw| render(&raw).map(|rendered| (raw, rendered))) else {
+            self.hide_page();
             self.app.set_pane(Pane::Failed);
             return;
         };
-        if rendered.remote_images.is_empty() {
-            self.display(rendered, ImageBar::Hidden);
-        } else if self.all_images_load(id) {
-            self.app.set_pane(Pane::Loading);
-            self.fetch_images(id, rendered.remote_images);
-        } else if self.sender_allowed() {
-            self.app.set_pane(Pane::Loading);
-            self.app.set_image_bar(ImageBar::Loading);
-            self.fetch_images(id, rendered.remote_images);
-        } else {
-            self.display(rendered, ImageBar::Blocked);
-        }
+        let bar = match (rendered.remote_images.is_empty(), load_images) {
+            (true, _) => ImageBar::Hidden,
+            (false, false) => ImageBar::Blocked,
+            (false, true) if !self.all_images_load(id) && self.sender_allowed() => ImageBar::Allowed,
+            (false, true) => ImageBar::Hidden,
+        };
+        self.page_key.set(self.page_key.get() + 1);
+        self.page_images.replace(load_images.then(|| PageImages {
+            page: self.images.page(),
+            key: self.page_key.get(),
+            urls: rendered.remote_images.clone(),
+            failed: 0,
+            arrived: false,
+        }));
+        self.display(&raw, rendered, bar);
+    }
+
+    /// Takes the page away, along with whatever it was still waiting for.
+    fn hide_page(&self) {
+        self.page_images.take();
+        self.pane.hide();
     }
 
     fn sender_allowed(&self) -> bool {
@@ -1059,13 +1093,10 @@ impl Controller {
         self.settings.get().show_all_images && !spam
     }
 
-    /// Fetches the selected message's images, because the user asked for them.
+    /// Shows the selected message with its images, because the user asked for them.
     fn load_images(&self) {
-        let Some(id) = self.selected.get() else { return };
-        let rendered = self.reader.body(id).ok().flatten().and_then(|raw| render::message(&raw));
-        if let Some(rendered) = rendered {
-            self.app.set_image_bar(ImageBar::Loading);
-            self.fetch_images(id, rendered.remote_images);
+        if let Some(id) = self.selected.get() {
+            self.show_page(id, true);
         }
     }
 
@@ -1079,28 +1110,34 @@ impl Controller {
         }
     }
 
-    /// The webview has no network, so the images are fetched here and go in as `data:` URLs.
-    fn fetch_images(&self, id: i64, urls: Vec<String>) {
-        let network = self.network.clone();
-        std::thread::spawn(move || {
-            let images = network.images(&urls);
-            on_ui_thread(move |this| this.images_fetched(id, &images));
+    /// The page asks for one of its images. The webview has no network, so it is fetched here.
+    pub fn image_wanted(&self, index: usize, ticket: u64) {
+        let images = self.page_images.borrow();
+        let Some((images, url)) = images.as_ref().and_then(|i| Some((i, i.urls.get(index)?))) else {
+            return self.pane.image_ready(ticket, None);
+        };
+        let key = images.key;
+        images.page.get(url.clone(), move |image| {
+            on_ui_thread(move |this| this.image_fetched(key, ticket, image));
         });
     }
 
-    /// Shows a message with the images that arrived, unless the user has moved on from it.
-    pub fn images_fetched(&self, id: i64, images: &HashMap<String, String>) {
-        if self.selected.get() != Some(id) {
-            return;
+    /// Hands an image to the page. A page that gets none at all says so, for trying again.
+    pub fn image_fetched(&self, key: u64, ticket: u64, image: Option<Vec<u8>>) {
+        let found = image.is_some();
+        self.pane.image_ready(ticket, image);
+        let mut images = self.page_images.borrow_mut();
+        let Some(images) = images.as_mut().filter(|i| i.key == key) else { return };
+        images.arrived |= found;
+        images.failed += usize::from(!found);
+        if !images.arrived && images.failed == images.urls.len() {
+            self.app.set_image_bar(ImageBar::Failed);
         }
-        let rendered = self.reader.body(id).ok().flatten().and_then(|raw| render::message_with_images(&raw, images));
-        let Some(rendered) = rendered else { return };
-        let bar = match (images.is_empty(), !self.all_images_load(id) && self.sender_allowed()) {
-            (true, _) => ImageBar::Failed,
-            (false, true) => ImageBar::Allowed,
-            (false, false) => ImageBar::Hidden,
-        };
-        self.display(rendered, bar);
+    }
+
+    /// The key that answers for the page on screen, if it loads images.
+    pub fn page_key(&self) -> Option<u64> {
+        self.page_images.borrow().as_ref().map(|i| i.key)
     }
 
     pub fn selected_message(&self) -> Option<i64> {
@@ -1120,20 +1157,18 @@ impl Controller {
         }
     }
 
-    fn display(&self, rendered: Rendered, bar: ImageBar) {
+    fn display(&self, raw: &[u8], rendered: Rendered, bar: ImageBar) {
         self.app.set_image_bar(bar);
         let mut view = self.app.get_message();
         view.recipients = rendered.recipients.into();
-        let raw = self.selected.get().and_then(|id| self.reader.body(id).ok().flatten());
-        let files: Vec<FileItem> = raw
-            .map_or_else(Vec::new, |raw| compose::attachments(&raw))
+        let files: Vec<FileItem> = compose::attachments(raw)
             .into_iter()
             .map(|file| FileItem { size: writing::human_size(file.data.len()).into(), name: file.name.into() })
             .collect();
         view.attachments = ModelRc::new(VecModel::from(files));
         match rendered.body {
             Body::Text(text) => {
-                self.pane.hide();
+                self.hide_page();
                 view.text = text.into();
                 self.app.set_message(view);
                 self.app.set_pane(Pane::Text);

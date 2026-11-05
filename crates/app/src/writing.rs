@@ -139,7 +139,7 @@ impl Controller {
 
     fn open_composer(self: &Rc<Self>, fields: Compose, draft: Option<i64>, reply_to: Option<i64>, files: &[Attachment]) {
         self.finish_writing();
-        self.pane.hide();
+        self.hide_page();
         self.app.set_draft_to(fields.to.as_str().into());
         self.app.set_draft_cc(fields.cc.as_str().into());
         self.app.set_draft_bcc(fields.bcc.as_str().into());

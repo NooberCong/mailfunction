@@ -2,20 +2,23 @@
 //! because this one window accounts for almost all of the app's memory.
 //!
 //! Sanitised HTML is served from an in-memory URL through the same interception hook that
-//! refuses everything else, so there is no size limit and the CSP is a real header. Mail is
-//! hostile: scripts are off, nothing can reach the network, and links open in the browser.
+//! refuses everything else, so there is no size limit and the CSP is a real header. Remote images
+//! come through that hook too, each held open until the app has it, so the page never waits for
+//! them. Mail is hostile: scripts are off, nothing can reach the network, and links open in the
+//! browser.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
-use mailfunction_core::render::CONTENT_SECURITY_POLICY;
+use mailfunction_core::render::{CONTENT_SECURITY_POLICY, DOCUMENT_ORIGIN, image_index, image_type};
 use slint::{ComponentHandle, Timer, TimerMode};
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
 use webview2_com::{
-    AcceleratorKeyPressedEventHandler, CapturePreviewCompletedHandler, NavigationStartingEventHandler,
-    WebResourceRequestedEventHandler, take_pwstr,
+    AcceleratorKeyPressedEventHandler, CapturePreviewCompletedHandler, DOMContentLoadedEventHandler,
+    NavigationStartingEventHandler, WebResourceRequestedEventHandler, take_pwstr,
 };
 use windows::Win32::UI::Shell::{SHCreateMemStream, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -23,10 +26,8 @@ use windows::core::{BOOL, HSTRING, Interface, PWSTR, w};
 use wry::dpi::{PhysicalPosition, PhysicalSize};
 use wry::{Rect, WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows, WebViewExtWindows};
 
-use crate::{App, HtmlPane, Pane, Theme};
+use crate::{App, HtmlPane, Pane, Theme, on_ui_thread};
 
-/// Never resolved: every request for it is answered from memory.
-const DOCUMENT_ORIGIN: &str = "https://message.invalid/";
 const VK_ESCAPE: u32 = 0x1B;
 /// The page is served from memory, so the browser never needs a network. Refusing requests in
 /// the hook is not enough: Chromium preconnects to hosts it sees in the HTML before any request
@@ -70,12 +71,20 @@ pub fn open_externally(url: &str) {
     }
 }
 
+/// An image request, open until it is answered.
+struct HeldRequest {
+    args: ICoreWebView2WebResourceRequestedEventArgs,
+    deferral: ICoreWebView2Deferral,
+}
+
 #[derive(Default)]
 struct Document {
     url: String,
     html: String,
     /// False for a page nobody is waiting for: the user has left it, or it is the empty one.
     wanted: bool,
+    /// By ticket. They go with the page, whose navigating away has cancelled them.
+    held: HashMap<u64, HeldRequest>,
 }
 
 /// What the page has tried to do, for checking that the lockdown holds.
@@ -83,6 +92,7 @@ struct Document {
 pub struct Activity {
     pub refused: RefCell<Vec<String>>,
     pub cancelled_navigations: RefCell<Vec<String>>,
+    pub image_requests: Cell<u32>,
     pub loaded: Cell<u32>,
 }
 
@@ -103,6 +113,7 @@ pub struct Webview {
     policy: String,
     document: Rc<RefCell<Document>>,
     serial: Rc<Cell<u64>>,
+    tickets: Rc<Cell<u64>>,
     open: Rc<RefCell<Option<Open>>>,
     app: Rc<RefCell<slint::Weak<App>>>,
     placement: Rc<Cell<Placement>>,
@@ -124,6 +135,7 @@ impl Webview {
             policy: policy.to_string(),
             document: Rc::default(),
             serial: Rc::default(),
+            tickets: Rc::default(),
             open: Rc::default(),
             app: Rc::default(),
             placement: Rc::default(),
@@ -137,12 +149,13 @@ impl Webview {
     fn create(&self, window: &slint::Window, bounds: Rect) -> wry::Result<Open> {
         let mut context = WebContext::new(Some(self.data_dir.clone()));
         let activity = self.activity.clone();
-        let reveal = Reveal {
+        let reveal = Rc::new(Reveal {
             document: self.document.clone(),
             open: self.open.clone(),
             app: self.app.clone(),
             placement: self.placement.clone(),
-        };
+        });
+        let on_parsed = reveal.clone();
         let handle = window.window_handle();
         let view = WebViewBuilder::new_with_web_context(&mut context)
             .with_bounds(bounds)
@@ -155,15 +168,17 @@ impl Webview {
             .with_javascript_disabled()
             .with_additional_browser_args(BROWSER_ARGS)
             .with_on_page_load_handler(move |event, url| {
-                if !matches!(event, wry::PageLoadEvent::Finished) {
-                    return;
+                if matches!(event, wry::PageLoadEvent::Finished) {
+                    activity.loaded.set(activity.loaded.get() + 1);
+                    // Almost always up by now. A page replaced while the browser was starting
+                    // can miss the earlier signal, and this one is sure to come.
+                    reveal.after_first_frame(url);
                 }
-                activity.loaded.set(activity.loaded.get() + 1);
-                reveal.after_first_frame(url);
             })
             .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
             .build_as_child(&handle)?;
-        lock_down(&view, &self.policy, self.document.clone(), self.activity.clone())
+        lock_down(&view, &self.policy, self.document.clone(), self.tickets.clone(), self.activity.clone())
+            .and_then(|()| reveal_when_parsed(&view, on_parsed))
             .map_err(|e| wry::Error::WebView2Error(webview2_com::Error::WindowsError(e)))?;
         Ok(Open { view, _context: context })
     }
@@ -217,7 +232,7 @@ fn navigate(
 ) -> wry::Result<()> {
     serial.set(serial.get() + 1);
     let url = format!("{DOCUMENT_ORIGIN}{}", serial.get());
-    *document.borrow_mut() = Document { url: url.clone(), html, wanted };
+    *document.borrow_mut() = Document { url: url.clone(), html, wanted, held: HashMap::new() };
     view.load_url(&url)
 }
 
@@ -230,15 +245,15 @@ struct Reveal {
 }
 
 impl Reveal {
-    /// Brings the page in once it has drawn a frame. "Loaded" does not mean that, and until then
-    /// the view would show its previous page. WebView2 has no first-paint event, but a capture
-    /// only completes after a frame of the current page, so asking for one is the signal.
+    /// Brings the page in once it has drawn a frame, and until then the view would show its
+    /// previous page. WebView2 has no first-paint event, but a capture only completes after a
+    /// frame of the current page, so asking for one is the signal.
     fn after_first_frame(&self, url: String) {
         let (document, open, app, placement) =
             (self.document.clone(), self.open.clone(), self.app.clone(), self.placement.clone());
         let bring_in = move || {
             // A page the user has already left finishes too, and must stay out of sight.
-            if url != document.borrow().url || !document.borrow().wanted {
+            if url != document.borrow().url || !document.borrow().wanted || placement.get().revealed {
                 return;
             }
             let Some(moved) = open.borrow().as_ref().map(|o| o.view.set_bounds(rect(placement.get().slot))) else {
@@ -265,6 +280,24 @@ impl Reveal {
     }
 }
 
+/// Starts revealing once the text is there. Waiting for the page to finish loading would mean
+/// waiting for every image.
+fn reveal_when_parsed(view: &WebView, reveal: Rc<Reveal>) -> windows::core::Result<()> {
+    let mut token = Default::default();
+    unsafe {
+        view.webview().cast::<ICoreWebView2_2>()?.add_DOMContentLoaded(
+            &DOMContentLoadedEventHandler::create(Box::new(move |sender, _| {
+                let Some(sender) = sender else { return Ok(()) };
+                let mut uri = PWSTR::null();
+                sender.Source(&mut uri)?;
+                reveal.after_first_frame(take_pwstr(uri));
+                Ok(())
+            })),
+            &mut token,
+        )
+    }
+}
+
 fn slot(app: &App) -> Bounds {
     let s = app.window().scale_factor();
     (app.get_slot_x() * s, app.get_slot_y() * s, app.get_slot_w() * s, app.get_slot_h() * s)
@@ -281,6 +314,27 @@ impl HtmlPane for Rc<Webview> {
             let _ = open.view.zoom(f64::from(app.global::<Theme>().get_reading() / READING));
         }
         loaded
+    }
+
+    fn image_ready(&self, ticket: u64, image: Option<Vec<u8>>) {
+        let Some(request) = self.document.borrow_mut().held.remove(&ticket) else { return };
+        let Some(env) = self.with_view(|view| view.environment()) else { return };
+        // The type comes from the bytes again, as what is on disk is only as good as the disk.
+        let image = image.and_then(|bytes| Some((image_type(&bytes)?, bytes)));
+        let answered: windows::core::Result<()> = unsafe {
+            let response = match image {
+                Some((kind, bytes)) => {
+                    let headers = HSTRING::from(format!(
+                        "Content-Type: {kind}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff"
+                    ));
+                    let stream = SHCreateMemStream(Some(&bytes));
+                    env.CreateWebResourceResponse(stream.as_ref(), 200, w!("OK"), &headers)
+                }
+                None => env.CreateWebResourceResponse(None, 404, w!("Not Found"), w!("")),
+            };
+            response.and_then(|response| request.args.SetResponse(&response)).and_then(|()| request.deferral.Complete())
+        };
+        debug_assert!(answered.is_ok(), "an image could not be answered: {answered:?}");
     }
 
     fn hide(&self) {
@@ -327,6 +381,7 @@ fn lock_down(
     view: &WebView,
     policy: &str,
     document: Rc<RefCell<Document>>,
+    tickets: Rc<Cell<u64>>,
     activity: Rc<Activity>,
 ) -> windows::core::Result<()> {
     unsafe {
@@ -380,6 +435,15 @@ fn lock_down(
                 let mut uri = PWSTR::null();
                 args.Request()?.Uri(&mut uri)?;
                 let uri = take_pwstr(uri);
+                if let Some(index) = image_index(&uri) {
+                    activity.image_requests.set(activity.image_requests.get() + 1);
+                    let ticket = tickets.get() + 1;
+                    tickets.set(ticket);
+                    let request = HeldRequest { deferral: args.GetDeferral()?, args: args.clone() };
+                    document.borrow_mut().held.insert(ticket, request);
+                    on_ui_thread(move |this| this.image_wanted(index, ticket));
+                    return Ok(());
+                }
                 let document = document.borrow();
                 let response = if uri == document.url {
                     let stream = SHCreateMemStream(Some(document.html.as_bytes()));

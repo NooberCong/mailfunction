@@ -1,6 +1,6 @@
 //! Turns a raw message into something safe to show. This is the first of three layers against
 //! hostile mail: an allowlist sanitiser here, then a CSP header, then a webview that has
-//! scripts off and answers every network request with a refusal.
+//! scripts off and answers every network request itself.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -11,18 +11,27 @@ use base64::engine::general_purpose::STANDARD;
 use mail_parser::{MessageParser, MessageRef, PartKind};
 
 /// Sent as a real response header by the webview layer, so mail cannot remove it.
-pub const CONTENT_SECURITY_POLICY: &str =
-    "default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'";
+pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src data: https://message.invalid; \
+    style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'";
+
+/// Never resolved: every request for it is answered from memory.
+pub const DOCUMENT_ORIGIN: &str = "https://message.invalid/";
+const IMAGE_PATH: &str = "image/";
+/// A message cannot ask for more remote images than this.
+const MAX_IMAGES: usize = 100;
 
 /// Mail is designed for a white page and brings its own spacing, so a newsletter fills the pane
 /// in either theme. Only mail with no layout of its own, such as a personal note, gets a margin.
+/// Only an image that failed has an `::after`, which covers the browser's broken-image icon.
 const SHEET: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><style>\
     html{background:#fff;color:#231417;color-scheme:light}\
     body{margin:0;padding:0;font:14px/1.6 'Segoe UI Variable Text','Segoe UI',sans-serif;overflow-wrap:anywhere;\
     animation:mf-in .17s cubic-bezier(.22,1,.36,1)}\
     body:not(:has(table)){padding:22px 36px}\
     @keyframes mf-in{from{opacity:0;transform:translateY(6px)}}\
-    img{max-width:100%;height:auto}\
+    img{max-width:100%;height:auto;position:relative}\
+    img::after{content:attr(alt);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;\
+    overflow:hidden;background:#f6f1f2;color:#85757a;font-size:12px}\
     ::-webkit-scrollbar{width:10px;height:10px}\
     ::-webkit-scrollbar-thumb{background:#e6dadc;border-radius:5px;border:2px solid #fff}\
     @media (prefers-reduced-motion:reduce){body{animation:none}}\
@@ -43,23 +52,29 @@ pub struct Rendered {
     pub body: Body,
     pub recipients: String,
     pub attachments: Vec<String>,
-    /// Images the body asks for that were not supplied, and so are not in it.
+    /// The remote images the body asks for. In a page that loads them, each one's place in this
+    /// list is what [`image_index`] gets back from the request for it.
     pub remote_images: Vec<String>,
 }
 
 /// A message's body and details, or `None` if the bytes are not a message at all.
 pub fn message(raw: &[u8]) -> Option<Rendered> {
-    message_with_images(raw, &HashMap::new())
+    rendered(raw, false)
 }
 
-/// As [`message`], with the remote images that have been fetched, as `data:` URLs by URL.
-pub fn message_with_images(raw: &[u8], fetched: &HashMap<String, String>) -> Option<Rendered> {
+/// As [`message`], with a page that asks the webview for its remote images. The page can go up
+/// at once, and each one appears as it arrives.
+pub fn message_with_images(raw: &[u8]) -> Option<Rendered> {
+    rendered(raw, true)
+}
+
+fn rendered(raw: &[u8], load_images: bool) -> Option<Rendered> {
     let parsed = MessageParser::default().parse(raw)?;
     let message = parsed.root();
     let html = message.html_body().find(|p| matches!(p.kind(), PartKind::Html));
     let (body, remote_images) = match html.and_then(|_| message.body_html(0)) {
         Some(html) => {
-            let (document, remote) = sanitise(&html, &inline_images(message), fetched);
+            let (document, remote) = sanitise(&html, &inline_images(message), load_images);
             (Body::Html(document), remote)
         }
         None => (Body::Text(message.body_text(0).map(|t| t.into_owned()).unwrap_or_default()), Vec::new()),
@@ -99,21 +114,25 @@ fn inline_images(message: MessageRef) -> HashMap<String, String> {
     images
 }
 
-/// An image from the network as a `data:` URL, going by its bytes, because a server can claim
+/// The content type of an image from the network, going by its bytes, because a server can claim
 /// anything. Nothing that a browser could run code from gets through, SVG included.
-pub(crate) fn data_url(bytes: &[u8]) -> Option<String> {
-    let kind = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        "png"
+pub fn image_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
     } else if bytes.starts_with(b"\xff\xd8\xff") {
-        "jpeg"
+        Some("image/jpeg")
     } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        "gif"
+        Some("image/gif")
     } else if bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        "webp"
+        Some("image/webp")
     } else {
-        return None;
-    };
-    Some(format!("data:image/{kind};base64,{}", STANDARD.encode(bytes)))
+        None
+    }
+}
+
+/// Which of a page's remote images a request is for, if it is for one.
+pub fn image_index(url: &str) -> Option<usize> {
+    url.strip_prefix(DOCUMENT_ORIGIN)?.strip_prefix(IMAGE_PATH)?.parse().ok()
 }
 
 fn is_safe_data_image(value: &str) -> bool {
@@ -124,20 +143,15 @@ fn is_safe_data_image(value: &str) -> bool {
 
 /// Sanitises mail HTML into a complete document.
 pub fn document(html: &str, inline_images: &HashMap<String, String>) -> String {
-    sanitise(html, inline_images, &HashMap::new()).0
+    sanitise(html, inline_images, false).0
 }
 
-/// A complete document, and the remote images it had to leave out. Those in `fetched` go in as
-/// `data:` URLs, so the page still loads nothing from anywhere.
-fn sanitise(
-    html: &str,
-    inline_images: &HashMap<String, String>,
-    fetched: &HashMap<String, String>,
-) -> (String, Vec<String>) {
+/// A complete document, and the remote images it names. They are left out, or with `load_images`
+/// point at the page's own origin, so that the page still reaches nothing but the webview.
+fn sanitise(html: &str, inline_images: &HashMap<String, String>, load_images: bool) -> (String, Vec<String>) {
     let images = inline_images.clone();
-    let fetched = fetched.clone();
-    let blocked = Arc::new(Mutex::new(Vec::new()));
-    let seen = blocked.clone();
+    let remote = Arc::new(Mutex::new(Vec::new()));
+    let seen = remote.clone();
     let cleaned = Builder::default()
         .add_tags(["center", "font", "style", "tbody", "thead", "tfoot"])
         .rm_clean_content_tags(["style"])
@@ -157,14 +171,14 @@ fn sanitise(
                 if let Some(id) = value.strip_prefix("cid:") {
                     images.get(id).cloned().map(Into::into)
                 } else if lower.starts_with("https://") || lower.starts_with("http://") {
-                    let image = fetched.get(value).cloned();
-                    if image.is_none() {
-                        let mut blocked = seen.lock().expect("blocked images");
-                        if !blocked.iter().any(|url| url == value) {
-                            blocked.push(value.to_string());
-                        }
-                    }
-                    image.map(Into::into)
+                    let mut seen = seen.lock().expect("remote images");
+                    let index = seen.iter().position(|url| url == value).or_else(|| {
+                        (seen.len() < MAX_IMAGES).then(|| {
+                            seen.push(value.to_string());
+                            seen.len() - 1
+                        })
+                    });
+                    index.filter(|_| load_images).map(|index| format!("{DOCUMENT_ORIGIN}{IMAGE_PATH}{index}").into())
                 } else {
                     is_safe_data_image(value).then(|| value.to_string().into())
                 }
@@ -179,8 +193,8 @@ fn sanitise(
         })
         .clean(html)
         .to_string();
-    let blocked = std::mem::take(&mut *blocked.lock().expect("blocked images"));
-    (format!("{SHEET}{cleaned}</body></html>"), blocked)
+    let remote = std::mem::take(&mut *remote.lock().expect("remote images"));
+    (format!("{SHEET}{cleaned}</body></html>"), remote)
 }
 
 #[cfg(test)]
@@ -240,28 +254,47 @@ mod tests {
     }
 
     #[test]
-    fn remote_images_are_listed_once_until_they_are_supplied() {
+    fn remote_images_are_listed_once_and_a_page_that_loads_them_names_only_itself() {
         let html = "<img src='https://a.example/1.png?x=1&amp;y=2'><img src='https://a.example/1.png?x=1&amp;y=2'>\
                     <img src='HTTP://b.example/2.gif'><img src='data:image/gif;base64,AAAA'>";
-        let (out, blocked) = sanitise(html, &HashMap::new(), &HashMap::new());
+        let (out, blocked) = sanitise(html, &HashMap::new(), false);
         assert_eq!(blocked, ["https://a.example/1.png?x=1&y=2", "HTTP://b.example/2.gif"]);
         assert!(!out.contains("a.example") && !out.contains("b.example"), "{out}");
+        assert!(!out.contains("<img src=\"https"), "{out}");
 
-        let fetched = HashMap::from([(blocked[0].clone(), "data:image/png;base64,BBBB".to_string())]);
-        let (out, blocked) = sanitise(html, &HashMap::new(), &fetched);
-        assert_eq!(out.matches("data:image/png;base64,BBBB").count(), 2, "{out}");
-        assert_eq!(blocked, ["HTTP://b.example/2.gif"]);
-        assert!(!out.contains("a.example"), "{out}");
+        let (out, loading) = sanitise(html, &HashMap::new(), true);
+        assert_eq!(loading, blocked);
+        assert_eq!(out.matches("src=\"https://message.invalid/image/0\"").count(), 2, "{out}");
+        assert_eq!(out.matches("src=\"https://message.invalid/image/1\"").count(), 1, "{out}");
+        assert!(!out.contains("a.example") && !out.contains("b.example"), "{out}");
     }
 
     #[test]
-    fn only_real_images_become_data_urls() {
-        assert!(data_url(b"\x89PNG\r\n\x1a\nA").unwrap().starts_with("data:image/png;"));
-        assert!(data_url(b"\xff\xd8\xffA").unwrap().starts_with("data:image/jpeg;"));
-        assert!(data_url(b"GIF89aA").unwrap().starts_with("data:image/gif;"));
-        assert!(data_url(b"RIFF0000WEBPVP8").unwrap().starts_with("data:image/webp;"));
+    fn a_message_cannot_ask_for_images_past_the_limit() {
+        let html: String = (0..MAX_IMAGES + 1).map(|n| format!("<img src='https://a.example/{n}.png'>")).collect();
+        let (out, listed) = sanitise(&html, &HashMap::new(), true);
+        assert_eq!(listed.len(), MAX_IMAGES);
+        assert!(out.contains(&format!("/image/{}\"", MAX_IMAGES - 1)));
+        assert!(!out.contains(&format!("/image/{MAX_IMAGES}\"")));
+    }
+
+    #[test]
+    fn only_a_page_image_has_an_index_and_the_policy_lets_those_alone_through() {
+        assert_eq!(image_index("https://message.invalid/image/12"), Some(12));
+        for other in ["https://message.invalid/12", "https://message.invalid/image/x", "https://a.example/image/1"] {
+            assert_eq!(image_index(other), None, "{other}");
+        }
+        assert!(CONTENT_SECURITY_POLICY.contains(&format!("img-src data: {}", DOCUMENT_ORIGIN.trim_end_matches('/'))));
+    }
+
+    #[test]
+    fn only_real_images_have_a_type() {
+        assert_eq!(image_type(b"\x89PNG\r\n\x1a\nA"), Some("image/png"));
+        assert_eq!(image_type(b"\xff\xd8\xffA"), Some("image/jpeg"));
+        assert_eq!(image_type(b"GIF89aA"), Some("image/gif"));
+        assert_eq!(image_type(b"RIFF0000WEBPVP8"), Some("image/webp"));
         for not_an_image in [&b"<svg onload=alert(1)>"[..], b"<html>", b""] {
-            assert_eq!(data_url(not_an_image), None);
+            assert_eq!(image_type(not_an_image), None);
         }
     }
 

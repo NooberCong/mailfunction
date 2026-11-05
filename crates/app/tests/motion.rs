@@ -51,6 +51,7 @@ impl Notifier for Silent {
 struct NoHtml;
 
 impl HtmlPane for NoHtml {
+    fn image_ready(&self, _: u64, _: Option<Vec<u8>>) {}
     fn show(&self, app: &App, _: String) -> bool {
         app.set_pane(Pane::Html);
         true

@@ -7,6 +7,7 @@
 pub mod compose;
 pub mod draft;
 pub mod engine;
+pub mod images;
 pub mod imap;
 pub mod logo;
 pub mod oauth;

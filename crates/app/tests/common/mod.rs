@@ -36,9 +36,13 @@ pub fn offscreen() -> Rc<MinimalSoftwareWindow> {
     window
 }
 
+/// What an image request was answered with, by its ticket.
+pub type ImageAnswer = (u64, Option<Vec<u8>>);
+
 #[derive(Default)]
 pub struct RecordingPane {
     pub shown: Rc<RefCell<Vec<String>>>,
+    pub images: Rc<RefCell<Vec<ImageAnswer>>>,
 }
 
 impl HtmlPane for RecordingPane {
@@ -46,6 +50,9 @@ impl HtmlPane for RecordingPane {
         self.shown.borrow_mut().push(html);
         app.set_pane(Pane::Html);
         true
+    }
+    fn image_ready(&self, ticket: u64, image: Option<Vec<u8>>) {
+        self.images.borrow_mut().push((ticket, image));
     }
     fn hide(&self) {}
     fn bounds_changed(&self, _: &App) {}

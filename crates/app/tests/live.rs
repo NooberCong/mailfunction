@@ -4,7 +4,7 @@
 //! its own window, and moves nothing on the desktop. Run with `scripts/test-imap.ps1`.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -317,15 +317,15 @@ fn sheet_brightness(hwnd: isize, app: &App) -> u32 {
     pixels[at..at + 3].iter().map(|c| u32::from(*c)).sum()
 }
 
-const RED_DOT: &str = "data:image/gif;base64,R0lGODlhAQABAIAAAP8AAP8AACwAAAAAAQABAAACAkQBADs=";
+const RED_DOT: &[u8] = b"GIF89a\x01\0\x01\0\x80\0\0\xff\0\0\xff\0\0,\0\0\0\0\x01\0\x01\0\0\x02\x02D\x01\0;";
 
 /// Answers for one image. The real fetcher refuses a loopback address, so nothing local could
 /// stand in for a sender's server.
 struct RedDot;
 
 impl Network for RedDot {
-    fn images(&self, urls: &[String]) -> HashMap<String, String> {
-        urls.iter().map(|url| (url.clone(), RED_DOT.to_string())).collect()
+    fn image(&self, _: &str) -> Option<Vec<u8>> {
+        Some(RED_DOT.to_vec())
     }
 
     fn logo(&self, _: &str) -> Logo {

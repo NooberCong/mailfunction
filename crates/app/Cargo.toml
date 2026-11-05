@@ -30,6 +30,12 @@ name = "live"
 harness = false
 test = false
 
+# Opens a window.
+[[test]]
+name = "images"
+harness = false
+test = false
+
 # Opens a window, and needs the real executable.
 [[test]]
 name = "tray"
