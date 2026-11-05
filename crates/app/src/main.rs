@@ -11,7 +11,6 @@ use mailfunction::{App, Controller, Theme, chrome, instance, on_ui_thread, start
 use mailfunction_core::oauth;
 use mailfunction_core::remote::Web;
 use slint::ComponentHandle;
-use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 
 fn env_path(name: &str) -> PathBuf {
     std::env::var_os(name).map(PathBuf::from).unwrap_or_default()
@@ -58,14 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         on_ui_thread(|this| this.refresh_badge());
     })?;
-    // A file dropped on the window goes on the message being written.
-    app.window().on_winit_window_event(|_, event| {
-        if let winit::event::WindowEvent::DroppedFile(path) = event {
-            let path = path.clone();
-            on_ui_thread(move |this| this.attach_paths(&[path]));
-        }
-        EventResult::Propagate
-    });
+    chrome::watch_window(&app);
     // Until the app says so, as there may well be no window showing.
     slint::run_event_loop_until_quit()?;
     Ok(())

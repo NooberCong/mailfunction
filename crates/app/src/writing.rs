@@ -521,7 +521,9 @@ impl Controller {
         Ok(())
     }
 
+    /// The files changed, so what was wrong with them last time no longer stands.
     fn touch_files(&self) {
+        self.app.set_draft_error("".into());
         if let Some(writing) = self.writing.borrow_mut().as_mut() {
             writing.touched = true;
         }

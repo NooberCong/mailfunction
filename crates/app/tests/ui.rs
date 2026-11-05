@@ -546,7 +546,7 @@ fn the_whole_window() {
     let notice = notices.borrow().last().unwrap().clone();
     assert_eq!(notices.borrow().len(), 1);
     assert_eq!((notice.title.as_str(), notice.text.as_str()), ("Ann <Lee>", "Message 301"));
-    assert_eq!(notice.account.as_deref(), Some("work@studio.example"), "two accounts need telling apart");
+    assert_eq!(notice.account, "work@studio.example");
     assert_eq!(notice.opens, Opens { account: work, message: Some(person) });
     let (size, centre) = picture_centre(notice.picture.as_ref().unwrap());
     assert_eq!((size, centre[3]), (128, 255), "initials stand in for a logo");

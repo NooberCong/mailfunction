@@ -2567,6 +2567,12 @@ export component App inherits Window {
     default-font-family: "Be Vietnam Pro";
     forward-focus: keys;
 
+    /// Only the changed parts of a frame reach the screen, and never the parts under a webview, so
+    /// what a webview uncovers by moving is whatever was there before it arrived. This puts the
+    /// whole frame on the screen again.
+    public function repaint() { repaints += 1; }
+    private property <int> repaints;
+
     in property <bool> signed-in;
     in property <bool> can-sign-in: true;
     in property <string> sign-in-message;
@@ -3395,5 +3401,10 @@ export component App inherits Window {
             running: Tip.text != "";
             triggered => { Tip.text = ""; }
         }
+    }
+
+    // Never seen: reading the count is what makes each change of it repaint all this covers.
+    Rectangle {
+        background: root.repaints < 0 ? black : transparent;
     }
 }

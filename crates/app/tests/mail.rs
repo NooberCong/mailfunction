@@ -566,6 +566,8 @@ fn writing(s: &Scene) {
     s.controller.attach_paths(std::slice::from_ref(&large));
     assert_eq!(app.get_draft_files().row_count(), 1);
     assert!(app.get_draft_error().contains("too large"), "{}", app.get_draft_error());
+    s.controller.attach_paths(std::slice::from_ref(&file));
+    assert_eq!(app.get_draft_error(), "", "a file that fits clears the complaint about one that did not");
     let _ = std::fs::remove_file(&file);
     let _ = std::fs::remove_file(&large);
     s.controller.editor_event(EditorEvent::Discard);

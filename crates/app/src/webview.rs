@@ -343,7 +343,7 @@ impl HtmlPane for Rc<Webview> {
         // Also stops a page that is still loading from being revealed.
         self.document.borrow_mut().wanted = false;
         let Some(moved) = self.open.borrow().as_ref().map(|o| {
-            // Takes the keyboard back from the page, which a click on Slint alone does not do.
+            // Takes the keyboard back from the page, as the app may be closing it from a key.
             let _ = o.view.focus_parent();
             o.view.set_bounds(out_of_sight(placement.slot))
         }) else {

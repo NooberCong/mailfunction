@@ -335,7 +335,10 @@ impl Controller {
         self.app.on_send_draft(self.bound(|this| this.send_draft()));
         self.app.on_remove_draft_file(self.bound1(|this, index| this.remove_draft_file(index as usize)));
         self.app.on_focus_editor(self.bound(|this| this.editor.focus()));
-        self.app.on_editor_moved(self.bound(|this| this.editor.bounds_changed(&this.app)));
+        self.app.on_editor_moved(self.bound(|this| {
+            this.editor.bounds_changed(&this.app);
+            this.app.invoke_repaint();
+        }));
         self.app.on_close_draft(self.bound(|this| this.finish_writing()));
         self.app.on_notice_clicked(self.bound(|this| this.notice_clicked()));
     }
@@ -431,6 +434,7 @@ impl Controller {
         self.app.on_slot_changed(move || {
             if let Some(this) = weak.upgrade() {
                 this.pane.bounds_changed(&this.app);
+                this.app.invoke_repaint();
             }
         });
         let weak = Rc::downgrade(self);
@@ -556,6 +560,7 @@ impl Controller {
         if let Some(engine) = self.engine.borrow_mut().as_mut() {
             engine.remove(removed.id);
         }
+        self.notifier.forget(removed.id);
         let (store, images) = (self.store.clone(), self.images.clone());
         std::thread::spawn(move || {
             // If either fails the account returns at the next launch, asking to sign in again.
@@ -685,7 +690,7 @@ impl Controller {
         if !settings.notifications || !mailbox.identity.notify || messages.is_empty() {
             return;
         }
-        let address = (accounts.len() > 1).then(|| mailbox.account.email.clone());
+        let address = mailbox.account.email.clone();
         let silent = !settings.notification_sound;
         if messages.len() > MOST_NOTICES || !settings.notification_preview {
             let mut senders: Vec<&str> = Vec::new();

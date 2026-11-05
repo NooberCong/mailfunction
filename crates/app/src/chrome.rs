@@ -6,6 +6,8 @@ use std::num::NonZeroIsize;
 use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle,
 };
+use slint::winit_030::winit::event::{ElementState, WindowEvent};
+use slint::winit_030::{EventResult, WinitWindowAccessor};
 use slint::{Color, ComponentHandle};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -13,6 +15,7 @@ use windows::Win32::Graphics::Dwm::{
     DWMWINDOWATTRIBUTE,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, HICON, ICON_BIG, ICON_SMALL, IMAGE_ICON, IsIconic, IsWindowVisible, LR_DEFAULTCOLOR, LoadImageW,
     SM_CXICON, SM_CXSMICON, SPI_GETCLIENTAREAANIMATION, SW_HIDE, SW_RESTORE, SW_SHOW,
@@ -21,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BOOL, PCWSTR};
 
-use crate::{App, Theme};
+use crate::{App, Theme, on_ui_thread};
 
 /// The resource ids given to the icons in `build.rs`.
 pub(crate) const EXE_ICON: usize = 1;
@@ -111,6 +114,29 @@ pub(crate) fn raise(app: &App) -> bool {
 }
 
 /// Keeps the unread count on the taskbar from now on, on the button and in the notification area.
+pub fn watch_window(app: &App) {
+    let weak = app.as_weak();
+    app.window().on_winit_window_event(move |_, event| {
+        match event {
+            // A press that gets here missed the webviews, and one of them may still have the
+            // keyboard: Slint moves its focus only among its own items, and Windows moves it for
+            // no window on a click. The window takes it, whatever the press lands on.
+            WindowEvent::MouseInput { state: ElementState::Pressed, .. } => {
+                if let Some(hwnd) = weak.upgrade().as_ref().and_then(hwnd) {
+                    let _ = unsafe { SetFocus(Some(hwnd)) };
+                }
+            }
+            // A file dropped on the window goes on the message being written.
+            WindowEvent::DroppedFile(path) => {
+                let path = path.clone();
+                on_ui_thread(move |this| this.attach_paths(&[path]));
+            }
+            _ => {}
+        }
+        EventResult::Propagate
+    });
+}
+
 pub fn watch_taskbar(app: &App) {
     if let Some(hwnd) = hwnd(app) {
         crate::badge::watch(hwnd);

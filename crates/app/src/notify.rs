@@ -3,6 +3,8 @@
 //! reaches the app from the banner, from the notification centre, and after the app has closed,
 //! when Windows starts it again.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -14,7 +16,7 @@ use windows::Win32::System::Com::{
     CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoInitializeEx, CoRegisterClassObject, IClassFactory, IClassFactory_Impl,
     REGCLS_MULTIPLEUSE,
 };
-use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW};
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegDeleteTreeW, RegSetKeyValueW};
 use windows::Win32::UI::Notifications::{
     INotificationActivationCallback, INotificationActivationCallback_Impl, NOTIFICATION_USER_INPUT_DATA,
 };
@@ -26,6 +28,28 @@ pub const APP_ID: &str = "mailfunction";
 /// Identifies the app's activator to COM. Keep it: delivered notifications point to it.
 pub const ACTIVATOR: GUID = GUID::from_u128(0x6f1c_2a54_8d3e_4b7a_9c21_5e0d_7a3b_1f46);
 const ICON: &[u8] = include_bytes!("../ui/icon.png");
+
+/// Who an account's notifications come from. Windows heads a notification with the name of the
+/// identity that sent it and offers no other way to set that line, so each account has its own.
+pub fn identity(account: i64) -> String {
+    format!("{APP_ID}.{account}")
+}
+
+fn identity_key(identity: &str) -> String {
+    format!(r"Software\Classes\AppUserModelId\{identity}")
+}
+
+fn activator_id() -> String {
+    format!("{{{}}}", format!("{ACTIVATOR:?}").to_uppercase())
+}
+
+/// Tells Windows an identity's name, and that clicks on its notifications come to the activator.
+fn declare(identity: &str, name: &str, icon: &Path) -> Option<()> {
+    let key = identity_key(identity);
+    set_registry(&key, Some("DisplayName"), name)?;
+    set_registry(&key, Some("IconUri"), &icon.to_string_lossy())?;
+    set_registry(&key, Some("CustomActivator"), &activator_id())
+}
 
 /// What a notification opens: an account's Inbox, at a message if it is about just one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,8 +78,8 @@ impl Opens {
 pub struct Notice {
     pub title: String,
     pub text: String,
-    /// Which account this is for, when there are several to tell apart.
-    pub account: Option<String>,
+    /// The address it came to, which heads the notification.
+    pub account: String,
     /// A PNG of the sender.
     pub picture: Option<Vec<u8>>,
     /// It appears without a sound.
@@ -66,6 +90,8 @@ pub struct Notice {
 /// Where notices go. The real one is Windows; tests record what they are given.
 pub trait Notifier {
     fn show(&self, notice: &Notice);
+    /// The account is gone, and nothing of it should stay behind.
+    fn forget(&self, _account: i64) {}
 }
 
 fn escape(text: &str) -> String {
@@ -76,12 +102,9 @@ fn toast_xml(notice: &Notice, picture: Option<&Path>) -> String {
     let image = picture.map_or_else(String::new, |path| {
         format!(r#"<image placement="appLogoOverride" src="{}"/>"#, escape(&path.to_string_lossy()))
     });
-    let account = notice.account.as_deref().map_or_else(String::new, |account| {
-        format!(r#"<text placement="attribution">{}</text>"#, escape(account))
-    });
     let audio = if notice.silent { r#"silent="true""# } else { r#"src="ms-winsoundevent:Notification.Mail""# };
     format!(
-        r#"<toast launch="{}"><visual><binding template="ToastGeneric"><text>{}</text><text>{}</text>{image}{account}</binding></visual><audio {audio}/></toast>"#,
+        r#"<toast launch="{}"><visual><binding template="ToastGeneric"><text>{}</text><text>{}</text>{image}</binding></visual><audio {audio}/></toast>"#,
         notice.opens.to_launch(),
         escape(&notice.title),
         escape(&notice.text),
@@ -132,18 +155,15 @@ pub(crate) fn set_registry(key: &str, name: Option<&str>, value: &str) -> Option
     unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, &HSTRING::from(key), &name, REG_SZ.0, data, size) }.ok().ok()
 }
 
-/// Tells Windows who the app is and how to reach it. The exe can move, so this runs at each start.
-fn register(pictures: &Path) -> Option<ToastNotifier> {
+/// Tells Windows how to reach the app. The exe can move, so this runs at each start. The app's own
+/// identity stays for the notifications it already delivered, which still point to it.
+fn register(pictures: &Path) -> Option<PathBuf> {
     let icon = pictures.join("icon.png");
     std::fs::create_dir_all(pictures).ok()?;
     std::fs::write(&icon, ICON).ok()?;
     let exe = std::env::current_exe().ok()?;
-    let activator = format!("{ACTIVATOR:?}").to_uppercase();
-    let identity = format!(r"Software\Classes\AppUserModelId\{APP_ID}");
-    set_registry(&identity, Some("DisplayName"), APP_ID)?;
-    set_registry(&identity, Some("IconUri"), &icon.to_string_lossy())?;
-    set_registry(&identity, Some("CustomActivator"), &format!("{{{activator}}}"))?;
-    let server = format!(r"Software\Classes\CLSID\{{{activator}}}\LocalServer32");
+    declare(APP_ID, APP_ID, &icon)?;
+    let server = format!(r"Software\Classes\CLSID\{}\LocalServer32", activator_id());
     set_registry(&server, None, &format!(r#""{}" -ToastActivated"#, exe.display()))?;
 
     unsafe {
@@ -153,19 +173,34 @@ fn register(pictures: &Path) -> Option<ToastNotifier> {
         // Held until the process ends, as clicks can come at any time.
         CoRegisterClassObject(&ACTIVATOR, &factory, CLSCTX_LOCAL_SERVER, REGCLS_MULTIPLEUSE).ok()?;
     }
-    ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID)).ok()
+    Some(icon)
 }
 
 /// Notifications from Windows. If registering failed, the app simply goes without them.
 pub struct Toasts {
-    notifier: Option<ToastNotifier>,
+    /// The app's icon on disk, if registering went well.
+    icon: Option<PathBuf>,
+    /// By account, as each one comes first needed.
+    notifiers: RefCell<HashMap<i64, ToastNotifier>>,
     pictures: PathBuf,
 }
 
 impl Toasts {
     pub fn new(data: &Path) -> Self {
         let pictures = data.join("notifications");
-        Self { notifier: register(&pictures), pictures }
+        Self { icon: register(&pictures), notifiers: RefCell::default(), pictures }
+    }
+
+    fn notifier(&self, notice: &Notice) -> Option<ToastNotifier> {
+        let account = notice.opens.account;
+        if let Some(notifier) = self.notifiers.borrow().get(&account) {
+            return Some(notifier.clone());
+        }
+        let identity = identity(account);
+        declare(&identity, &notice.account, self.icon.as_ref()?)?;
+        let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(identity)).ok()?;
+        self.notifiers.borrow_mut().insert(account, notifier.clone());
+        Some(notifier)
     }
 
     /// Windows reads pictures from disk, and again whenever the notification centre opens, so
@@ -180,7 +215,7 @@ impl Toasts {
 
 impl Notifier for Toasts {
     fn show(&self, notice: &Notice) {
-        let Some(notifier) = &self.notifier else { return };
+        let Some(notifier) = self.notifier(notice) else { return };
         let picture = notice.picture.as_deref().and_then(|png| self.save(png));
         let xml = HSTRING::from(toast_xml(notice, picture.as_deref()));
         let document = XmlDocument::new().and_then(|document| document.LoadXml(&xml).map(|()| document));
@@ -188,6 +223,15 @@ impl Notifier for Toasts {
         if let Ok(toast) = toast {
             let _ = notifier.Show(&toast);
         }
+    }
+
+    fn forget(&self, account: i64) {
+        self.notifiers.borrow_mut().remove(&account);
+        let identity = identity(account);
+        if let Ok(history) = ToastNotificationManager::History() {
+            let _ = history.ClearWithId(&HSTRING::from(&identity));
+        }
+        let _ = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(identity_key(&identity))) };
     }
 }
 
@@ -199,7 +243,7 @@ mod tests {
         Notice {
             title: "An & Co".into(),
             text: "<b>Lunch?</b> \"today\"".into(),
-            account: None,
+            account: "me@example.com".into(),
             picture: None,
             silent: false,
             opens: Opens { account: 2, message: Some(9) },
@@ -232,12 +276,9 @@ mod tests {
     }
 
     #[test]
-    fn the_picture_and_account_appear_only_when_there_are_some() {
-        let bare = toast_xml(&notice(), None);
-        assert!(!bare.contains("<image") && !bare.contains("attribution"), "{bare}");
-        let full = Notice { account: Some("me@example.com".into()), ..notice() };
-        let xml = toast_xml(&full, Some(Path::new(r"C:\Users\Rog Scar\a.png")));
+    fn the_picture_appears_only_when_there_is_one() {
+        assert!(!toast_xml(&notice(), None).contains("<image"));
+        let xml = toast_xml(&notice(), Some(Path::new(r"C:\Users\Rog Scar\a.png")));
         assert!(xml.contains(r#"placement="appLogoOverride" src="C:\Users\Rog Scar\a.png""#), "{xml}");
-        assert!(xml.contains(r#"<text placement="attribution">me@example.com</text>"#), "{xml}");
     }
 }

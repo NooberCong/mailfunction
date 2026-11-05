@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use common::server::{canary, client_pixels, create_folders, deliver, delivered_to_mailpit, dovecot_port, on_server, received_by_mailpit, sleep, until};
 use mailfunction::editor::{EditorEvent, EditorView};
-use mailfunction::notify::{ACTIVATOR, APP_ID, Toasts};
+use mailfunction::notify::{ACTIVATOR, APP_ID, Toasts, identity};
 use mailfunction::webview::Webview;
 use mailfunction::{App, Controller, ImageBar, Pane, Theme, Verb, chrome};
 use mailfunction_core::remote::{Logo, Network};
@@ -528,15 +528,18 @@ async fn daily_use(app: &App, controller: &Rc<Controller>, user: &str) {
     assert_eq!(delivered_to_mailpit(&subject), 1, "once");
 }
 
-/// What Windows holds for the app, as each notification's XML.
+/// The account the notifications are for, the first in a new store.
+const NOTIFIED: i64 = 1;
+
+/// What Windows holds for the account, as each notification's XML.
 fn delivered_toasts() -> Vec<String> {
     let history = ToastNotificationManager::History().unwrap();
-    let toasts = history.GetHistoryWithId(&HSTRING::from(APP_ID)).unwrap();
+    let toasts = history.GetHistoryWithId(&HSTRING::from(identity(NOTIFIED))).unwrap();
     toasts.into_iter().map(|toast| toast.Content().unwrap().GetXml().unwrap().to_string()).collect()
 }
 
 fn clear_toasts() {
-    ToastNotificationManager::History().unwrap().ClearWithId(&HSTRING::from(APP_ID)).unwrap();
+    ToastNotificationManager::History().unwrap().ClearWithId(&HSTRING::from(identity(NOTIFIED))).unwrap();
 }
 
 /// Does what the shell does for a click on a notification, from outside the app's process.
