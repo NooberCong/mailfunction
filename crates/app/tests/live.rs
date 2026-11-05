@@ -1,4 +1,5 @@
-//! The real window, real WebView2 and real sync against Dovecot, driven through the controller.
+//! The real window, real WebView2, real sync against Dovecot and real sending through mailpit,
+//! driven through the controller.
 //! It opens a window, but injects no input: the one message it sends about the pointer goes to
 //! its own window, and moves nothing on the desktop. Run with `scripts/test-imap.ps1`.
 
@@ -14,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use mailfunction::notify::{ACTIVATOR, APP_ID, Toasts};
 use mailfunction::webview::Webview;
-use mailfunction::{App, Controller, Pane, Theme, chrome};
+use mailfunction::{App, Controller, Pane, Theme, Verb, chrome};
 use mailfunction_core::remote::Offline;
 use mailfunction_core::render;
 use mailfunction_core::secrets;
@@ -324,7 +325,7 @@ impl Drop for Film {
 }
 
 /// Opens a message and waits for it to settle on screen.
-async fn open_settled(app: &App, controller: &Controller, film: &Film, row: usize) -> Frame {
+async fn open_settled(app: &App, controller: &Rc<Controller>, film: &Film, row: usize) -> Frame {
     controller.select_row(row);
     until("message on screen", || matches!(app.get_pane(), Pane::Html | Pane::Text)).await;
     sleep(500).await;
@@ -332,7 +333,7 @@ async fn open_settled(app: &App, controller: &Controller, film: &Film, row: usiz
 }
 
 /// The message on screen goes with the click, even while the next one is still loading.
-async fn moving_between_messages(app: &App, controller: &Controller, film: &Film, html: (usize, usize), text: usize) {
+async fn moving_between_messages(app: &App, controller: &Rc<Controller>, film: &Film, html: (usize, usize), text: usize) {
     let first = open_settled(app, controller, film, html.0).await;
     let second = open_settled(app, controller, film, html.1).await;
     let plain = open_settled(app, controller, film, text).await;
@@ -439,6 +440,89 @@ fn deliver(user: String, messages: Vec<Vec<u8>>) {
     .unwrap();
 }
 
+/// How many messages a folder holds on the server, and how many of them are read.
+fn on_server(user: &str, folder: &str) -> (u32, usize) {
+    let (user, folder) = (user.to_string(), folder.to_string());
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", dovecot_port())).await.unwrap();
+            let mut client = async_imap::Client::new(tcp);
+            client.read_response().await.unwrap();
+            let mut session = client.login(&user, "pass").await.map_err(|(e, _)| e).unwrap();
+            let exists = session.select(&folder).await.unwrap().exists;
+            (exists, session.search("SEEN").await.unwrap().len())
+        })
+    })
+    .join()
+    .unwrap()
+}
+
+fn create_folders(user: String) {
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", dovecot_port())).await.unwrap();
+            let mut client = async_imap::Client::new(tcp);
+            client.read_response().await.unwrap();
+            let mut session = client.login(&user, "pass").await.map_err(|(e, _)| e).unwrap();
+            for folder in ["Trash", "Sent", "Drafts"] {
+                session.create(folder).await.unwrap();
+            }
+        });
+    })
+    .join()
+    .unwrap();
+}
+
+fn delivered_to_mailpit(subject: &str) -> usize {
+    let url = format!("http://127.0.0.1:18025/api/v1/search?query=subject:{subject}");
+    let mut response = ureq::get(&url).call().expect("start mailpit: scripts/test-imap.ps1");
+    let body = response.body_mut().read_to_string().unwrap();
+    body.split("\"ID\"").count() - 1
+}
+
+/// A day's actions from the real window, each one checked on the real server.
+async fn daily_use(app: &App, controller: &Rc<Controller>, user: &str) {
+    println!("daily use");
+    let before = app.get_rows().row_count();
+    deliver(user.to_string(), vec![colour_message("fresh", "#a818a8")]);
+    until("fresh mail", || app.get_rows().row_count() == before + 1).await;
+    let rows = before + 1;
+    let (total, seen) = on_server(user, "INBOX");
+    assert_eq!(total as usize, rows);
+    assert!(app.get_rows().row_data(0).unwrap().unread);
+    controller.select_row(0);
+    until("reading reaches the server", || on_server(user, "INBOX").1 == seen + 1).await;
+
+    app.invoke_verb(Verb::Trash);
+    assert_eq!(app.get_rows().row_count(), rows - 1, "gone from the list at once");
+    until("the move reaches the server", || on_server(user, "Trash").0 == 1).await;
+    assert_eq!(on_server(user, "INBOX").0, total - 1);
+
+    app.invoke_verb(Verb::Undo);
+    assert_eq!(app.get_rows().row_count(), rows);
+    until("undo reaches the server", || on_server(user, "INBOX").0 == total).await;
+    assert_eq!(on_server(user, "Trash").0, 0);
+
+    // Written and sent from the real composer. It waits out its undo, then goes through real
+    // SMTP, and files itself on the server as one copy.
+    let subject = format!("liveword{}", std::process::id());
+    app.invoke_verb(Verb::Compose);
+    assert!(app.get_composing());
+    app.set_draft_to("someone@example.com".into());
+    app.set_draft_subject(subject.as_str().into());
+    app.set_draft_body("Chào bạn".into());
+    app.invoke_send_draft();
+    assert!(!app.get_composing());
+    assert_eq!(app.get_notice(), "Sending");
+    sleep(1000).await;
+    assert_eq!(delivered_to_mailpit(&subject), 0, "still in its undo window");
+    until("it goes out through SMTP", || delivered_to_mailpit(&subject) == 1).await;
+    until("it is filed in Sent", || on_server(user, "Sent").0 == 1).await;
+    assert_eq!(on_server(user, "Sent").1, 1, "and read");
+    until("the notice", || app.get_notice() == "Sent").await;
+    assert_eq!(delivered_to_mailpit(&subject), 1, "once");
+}
+
 /// What Windows holds for the app, as each notification's XML.
 fn delivered_toasts() -> Vec<String> {
     let history = ToastNotificationManager::History().unwrap();
@@ -540,8 +624,10 @@ async fn scenario(app: App, dir: PathBuf, user: String, controller: Rc<Controlle
     moving_between_messages(&app, &controller, &film, (0, 1), 3).await;
     drop(film);
 
+    daily_use(&app, &controller, &user).await;
+
     println!("a second account");
-    let second = format!("{user}-second");
+    let second = format!("second-{user}");
     secrets::save(&second, "pass").unwrap();
     deliver(second.clone(), vec![plain_message()]);
     let first_rows = app.get_rows().row_count();
@@ -552,6 +638,8 @@ async fn scenario(app: App, dir: PathBuf, user: String, controller: Rc<Controlle
         port: dovecot_port(),
         security: Security::Plain,
         auth: AuthKind::Password,
+        smtp_host: "localhost".into(),
+        smtp_port: 25,
     };
     controller.add_account(local(&second)).unwrap();
     assert_eq!(app.get_active_account(), 1);
@@ -692,11 +780,12 @@ fn main() {
         return click_toast(launch);
     }
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let user = format!("live-{nanos}");
+    let user = format!("live-{nanos}@example.com");
     let dir = std::env::temp_dir().join(format!("mailfunction-{user}"));
     assert!(render::message(&newsletter_message()).is_some());
 
     deliver(user.clone(), vec![plain_message(), newsletter_message()]);
+    create_folders(user.clone());
     {
         let store = Store::open(&dir).unwrap();
         store
@@ -707,6 +796,8 @@ fn main() {
                 port: dovecot_port(),
                 security: Security::Plain,
                 auth: AuthKind::Password,
+                smtp_host: "127.0.0.1".into(),
+                smtp_port: 11025,
             })
             .unwrap();
     }

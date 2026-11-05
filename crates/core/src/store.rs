@@ -4,11 +4,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use mail_parser::MessageParser;
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 
 use crate::Result;
+use crate::draft::finished_elsewhere;
+use crate::ops::reapply_pending;
 
 /// Applied in order; `PRAGMA user_version` records how many have run.
 const MIGRATIONS: &[&str] = &["
@@ -85,7 +88,94 @@ const MIGRATIONS: &[&str] = &["
         image BLOB,
         checked INTEGER NOT NULL
     );
+", "
+    ALTER TABLE account ADD COLUMN smtp_host TEXT NOT NULL DEFAULT 'smtp.gmail.com';
+    ALTER TABLE account ADD COLUMN smtp_port INTEGER NOT NULL DEFAULT 465;
+
+    ALTER TABLE message RENAME COLUMN gm_thread_id TO thread_id;
+    UPDATE message SET thread_id = id WHERE thread_id IS NULL;
+    -- The Message-ID, without its angle brackets. Mail synced before this column stays NULL.
+    ALTER TABLE message ADD COLUMN mid TEXT;
+    CREATE INDEX message_thread ON message (account_id, thread_id);
+    CREATE INDEX message_date ON message (account_id, date);
+    CREATE INDEX message_mid ON message (account_id, mid) WHERE mid IS NOT NULL;
+    -- Which thread a Message-ID belongs to, on servers that do not say. Gmail does.
+    CREATE TABLE thread_ref (
+        account_id INTEGER NOT NULL REFERENCES account ON DELETE CASCADE,
+        mid TEXT NOT NULL,
+        thread_id INTEGER NOT NULL,
+        PRIMARY KEY (account_id, mid)
+    ) WITHOUT ROWID;
+
+    -- `head` marks a thread's newest message in a label, so a list of threads is an index walk.
+    ALTER TABLE message_label ADD COLUMN head INTEGER NOT NULL DEFAULT 0;
+    UPDATE message_label SET head = 1 WHERE (label_id, date, message_id) IN (
+        SELECT label_id, date, message_id FROM (
+            SELECT ml.label_id, ml.date, ml.message_id, row_number() OVER (
+                PARTITION BY ml.label_id, m.thread_id ORDER BY ml.date DESC, ml.message_id DESC
+            ) AS position
+            FROM message_label ml JOIN message m ON m.id = ml.message_id
+        ) WHERE position = 1
+    );
+    CREATE INDEX message_label_head ON message_label (label_id, date, message_id) WHERE head = 1;
+
+    -- What the user did that the server has not heard yet. `message_id` is no foreign key,
+    -- because discarding a draft deletes the message while its server copy is still to go.
+    CREATE TABLE pending_op (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id INTEGER NOT NULL REFERENCES account ON DELETE CASCADE,
+        message_id INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        undo TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX pending_op_message ON pending_op (message_id);
+
+    -- `old_mid` is the Message-ID of the copy on the server, which the next upload replaces.
+    CREATE TABLE draft (
+        message_id INTEGER PRIMARY KEY REFERENCES message ON DELETE CASCADE,
+        recipients TEXT NOT NULL DEFAULT '',
+        cc TEXT NOT NULL DEFAULT '',
+        bcc TEXT NOT NULL DEFAULT '',
+        body TEXT NOT NULL DEFAULT '',
+        in_reply_to TEXT NOT NULL DEFAULT '',
+        refs TEXT NOT NULL DEFAULT '',
+        old_mid TEXT,
+        state TEXT NOT NULL DEFAULT 'editing',
+        send_at INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX draft_send ON draft (state, send_at);
+    CREATE TABLE bodies.attachment (
+        message_id INTEGER NOT NULL,
+        position INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        mime TEXT NOT NULL,
+        data BLOB NOT NULL,
+        PRIMARY KEY (message_id, position)
+    );
+
+    -- Search ignores accents, but đ is a letter of its own that the tokenizer keeps, so it is
+    -- folded by hand. People type Vietnamese without its accents, and `don` must find `đơn`.
+    CREATE VIRTUAL TABLE fts USING fts5 (
+        subject, sender, body, content = '', contentless_delete = 1,
+        tokenize = 'unicode61 remove_diacritics 2'
+    );
+    INSERT INTO fts (rowid, subject, sender, body)
+        SELECT id, replace(replace(subject, 'đ', 'd'), 'Đ', 'd'), replace(replace(from_name || ' ' || from_addr, 'đ', 'd'), 'Đ', 'd'), '' FROM message;
+    CREATE TRIGGER message_indexed AFTER INSERT ON message BEGIN
+        INSERT INTO fts (rowid, subject, sender, body)
+        VALUES (new.id, replace(replace(new.subject, 'đ', 'd'), 'Đ', 'd'), replace(replace(new.from_name || ' ' || new.from_addr, 'đ', 'd'), 'Đ', 'd'), '');
+    END;
+    CREATE TRIGGER message_unindexed AFTER DELETE ON message BEGIN
+        DELETE FROM fts WHERE rowid = old.id;
+    END;
 "];
+
+/// The migration that added search. Bodies stored before it are indexed once, on opening.
+const FTS_MIGRATION: i64 = 3;
+
+/// The most of a message's text that goes into the search index.
+const MAX_INDEXED_TEXT: usize = 15_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Security {
@@ -108,6 +198,8 @@ pub struct Account {
     pub port: u16,
     pub security: Security,
     pub auth: AuthKind,
+    pub smtp_host: String,
+    pub smtp_port: u16,
 }
 
 /// What a label means to the app. Anything without a role is a user label.
@@ -117,33 +209,41 @@ pub enum Role {
     Starred,
     Sent,
     Drafts,
+    /// Mail waiting to go. Local only, and shown only while there is some.
+    Outbox,
     All,
+    /// Where archived mail goes on servers without Gmail's All Mail.
+    Archive,
     Spam,
     Trash,
     None,
 }
 
 impl Role {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Role::Inbox => "inbox",
             Role::Starred => "starred",
             Role::Sent => "sent",
             Role::Drafts => "drafts",
+            Role::Outbox => "outbox",
             Role::All => "all",
+            Role::Archive => "archive",
             Role::Spam => "spam",
             Role::Trash => "trash",
             Role::None => "",
         }
     }
 
-    fn parse(s: &str) -> Self {
+    pub(crate) fn parse(s: &str) -> Self {
         match s {
             "inbox" => Role::Inbox,
             "starred" => Role::Starred,
             "sent" => Role::Sent,
             "drafts" => Role::Drafts,
+            "outbox" => Role::Outbox,
             "all" => Role::All,
+            "archive" => Role::Archive,
             "spam" => Role::Spam,
             "trash" => Role::Trash,
             _ => Role::None,
@@ -157,7 +257,9 @@ impl Role {
             Role::Starred => "Starred",
             Role::Sent => "Sent",
             Role::Drafts => "Drafts",
+            Role::Outbox => "Outbox",
             Role::All => "All Mail",
+            Role::Archive => "Archive",
             Role::Spam => "Spam",
             Role::Trash => "Trash",
             Role::None => "",
@@ -208,6 +310,10 @@ pub struct NewMessage {
     pub uid: u32,
     pub remote_id: String,
     pub gm_thread_id: Option<u64>,
+    /// The Message-ID, without its angle brackets.
+    pub mid: Option<String>,
+    /// The Message-IDs it answers, which place it in a thread where the server has no threads.
+    pub references: Vec<String>,
     pub subject: String,
     pub from_name: String,
     pub from_addr: String,
@@ -240,24 +346,17 @@ pub struct LabelRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageRow {
     pub id: i64,
+    pub thread_id: i64,
     pub from_name: String,
     pub from_addr: String,
     pub subject: String,
     pub date: i64,
+    /// In a list these two speak for the thread: read only if all of it is, and starred if any
+    /// of it is.
     pub seen: bool,
     pub flagged: bool,
-}
-
-fn message_row(r: &rusqlite::Row) -> rusqlite::Result<MessageRow> {
-    Ok(MessageRow {
-        id: r.get(0)?,
-        from_name: r.get(1)?,
-        from_addr: r.get(2)?,
-        subject: r.get(3)?,
-        date: r.get(4)?,
-        seen: r.get(5)?,
-        flagged: r.get(6)?,
-    })
+    /// Messages in the thread, as [`Reader::thread`] would list them.
+    pub count: i64,
 }
 
 fn configure(conn: &Connection, dir: &Path, cache_kib: i64) -> Result<()> {
@@ -291,10 +390,13 @@ impl Store {
             tx.execute_batch(&format!("PRAGMA user_version = {}", i + 1))?;
             tx.commit()?;
         }
+        if version > 0 && version < FTS_MIGRATION {
+            index_stored_bodies(&conn)?;
+        }
         Ok(Self { conn: Mutex::new(conn) })
     }
 
-    fn with_tx<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<T> {
+    pub(crate) fn with_tx<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<T> {
         let mut conn = self.conn.lock().expect("store lock");
         let tx = conn.transaction()?;
         let out = f(&tx)?;
@@ -302,17 +404,35 @@ impl Store {
         Ok(out)
     }
 
+    /// As [`Store::with_tx`], but the commit survives power loss. WAL's normal setting can lose
+    /// the latest commits in a power cut, which is fine for anything sync can fetch again.
+    pub(crate) fn with_durable_tx<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<T> {
+        let mut conn = self.conn.lock().expect("store lock");
+        conn.execute_batch("PRAGMA synchronous = FULL")?;
+        let tx = conn.transaction()?;
+        let out = f(&tx).and_then(|out| {
+            tx.commit()?;
+            Ok(out)
+        });
+        conn.execute_batch("PRAGMA synchronous = NORMAL")?;
+        out
+    }
+
     pub fn add_account(&self, a: &Account) -> Result<i64> {
         self.with_tx(|tx| {
             tx.execute(
-                "INSERT INTO account (email, host, port, security, auth) VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT (email) DO UPDATE SET host = ?2, port = ?3, security = ?4, auth = ?5",
+                "INSERT INTO account (email, host, port, security, auth, smtp_host, smtp_port)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT (email) DO UPDATE
+                 SET host = ?2, port = ?3, security = ?4, auth = ?5, smtp_host = ?6, smtp_port = ?7",
                 params![
                     a.email,
                     a.host,
                     a.port,
                     if a.security == Security::Tls { "tls" } else { "plain" },
                     if a.auth == AuthKind::Google { "google" } else { "password" },
+                    a.smtp_host,
+                    a.smtp_port,
                 ],
             )?;
             Ok(tx.query_row("SELECT id FROM account WHERE email = ?1", [&a.email], |r| r.get(0))?)
@@ -324,6 +444,10 @@ impl Store {
         self.with_tx(|tx| {
             tx.execute(
                 "DELETE FROM bodies.body WHERE message_id IN (SELECT id FROM message WHERE account_id = ?1)",
+                [account_id],
+            )?;
+            tx.execute(
+                "DELETE FROM bodies.attachment WHERE message_id IN (SELECT id FROM message WHERE account_id = ?1)",
                 [account_id],
             )?;
             tx.execute(
@@ -402,41 +526,58 @@ impl Store {
     /// fetching the same batch again.
     pub fn save_messages(&self, folder: &Folder, messages: &[NewMessage]) -> Result<Vec<i64>> {
         self.with_tx(|tx| {
+            let account = folder.account_id;
+            let role = folder_role(tx, folder)?;
             let mut labels = HashMap::new();
+            let mut threads = HashSet::new();
             let mut added = Vec::new();
             for m in messages {
-                let known: Option<i64> = tx
-                    .query_row(
-                        "SELECT id FROM message WHERE account_id = ?1 AND remote_id = ?2",
-                        params![folder.account_id, m.remote_id],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                let id = if let Some(id) = known {
-                    tx.execute("UPDATE message SET seen = ?2, flagged = ?3 WHERE id = ?1", params![id, m.seen, m.flagged])?;
-                    id
-                } else {
-                    tx.execute(
-                        "INSERT INTO message
-                           (account_id, remote_id, gm_thread_id, subject, from_name, from_addr, date, size, seen, flagged)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                        params![
-                            folder.account_id,
-                            m.remote_id,
-                            m.gm_thread_id.map(|t| t as i64),
-                            m.subject,
-                            m.from_name,
-                            m.from_addr,
-                            m.date,
-                            m.size,
-                            m.seen,
-                            m.flagged,
-                        ],
+                // Our own sent mail or draft, back from the server: it stays one message.
+                if let Some(mid) = &m.mid {
+                    let mut adopt = tx.prepare_cached(
+                        "UPDATE message SET remote_id = ?3
+                         WHERE account_id = ?1 AND mid = ?2 AND remote_id <> ?3
+                           AND (remote_id LIKE 'local:%' OR id IN (SELECT message_id FROM draft))",
                     )?;
-                    let id = tx.last_insert_rowid();
+                    adopt.execute(params![account, mid, m.remote_id])?;
+                }
+                // Before the write, because a new thread id leaves the old thread needing a head.
+                let mut previous = tx.prepare_cached("SELECT thread_id FROM message WHERE account_id = ?1 AND remote_id = ?2")?;
+                let known = previous.query_row(params![account, m.remote_id], |r| r.get::<_, Option<i64>>(0)).optional()?;
+                threads.extend(known.flatten());
+                tx.execute(
+                    "INSERT INTO message
+                       (account_id, remote_id, thread_id, subject, from_name, from_addr, date, size, seen, flagged, mid)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                     ON CONFLICT (account_id, remote_id) DO UPDATE
+                     SET seen = ?9, flagged = ?10, thread_id = coalesce(?3, thread_id), mid = coalesce(?11, mid)",
+                    params![
+                        account,
+                        m.remote_id,
+                        m.gm_thread_id.map(|t| t as i64),
+                        m.subject,
+                        m.from_name,
+                        m.from_addr,
+                        m.date,
+                        m.size,
+                        m.seen,
+                        m.flagged,
+                        m.mid,
+                    ],
+                )?;
+                let (id, thread): (i64, Option<i64>) = tx.query_row(
+                    "SELECT id, thread_id FROM message WHERE account_id = ?1 AND remote_id = ?2",
+                    params![account, m.remote_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                threads.extend(thread);
+                // What was adopted above is our own mail coming back, which is no news.
+                if known.is_none() {
                     added.push(id);
-                    id
-                };
+                }
+                if m.gm_thread_id.is_none() {
+                    threads.insert(place_in_thread(tx, account, id, thread, m.mid.as_deref(), &m.references)?);
+                }
                 // A reused UID can only mean a stale row from before a rescan.
                 tx.execute(
                     "UPDATE placement SET uid = NULL WHERE folder_id = ?1 AND uid = ?2 AND message_id <> ?3",
@@ -447,8 +588,13 @@ impl Store {
                      ON CONFLICT (folder_id, message_id) DO UPDATE SET uid = ?3",
                     params![folder.id, id, m.uid],
                 )?;
-                set_labels(tx, folder.account_id, id, m.flagged, Some(&m.labels), &mut labels)?;
+                set_labels(tx, account, id, m.flagged, in_bin(role), Some(&m.labels), &mut labels)?;
+                if role == Role::Sent || m.labels.iter().any(|l| l.role == Role::Sent) {
+                    finished_elsewhere(tx, account, id)?;
+                }
+                reapply_pending(tx, id)?;
             }
+            refresh_heads(tx, account, threads)?;
             Ok(added)
         })
     }
@@ -457,7 +603,9 @@ impl Store {
     /// fetch those messages with their current state.
     pub fn apply_changes(&self, folder: &Folder, changes: &[Change]) -> Result<()> {
         self.with_tx(|tx| {
+            let binned = in_bin(folder_role(tx, folder)?);
             let mut labels = HashMap::new();
+            let mut threads = HashSet::new();
             for c in changes {
                 let id: Option<i64> = tx
                     .query_row(
@@ -471,9 +619,11 @@ impl Store {
                     "UPDATE message SET seen = ?2, flagged = ?3 WHERE id = ?1",
                     params![id, c.seen, c.flagged],
                 )?;
-                set_labels(tx, folder.account_id, id, c.flagged, c.labels.as_deref(), &mut labels)?;
+                set_labels(tx, folder.account_id, id, c.flagged, binned, c.labels.as_deref(), &mut labels)?;
+                reapply_pending(tx, id)?;
+                threads.insert(thread_of(tx, id)?);
             }
-            Ok(())
+            refresh_heads(tx, folder.account_id, threads)
         })
     }
 
@@ -517,6 +667,7 @@ impl Store {
     /// until [`Store::purge_orphans`], because it may simply have moved to a later folder.
     pub fn remove_uids(&self, folder: &Folder, uids: &[u32]) -> Result<()> {
         self.with_tx(|tx| {
+            let mut threads = HashSet::new();
             for uid in uids {
                 let id: Option<i64> = tx
                     .query_row(
@@ -527,9 +678,10 @@ impl Store {
                     .optional()?;
                 if let Some(id) = id {
                     remove_placement(tx, folder, id)?;
+                    threads.insert(thread_of(tx, id)?);
                 }
             }
-            Ok(())
+            refresh_heads(tx, folder.account_id, threads)
         })
     }
 
@@ -538,40 +690,79 @@ impl Store {
         self.with_tx(|tx| {
             let mut stmt = tx.prepare("SELECT message_id FROM placement WHERE folder_id = ?1 AND uid IS NULL")?;
             let gone: Vec<i64> = stmt.query_map([folder.id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            let mut threads = HashSet::new();
             for id in gone {
                 remove_placement(tx, folder, id)?;
+                threads.insert(thread_of(tx, id)?);
             }
-            Ok(())
+            refresh_heads(tx, folder.account_id, threads)
         })
     }
 
-    /// Deletes messages that no folder claimed. Call only after a pass over every folder.
+    /// Deletes messages that no folder claimed. Call only after a pass over every folder. A
+    /// message that still has labels is on its way somewhere: a move the server has done and
+    /// sync has yet to see, or mail that exists only here so far.
     pub fn purge_orphans(&self, account_id: i64) -> Result<()> {
         const ORPHANS: &str = "SELECT id FROM message m WHERE account_id = ?1
-                               AND NOT EXISTS (SELECT 1 FROM placement p WHERE p.message_id = m.id)";
+                               AND NOT EXISTS (SELECT 1 FROM placement p WHERE p.message_id = m.id)
+                               AND NOT EXISTS (SELECT 1 FROM message_label l WHERE l.message_id = m.id)";
         self.with_tx(|tx| {
             tx.execute(&format!("DELETE FROM bodies.body WHERE message_id IN ({ORPHANS})"), [account_id])?;
+            tx.execute(&format!("DELETE FROM bodies.attachment WHERE message_id IN ({ORPHANS})"), [account_id])?;
             tx.execute(&format!("DELETE FROM message WHERE id IN ({ORPHANS})"), [account_id])?;
             Ok(())
         })
     }
 
-    /// Keeps a message's body. One that arrives after its account was removed is dropped, since
-    /// `bodies.db` is a separate file and no foreign key can refuse it.
+    /// Keeps a message's body and indexes its text. One that arrives after its account was
+    /// removed is dropped, since `bodies.db` is a separate file and no foreign key can refuse it.
     pub fn save_body(&self, message_id: i64, raw: &[u8]) -> Result<()> {
         let packed = zstd::bulk::compress(raw, 3)?;
+        let text = indexed_text(raw);
         self.with_tx(|tx| {
             tx.execute(
                 "INSERT OR REPLACE INTO bodies.body (message_id, raw)
                  SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM message WHERE id = ?1)",
                 params![message_id, packed],
             )?;
-            Ok(())
+            index_message(tx, message_id, &text)
         })
     }
 }
 
-fn label_id(tx: &Transaction, account_id: i64, spec: &LabelSpec) -> Result<i64> {
+/// A message's text as search sees it.
+fn indexed_text(raw: &[u8]) -> String {
+    let parsed = MessageParser::default().parse(raw);
+    let text = parsed.as_ref().and_then(|m| m.root().body_text(0).map(|t| t.chars().take(MAX_INDEXED_TEXT).collect()));
+    text.unwrap_or_default()
+}
+
+const INDEX_MESSAGE: &str = "INSERT OR REPLACE INTO fts (rowid, subject, sender, body)
+                             SELECT id, replace(replace(subject, 'đ', 'd'), 'Đ', 'd'), replace(replace(from_name || ' ' || from_addr, 'đ', 'd'), 'Đ', 'd'), ?2
+                             FROM message WHERE id = ?1";
+
+/// As the index and its queries see text. See the note on the `fts` table.
+fn folded(text: &str) -> String {
+    text.replace(['đ', 'Đ'], "d")
+}
+
+/// Replaces a message's search entry. The index keeps no text of its own, so all of it goes in.
+pub(crate) fn index_message(tx: &Transaction, message_id: i64, body: &str) -> Result<()> {
+    tx.execute(INDEX_MESSAGE, params![message_id, folded(body)])?;
+    Ok(())
+}
+
+fn index_stored_bodies(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT message_id, raw FROM bodies.body")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
+    for row in rows {
+        let (id, packed) = row?;
+        conn.execute(INDEX_MESSAGE, params![id, folded(&indexed_text(&zstd::decode_all(packed.as_slice())?))])?;
+    }
+    Ok(())
+}
+
+pub(crate) fn label_id(tx: &Transaction, account_id: i64, spec: &LabelSpec) -> Result<i64> {
     tx.execute(
         "INSERT INTO label (account_id, name, role) VALUES (?1, ?2, ?3) ON CONFLICT (account_id, name) DO NOTHING",
         params![account_id, spec.name, spec.role.as_str()],
@@ -584,12 +775,17 @@ fn label_id(tx: &Transaction, account_id: i64, spec: &LabelSpec) -> Result<i64> 
 }
 
 /// Rebuilds a message's labels: its folders' labels, plus Starred from the flag, plus `extra`.
-/// With `extra` as `None`, labels that came from the server are left alone.
+/// With `extra` as `None`, labels that came from the server are left alone. Mail in Trash or Spam
+/// is out of circulation, so that is the only place it shows, whatever labels it still carries.
+/// `binned` says which side of that the folder being read is on. It decides, rather than the
+/// message's other locations, because one of those may be a stale copy that a later folder in
+/// the same pass will find has gone.
 fn set_labels(
     tx: &Transaction,
     account_id: i64,
     message_id: i64,
     flagged: bool,
+    binned: bool,
     extra: Option<&[LabelSpec]>,
     cache: &mut HashMap<LabelSpec, i64>,
 ) -> Result<()> {
@@ -607,21 +803,110 @@ fn set_labels(
     } else {
         tx.execute("DELETE FROM message_label WHERE message_id = ?1 AND label_id = ?2", params![message_id, starred])?;
     }
-    let date: i64 = tx.query_row("SELECT date FROM message WHERE id = ?1", [message_id], |r| r.get(0))?;
-    let add = |label: i64| {
-        tx.execute("INSERT OR IGNORE INTO message_label VALUES (?1, ?2, ?3)", params![label, date, message_id])
-    };
-    if flagged {
-        add(starred)?;
-    }
-    for spec in extra.unwrap_or_default() {
-        add(id_of(spec)?)?;
-    }
-    tx.execute(
-        "INSERT OR IGNORE INTO message_label
-         SELECT f.label_id, ?2, ?1 FROM placement p JOIN folder f ON f.id = p.folder_id WHERE p.message_id = ?1",
-        params![message_id, date],
+    let mut folders = tx.prepare_cached(
+        "SELECT f.label_id, l.role IN ('trash', 'spam') FROM placement p
+         JOIN folder f ON f.id = p.folder_id JOIN label l ON l.id = f.label_id
+         WHERE p.message_id = ?1",
     )?;
+    let folders: Vec<(i64, bool)> =
+        folders.query_map([message_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    if !binned {
+        if flagged {
+            add_label(tx, starred, message_id)?;
+        }
+        for spec in extra.unwrap_or_default() {
+            add_label(tx, id_of(spec)?, message_id)?;
+        }
+    }
+    for (label, _) in folders.iter().filter(|(_, in_bin)| *in_bin == binned) {
+        add_label(tx, *label, message_id)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn add_label(tx: &Transaction, label: i64, message_id: i64) -> Result<()> {
+    let mut add = tx.prepare_cached(
+        "INSERT OR IGNORE INTO message_label (label_id, date, message_id)
+         SELECT ?1, date, id FROM message WHERE id = ?2",
+    )?;
+    add.execute(params![label, message_id])?;
+    Ok(())
+}
+
+pub(crate) fn thread_of(tx: &Transaction, message_id: i64) -> Result<i64> {
+    let mut stmt = tx.prepare_cached("SELECT thread_id FROM message WHERE id = ?1")?;
+    Ok(stmt.query_row([message_id], |r| r.get(0))?)
+}
+
+/// Puts a message in the thread of whatever it mentions, joining threads it turns out to link,
+/// and returns the thread. Only the nearest references count, because a hostile message can list
+/// thousands.
+pub(crate) fn place_in_thread(
+    tx: &Transaction,
+    account_id: i64,
+    message_id: i64,
+    current: Option<i64>,
+    mid: Option<&str>,
+    references: &[String],
+) -> Result<i64> {
+    const MAX_REFERENCES: usize = 50;
+    let nearest = references.iter().rev().take(MAX_REFERENCES).map(String::as_str);
+    let ids: Vec<&str> = mid.into_iter().chain(nearest).collect();
+    let mut known: Vec<i64> = current.into_iter().collect();
+    {
+        let mut find = tx.prepare_cached("SELECT thread_id FROM thread_ref WHERE account_id = ?1 AND mid = ?2")?;
+        for id in &ids {
+            known.extend(find.query_row(params![account_id, id], |r| r.get::<_, i64>(0)).optional()?);
+        }
+    }
+    let thread = known.iter().copied().min().unwrap_or(message_id);
+    for other in known.iter().filter(|t| **t != thread) {
+        tx.execute(
+            "UPDATE message SET thread_id = ?3 WHERE account_id = ?1 AND thread_id = ?2",
+            params![account_id, other, thread],
+        )?;
+        tx.execute(
+            "UPDATE thread_ref SET thread_id = ?3 WHERE account_id = ?1 AND thread_id = ?2",
+            params![account_id, other, thread],
+        )?;
+    }
+    tx.execute("UPDATE message SET thread_id = ?2 WHERE id = ?1", params![message_id, thread])?;
+    let mut record = tx.prepare_cached(
+        "INSERT INTO thread_ref (account_id, mid, thread_id) VALUES (?1, ?2, ?3)
+         ON CONFLICT (account_id, mid) DO UPDATE SET thread_id = ?3",
+    )?;
+    for id in ids {
+        record.execute(params![account_id, id, thread])?;
+    }
+    Ok(thread)
+}
+
+/// Marks each thread's newest message in every label it is in. Call once a batch has settled.
+/// A thread is a few rows, so they are compared here, and only what changed is written. This runs
+/// for every batch of sync, so the plan is pinned rather than left to the query planner.
+pub(crate) fn refresh_heads(tx: &Transaction, account_id: i64, threads: impl IntoIterator<Item = i64>) -> Result<()> {
+    let mut rows = tx.prepare_cached(
+        "SELECT ml.label_id, ml.date, ml.message_id, ml.head
+         FROM message m INDEXED BY message_thread CROSS JOIN message_label ml ON ml.message_id = m.id
+         WHERE m.account_id = ?1 AND m.thread_id = ?2",
+    )?;
+    let mut write = tx.prepare_cached("UPDATE message_label SET head = ?4 WHERE label_id = ?1 AND date = ?2 AND message_id = ?3")?;
+    for thread in threads {
+        let rows: Vec<(i64, i64, i64, bool)> = rows
+            .query_map(params![account_id, thread], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut newest: HashMap<i64, (i64, i64)> = HashMap::new();
+        for &(label, date, message, _) in &rows {
+            let best = newest.entry(label).or_insert((date, message));
+            *best = (*best).max((date, message));
+        }
+        for (label, date, message, head) in rows {
+            let is_newest = newest[&label] == (date, message);
+            if head != is_newest {
+                write.execute(params![label, date, message, is_newest])?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -629,10 +914,73 @@ fn remove_placement(tx: &Transaction, folder: &Folder, message_id: i64) -> Resul
     tx.execute("DELETE FROM placement WHERE folder_id = ?1 AND message_id = ?2", params![folder.id, message_id])?;
     tx.execute("DELETE FROM message_label WHERE label_id = ?1 AND message_id = ?2", params![folder.label_id, message_id])?;
     let remaining: i64 = tx.query_row("SELECT count(*) FROM placement WHERE message_id = ?1", [message_id], |r| r.get(0))?;
-    if remaining == 0 {
+    // A draft is what the user is writing, whatever became of its copy on the server.
+    let draft = tx.prepare_cached("SELECT 1 FROM draft WHERE message_id = ?1")?.exists([message_id])?;
+    if remaining == 0 && !draft {
         tx.execute("DELETE FROM message_label WHERE message_id = ?1", [message_id])?;
     }
     Ok(())
+}
+
+fn folder_role(tx: &Transaction, folder: &Folder) -> Result<Role> {
+    let mut stmt = tx.prepare_cached("SELECT role FROM label WHERE id = ?1")?;
+    let role: String = stmt.query_row([folder.label_id], |r| r.get(0))?;
+    Ok(Role::parse(&role))
+}
+
+fn in_bin(role: Role) -> bool {
+    matches!(role, Role::Trash | Role::Spam)
+}
+
+/// Whether a message `t` is in Trash or Spam, as an SQL condition.
+const IN_BIN: &str = "EXISTS (SELECT 1 FROM message_label x JOIN label l ON l.id = x.label_id
+                              WHERE x.message_id = t.id AND l.role IN ('trash', 'spam'))";
+/// Drafts and mail waiting to go are not part of a conversation yet.
+const READABLE: &str = "NOT EXISTS (SELECT 1 FROM message_label y JOIN label k ON k.id = y.label_id
+                                    WHERE y.message_id = t.id AND k.role IN ('drafts', 'outbox'))";
+
+/// The columns [`thread_row`] reads, for a message `m` that stands for its thread. A thread's
+/// count and state cover the messages on the same side of the bin as `m`.
+static THREAD_COLUMNS: LazyLock<String> = LazyLock::new(|| {
+    let peers = format!(
+        "FROM message t WHERE t.account_id = m.account_id AND t.thread_id = m.thread_id AND {READABLE} AND {IN_BIN} = {}",
+        IN_BIN.replace("t.id", "m.id")
+    );
+    format!(
+        "m.id, m.thread_id, m.from_name, m.from_addr, m.subject, m.date,
+         coalesce((SELECT min(t.seen) {peers}), m.seen),
+         coalesce((SELECT max(t.flagged) {peers}), m.flagged),
+         (SELECT count(*) {peers})"
+    )
+});
+
+fn thread_row(r: &Row) -> rusqlite::Result<MessageRow> {
+    Ok(MessageRow {
+        id: r.get(0)?,
+        thread_id: r.get(1)?,
+        from_name: r.get(2)?,
+        from_addr: r.get(3)?,
+        subject: r.get(4)?,
+        date: r.get(5)?,
+        seen: r.get(6)?,
+        flagged: r.get(7)?,
+        count: r.get(8)?,
+    })
+}
+
+/// Someone mail can be addressed to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Contact {
+    pub name: String,
+    pub address: String,
+}
+
+/// Turns what someone typed into an FTS5 query: each word a quoted prefix, so nothing they type
+/// can be read as query syntax. `None` if there is nothing to search for.
+fn fts_query(text: &str) -> Option<String> {
+    let text = folded(text);
+    let words: Vec<String> = text.split_whitespace().map(|word| format!("\"{}\"*", word.replace('"', "\"\""))).collect();
+    (!words.is_empty()).then(|| words.join(" "))
 }
 
 /// A read connection, one per thread that needs it. It cannot write.
@@ -649,6 +997,10 @@ impl Reader {
         Ok(Self { conn })
     }
 
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
     pub fn images_allowed(&self, account_id: i64, address: &str) -> Result<bool> {
         let mut stmt = self.conn.prepare_cached("SELECT 1 FROM image_sender WHERE account_id = ?1 AND address = ?2")?;
         Ok(stmt.exists(params![account_id, address.to_lowercase()])?)
@@ -661,7 +1013,7 @@ impl Reader {
     }
 
     pub fn accounts(&self) -> Result<Vec<Account>> {
-        let mut stmt = self.conn.prepare_cached("SELECT id, email, host, port, security, auth FROM account ORDER BY id")?;
+        let mut stmt = self.conn.prepare_cached("SELECT id, email, host, port, security, auth, smtp_host, smtp_port FROM account ORDER BY id")?;
         let rows = stmt.query_map([], |r| {
             Ok(Account {
                 id: r.get(0)?,
@@ -670,6 +1022,8 @@ impl Reader {
                 port: r.get(3)?,
                 security: if r.get::<_, String>(4)? == "tls" { Security::Tls } else { Security::Plain },
                 auth: if r.get::<_, String>(5)? == "google" { AuthKind::Google } else { AuthKind::Password },
+                smtp_host: r.get(6)?,
+                smtp_port: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -690,14 +1044,14 @@ impl Reader {
     /// Those of `ids` that are unread in the Inbox, newest first.
     pub fn unread_in_inbox(&self, ids: &[i64]) -> Result<Vec<MessageRow>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT m.id, m.from_name, m.from_addr, m.subject, m.date, m.seen, m.flagged FROM message m
+            "SELECT m.id, m.thread_id, m.from_name, m.from_addr, m.subject, m.date, m.seen, m.flagged, 1 FROM message m
              WHERE m.id = ?1 AND m.seen = 0 AND EXISTS (
                  SELECT 1 FROM message_label ml JOIN label l ON l.id = ml.label_id
                  WHERE ml.message_id = m.id AND l.role = 'inbox')",
         )?;
         let mut rows = Vec::new();
         for id in ids {
-            rows.extend(stmt.query_row([id], message_row).optional()?);
+            rows.extend(stmt.query_row([id], thread_row).optional()?);
         }
         rows.sort_by_key(|m| std::cmp::Reverse((m.date, m.id)));
         Ok(rows)
@@ -727,39 +1081,156 @@ impl Reader {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        const ORDER: [Role; 8] =
-            [Role::Inbox, Role::Starred, Role::Sent, Role::Drafts, Role::All, Role::Spam, Role::Trash, Role::None];
+        const ORDER: [Role; 10] = [
+            Role::Inbox,
+            Role::Starred,
+            Role::Sent,
+            Role::Drafts,
+            Role::Outbox,
+            Role::All,
+            Role::Archive,
+            Role::Spam,
+            Role::Trash,
+            Role::None,
+        ];
+        // Mail in its few seconds of undo is not stuck, and is not worth a line in the sidebar.
+        let mut stuck = self.conn.prepare_cached(
+            "SELECT 1 FROM draft d JOIN message m ON m.id = d.message_id WHERE m.account_id = ?1 AND d.state = 'retrying'",
+        )?;
+        let stuck = stuck.exists([account_id])?;
+        labels.retain(|l| l.role != Role::Outbox || stuck);
         labels.sort_by_cached_key(|l| (ORDER.iter().position(|r| *r == l.role), l.name.to_lowercase()));
         Ok(labels)
     }
 
+    /// Threads in a label.
     pub fn message_count(&self, label_id: i64) -> Result<usize> {
-        let count: i64 = self.conn.query_row("SELECT count(*) FROM message_label WHERE label_id = ?1", [label_id], |r| r.get(0))?;
+        let mut stmt = self.conn.prepare_cached("SELECT count(*) FROM message_label WHERE label_id = ?1 AND head = 1")?;
+        let count: i64 = stmt.query_row([label_id], |r| r.get(0))?;
         Ok(count as usize)
     }
 
-    /// Where a message sits in a label's list, or `None` if it is not there.
-    pub fn position(&self, label_id: i64, message_id: i64) -> Result<Option<usize>> {
+    /// Where a thread sits in a label's list, or `None` if it is not there.
+    pub fn position(&self, label_id: i64, thread_id: i64) -> Result<Option<usize>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT (SELECT count(*) FROM message_label b
-                     WHERE b.label_id = a.label_id AND (b.date, b.message_id) > (a.date, a.message_id))
-             FROM message_label a WHERE a.label_id = ?1 AND a.message_id = ?2",
+                     WHERE b.label_id = a.label_id AND b.head = 1 AND (b.date, b.message_id) > (a.date, a.message_id))
+             FROM message_label a JOIN message m ON m.id = a.message_id
+             WHERE a.label_id = ?1 AND a.head = 1 AND m.thread_id = ?2
+               AND m.account_id = (SELECT account_id FROM label WHERE id = ?1)",
         )?;
-        let position: Option<i64> = stmt.query_row(params![label_id, message_id], |r| r.get(0)).optional()?;
+        let position: Option<i64> = stmt.query_row(params![label_id, thread_id], |r| r.get(0)).optional()?;
         Ok(position.map(|p| p as usize))
     }
 
-    /// One window of a label, newest first. Never load a whole mailbox.
+    /// One window of a label's threads, newest first. Never load a whole mailbox.
     pub fn messages(&self, label_id: i64, offset: usize, limit: usize) -> Result<Vec<MessageRow>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT m.id, m.from_name, m.from_addr, m.subject, m.date, m.seen, m.flagged
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {}
              FROM message_label ml JOIN message m ON m.id = ml.message_id
-             WHERE ml.label_id = ?1
+             WHERE ml.label_id = ?1 AND ml.head = 1
              ORDER BY ml.date DESC, ml.message_id DESC
              LIMIT ?2 OFFSET ?3",
-        )?;
-        let rows = stmt.query_map(params![label_id, limit as i64, offset as i64], message_row)?;
+            *THREAD_COLUMNS
+        ))?;
+        let rows = stmt.query_map(params![label_id, limit as i64, offset as i64], thread_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// A thread's messages, oldest first, as its reader sees them. `binned` asks for those in
+    /// Trash or Spam instead of the rest, because a thread can be split between the two.
+    pub fn thread(&self, account_id: i64, thread_id: i64, binned: bool) -> Result<Vec<MessageRow>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT t.id, t.thread_id, t.from_name, t.from_addr, t.subject, t.date, t.seen, t.flagged, 1
+             FROM message t INDEXED BY message_thread
+             WHERE t.account_id = ?1 AND t.thread_id = ?2 AND {READABLE} AND {IN_BIN} = ?3
+             ORDER BY t.date, t.id"
+        ))?;
+        let rows = stmt.query_map(params![account_id, thread_id, binned], thread_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Threads matching a local search, newest first, leaving out Trash and Spam. Every word
+    /// must match, as a prefix, in any part of the message that is stored here. Walks the mail
+    /// from the newest and stops at `limit`, so a word in everything costs no more than a rare one.
+    pub fn search(&self, account_id: i64, query: &str, limit: usize) -> Result<Vec<MessageRow>> {
+        let Some(query) = fts_query(query) else { return Ok(Vec::new()) };
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT t.id, t.thread_id FROM message t
+             WHERE t.account_id = ?1 AND t.id IN (SELECT rowid FROM fts WHERE fts MATCH ?2) AND NOT {IN_BIN}
+             ORDER BY t.date DESC, t.id DESC"
+        ))?;
+        let mut rows = stmt.query(params![account_id, query])?;
+        let mut threads = HashSet::new();
+        let mut newest = Vec::new();
+        while newest.len() < limit
+            && let Some(row) = rows.next()?
+        {
+            if threads.insert(row.get::<_, i64>(1)?) {
+                newest.push(row.get(0)?);
+            }
+        }
+        drop(rows);
+        self.rows(&newest)
+    }
+
+    /// These messages as rows of their threads, in the order given. Unknown ids are left out.
+    pub fn rows(&self, ids: &[i64]) -> Result<Vec<MessageRow>> {
+        let mut stmt = self.conn.prepare_cached(&format!("SELECT {} FROM message m WHERE m.id = ?1", *THREAD_COLUMNS))?;
+        let mut rows = Vec::with_capacity(ids.len());
+        for id in ids {
+            rows.extend(stmt.query_row([id], thread_row).optional()?);
+        }
+        Ok(rows)
+    }
+
+    /// The message at a UID, if we hold it.
+    pub fn message_at(&self, account_id: i64, path: &str, uid: u32) -> Result<Option<i64>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT p.message_id FROM placement p JOIN folder f ON f.id = p.folder_id
+             WHERE f.account_id = ?1 AND f.path = ?2 AND p.uid = ?3",
+        )?;
+        Ok(stmt.query_row(params![account_id, path, uid], |r| r.get(0)).optional()?)
+    }
+
+    /// The paths of the folders a search of the server should cover.
+    pub fn searchable_folders(&self, account_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT f.path FROM folder f JOIN label l ON l.id = f.label_id
+             WHERE f.account_id = ?1 AND l.role NOT IN ('trash', 'spam')",
+        )?;
+        let paths = stmt.query_map([account_id], |r| r.get(0))?;
+        Ok(paths.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// People whose name or address starts with `prefix`, most frequent first, from the mail
+    /// they sent. Spam and machines that never read their mail are no use here.
+    pub fn contacts(&self, account_id: i64, prefix: &str, limit: usize) -> Result<Vec<Contact>> {
+        if prefix.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare_cached(
+            r"SELECT max(m.from_name), m.from_addr FROM message m
+              WHERE m.account_id = ?1 AND m.from_addr <> ''
+                AND (m.from_addr LIKE ?2 ESCAPE '\' OR m.from_name LIKE ?2 ESCAPE '\' OR m.from_name LIKE ?3 ESCAPE '\')
+                AND m.from_addr NOT LIKE 'no%reply%' AND m.from_addr NOT LIKE 'notifications@%'
+                AND NOT EXISTS (SELECT 1 FROM message_label x JOIN label l ON l.id = x.label_id
+                                WHERE x.message_id = m.id AND l.role = 'spam')
+              GROUP BY lower(m.from_addr) ORDER BY count(*) DESC LIMIT ?4",
+        )?;
+        let escaped = prefix.replace('\\', r"\\").replace('%', r"\%").replace('_', r"\_");
+        let rows = stmt.query_map(
+            params![account_id, format!("{escaped}%"), format!("% {escaped}%"), limit as i64],
+            |r| Ok(Contact { name: r.get(0)?, address: r.get(1)? }),
+        )?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The labels a message has, by id.
+    pub fn message_labels(&self, message_id: i64) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare_cached("SELECT label_id FROM message_label WHERE message_id = ?1")?;
+        let labels = stmt.query_map([message_id], |r| r.get(0))?;
+        Ok(labels.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn body(&self, message_id: i64) -> Result<Option<Vec<u8>>> {
@@ -855,6 +1326,8 @@ mod tests {
                 port: 993,
                 security: Security::Tls,
                 auth: AuthKind::Password,
+                smtp_host: "localhost".into(),
+                smtp_port: 465,
             })
             .unwrap();
         let inbox = store.folder(account, "INBOX", &LabelSpec::system(Role::Inbox)).unwrap();
@@ -866,6 +1339,8 @@ mod tests {
             uid,
             remote_id: remote_id.into(),
             gm_thread_id: None,
+            mid: None,
+            references: vec![],
             subject: format!("Subject {uid}"),
             from_name: "Ann".into(),
             from_addr: "ann@example.com".into(),
@@ -886,8 +1361,8 @@ mod tests {
         assert_eq!(f.reader.message_count(label).unwrap(), 5);
         let page: Vec<_> = f.reader.messages(label, 1, 2).unwrap();
         assert_eq!(page.iter().map(|m| m.date).collect::<Vec<_>>(), [4, 3]);
-        assert_eq!(f.reader.position(label, page[0].id).unwrap(), Some(1));
-        assert_eq!(f.reader.position(label, page[1].id).unwrap(), Some(2));
+        assert_eq!(f.reader.position(label, page[0].thread_id).unwrap(), Some(1));
+        assert_eq!(f.reader.position(label, page[1].thread_id).unwrap(), Some(2));
         assert_eq!(f.reader.position(label, -1).unwrap(), None);
     }
 
@@ -1028,6 +1503,8 @@ mod tests {
                 port: 993,
                 security: Security::Tls,
                 auth: AuthKind::Password,
+                smtp_host: "localhost".into(),
+                smtp_port: 465,
             })
             .unwrap();
         let other_inbox = f.store.folder(other, "INBOX", &LabelSpec::system(Role::Inbox)).unwrap();

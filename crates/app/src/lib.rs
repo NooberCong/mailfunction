@@ -1,6 +1,7 @@
 //! The window. [`Controller`] connects the Slint UI to the store and the engine. HTML mail goes
 //! through [`HtmlPane`], so tests can drive all of this without a desktop.
 
+mod actions;
 pub mod badge;
 pub mod chrome;
 mod disc;
@@ -10,6 +11,7 @@ pub mod logos;
 pub mod notify;
 pub mod tray;
 pub mod webview;
+mod writing;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -23,6 +25,7 @@ use logos::Logos;
 use mailfunction_core::engine::{Engine, Event};
 use mailfunction_core::remote::Network;
 use mailfunction_core::{logo, oauth, secrets};
+use mailfunction_core::compose;
 use mailfunction_core::render::{self, Body, Rendered};
 use mailfunction_core::store::{Account, AuthKind, LabelRow, MessageRow, Reader, Role, Security, Store};
 use notify::{Notice, Notifier, Opens};
@@ -39,10 +42,13 @@ const FLICKING: Duration = Duration::from_millis(180);
 
 const GMAIL_HOST: &str = "imap.gmail.com";
 const IMAPS_PORT: u16 = 993;
+const GMAIL_SMTP_HOST: &str = "smtp.gmail.com";
+const SMTPS_PORT: u16 = 465;
 
 /// Avatar sizes, matching app.slint, so that a logo is cut to exactly the pixels it fills.
 const HEADER_AVATAR: f32 = 40.0;
 const ACCOUNT_AVATAR: f32 = 28.0;
+const THREAD_AVATAR: f32 = 22.0;
 
 /// A sender's picture on a notification, in pixels. Windows scales it down to fit the display.
 const NOTICE_PICTURE: u32 = 128;
@@ -125,10 +131,28 @@ pub struct Controller {
     shown: Cell<Option<i64>>,
     /// The account on screen has changed since its list was last read.
     list_stale: Cell<bool>,
+    /// The message showing in the reader.
     selected: Cell<Option<i64>>,
     /// The address the selected message is from.
     selected_sender: RefCell<String>,
     last_open: Cell<Option<Instant>>,
+    /// The thread in the reader, oldest first.
+    open_thread: Cell<Option<i64>>,
+    thread: RefCell<Vec<MessageRow>>,
+    thread_items: Rc<VecModel<ThreadItem>>,
+    read_timer: Timer,
+    reversible: RefCell<Option<actions::Reversible>>,
+    notice_timer: Timer,
+    pick_items: Rc<VecModel<PickItem>>,
+    pick_ids: RefCell<Vec<i64>>,
+    search_timer: Timer,
+    /// Identifies the latest search, so that late answers to older ones can be told apart.
+    search_key: Cell<u64>,
+    writing: RefCell<Option<writing::Writing>>,
+    autosave: Timer,
+    suggest_timer: Timer,
+    /// A draft from elsewhere that opens in the composer once its body is here.
+    opening_draft: Cell<Option<i64>>,
     pane: Box<dyn HtmlPane>,
     notifier: Box<dyn Notifier>,
     engine: RefCell<Option<Engine>>,
@@ -154,6 +178,10 @@ impl Controller {
         app.set_labels(ModelRc::from(label_items.clone()));
         let account_items = Rc::new(VecModel::default());
         app.set_accounts(ModelRc::from(account_items.clone()));
+        let thread_items = Rc::new(VecModel::default());
+        app.set_thread(ModelRc::from(thread_items.clone()));
+        let pick_items = Rc::new(VecModel::default());
+        app.set_picks(ModelRc::from(pick_items.clone()));
         let this = Rc::new(Self {
             app,
             dir: dir.to_path_buf(),
@@ -174,6 +202,20 @@ impl Controller {
             selected: Cell::new(None),
             selected_sender: RefCell::default(),
             last_open: Cell::new(None),
+            open_thread: Cell::new(None),
+            thread: RefCell::default(),
+            thread_items,
+            read_timer: Timer::default(),
+            reversible: RefCell::default(),
+            notice_timer: Timer::default(),
+            pick_items,
+            pick_ids: RefCell::default(),
+            search_timer: Timer::default(),
+            search_key: Cell::new(0),
+            writing: RefCell::default(),
+            autosave: Timer::default(),
+            suggest_timer: Timer::default(),
+            opening_draft: Cell::new(None),
             pane,
             notifier,
             engine: RefCell::default(),
@@ -185,7 +227,57 @@ impl Controller {
         Ok(this)
     }
 
+    /// A callback with no arguments, which ends quietly once the controller has gone.
+    fn bound(self: &Rc<Self>, f: impl Fn(&Rc<Self>) + 'static) -> impl Fn() + 'static {
+        let weak = Rc::downgrade(self);
+        move || {
+            if let Some(this) = weak.upgrade() {
+                f(&this);
+            }
+        }
+    }
+
+    /// As [`Controller::bound`], for a callback with one argument.
+    fn bound1<A>(self: &Rc<Self>, f: impl Fn(&Rc<Self>, A) + 'static) -> impl Fn(A) + 'static {
+        let weak = Rc::downgrade(self);
+        move |argument| {
+            if let Some(this) = weak.upgrade() {
+                f(&this, argument);
+            }
+        }
+    }
+
+    fn connect_mail_callbacks(self: &Rc<Self>) {
+        self.app.on_verb(self.bound1(|this, verb| this.verb(verb)));
+        self.app.on_open_thread_message(self.bound1(|this, index| this.open_at(index as usize)));
+        self.app.on_save_attachment(self.bound1(|this, index| this.save_attachment(index as usize)));
+        self.app.on_pick_labels(self.bound(|this| this.pick_labels()));
+        self.app.on_toggle_label(self.bound1(|this, index| this.toggle_label(index as usize)));
+        self.app.on_go_to(self.bound1(|this, kind| this.go_to(kind)));
+        self.app.on_leave_message(self.bound(|this| {
+            this.clear_message();
+        }));
+        self.app.on_search_edited(self.bound(|this| this.search_edited()));
+        self.app.on_search_closed(self.bound(|this| this.close_search()));
+        self.app.on_draft_edited(self.bound(|this| this.draft_edited()));
+        let weak = Rc::downgrade(self);
+        self.app.on_address_edited(move |field, text| {
+            if let Some(this) = weak.upgrade() {
+                this.address_edited(field, &text);
+            }
+        });
+        self.app.on_accept_suggestion(self.bound1(|this, index| this.accept_suggestion(index as usize)));
+        self.app.on_show_copies(self.bound(|this| this.app.set_draft_copies(true)));
+        self.app.on_send_draft(self.bound(|this| this.send_draft()));
+        self.app.on_attach_files(self.bound(|this| this.pick_files()));
+        self.app.on_remove_draft_file(self.bound1(|this, index| this.remove_draft_file(index as usize)));
+        self.app.on_discard_draft(self.bound(|this| this.discard_draft()));
+        self.app.on_close_draft(self.bound(|this| this.finish_writing()));
+        self.app.on_notice_clicked(self.bound(|this| this.notice_clicked()));
+    }
+
     fn connect_callbacks(self: &Rc<Self>) {
+        self.connect_mail_callbacks();
         let weak = Rc::downgrade(self);
         self.app.window().on_close_requested(move || {
             if let Some(this) = weak.upgrade() {
@@ -196,6 +288,7 @@ impl Controller {
         let weak = Rc::downgrade(self);
         self.app.on_select_label(move |index| {
             if let Some(this) = weak.upgrade() {
+                this.close_search();
                 this.select_label(index as usize);
             }
         });
@@ -310,9 +403,13 @@ impl Controller {
         self.publish_accounts();
     }
 
-    pub fn select_account(&self, index: usize) {
+    /// Shows another account. What was in progress belongs to the one being left, so it ends
+    /// there first.
+    pub fn select_account(self: &Rc<Self>, index: usize) {
         let id = self.accounts.borrow().get(index).map(|m| m.account.id);
         if let Some(id) = id.filter(|id| Some(*id) != self.shown.get()) {
+            self.finish_writing();
+            self.close_search();
             self.show(id);
         }
     }
@@ -349,7 +446,9 @@ impl Controller {
 
     /// Removes an account: stops its sync and deletes its mail and credentials. The delete
     /// runs on its own thread, as a large mailbox takes a while to go.
-    pub fn remove_account(&self, index: usize) {
+    pub fn remove_account(self: &Rc<Self>, index: usize) {
+        self.finish_writing();
+        self.close_search();
         let removed = {
             let mut accounts = self.accounts.borrow_mut();
             if index >= accounts.len() {
@@ -394,7 +493,7 @@ impl Controller {
         self.open_sign_in(&reason.unwrap_or_default());
     }
 
-    fn close_sign_in(&self) {
+    fn close_sign_in(self: &Rc<Self>) {
         self.app.set_adding(false);
         if let Ok(row) = usize::try_from(self.app.get_selected_row()) {
             self.select_row(row);
@@ -425,6 +524,8 @@ impl Controller {
                 port: IMAPS_PORT,
                 security: Security::Tls,
                 auth: AuthKind::Google,
+                smtp_host: GMAIL_SMTP_HOST.into(),
+                smtp_port: SMTPS_PORT,
             })
         });
         match added {
@@ -448,9 +549,22 @@ impl Controller {
             Event::Offline => self.set_link(account, Link::Offline),
             Event::SignInRequired(reason) => self.set_link(account, Link::SignedOut(reason)),
             // Message ids are unique across accounts, so these need no account check.
-            Event::BodyReady(id) if self.selected.get() == Some(id) => self.show_body(id),
+            Event::BodyReady(id) if self.selected.get() == Some(id) => self.body_ready(id),
             Event::BodyFailed(id) if self.selected.get() == Some(id) => self.app.set_pane(Pane::Failed),
             Event::BodyReady(_) | Event::BodyFailed(_) => {}
+            Event::ActionRefused => {
+                self.show_notice("The server said no, so that was put back", "", Duration::from_secs(8));
+                self.schedule_refresh(account);
+            }
+            Event::Sent(id) => {
+                self.sent(id);
+                self.schedule_refresh(account);
+            }
+            Event::SendFailed { maybe, reason, .. } => {
+                self.send_failed(maybe, &reason);
+                self.schedule_refresh(account);
+            }
+            Event::SearchDone { key, ids } => self.search_done(key, &ids),
             Event::AccountPicture => {
                 let email = self.accounts.borrow().iter().find(|m| m.account.id == account).map(|m| m.account.email.clone());
                 if let Some(email) = email {
@@ -517,9 +631,10 @@ impl Controller {
     }
 
     /// Brings the window up, opening again the page that closing it let go of.
-    pub fn reveal(&self) {
+    pub fn reveal(self: &Rc<Self>) {
         let returning = chrome::raise(&self.app);
         if returning
+            && !self.app.get_composing()
             && matches!(self.app.get_pane(), Pane::Html | Pane::Loading)
             && let Ok(row) = usize::try_from(self.app.get_selected_row())
         {
@@ -528,18 +643,22 @@ impl Controller {
     }
 
     /// Brings up what a clicked notification is about.
-    pub fn open(&self, opens: Opens) {
+    pub fn open(self: &Rc<Self>, opens: Opens) {
         self.reveal();
         if !self.accounts.borrow().iter().any(|m| m.account.id == opens.account) {
             return;
         }
         self.app.set_adding(false);
+        self.finish_writing();
+        self.close_search();
         if self.shown.get() != Some(opens.account) {
             self.show(opens.account);
         }
         let inbox = self.labels.borrow().iter().position(|l| l.role == Role::Inbox).unwrap_or_default();
         self.select_label(inbox);
-        let row = opens.message.zip(self.current_label()).and_then(|(id, label)| self.reader.position(label, id).ok().flatten());
+        // The list is of threads, so the message is found by the thread it is in.
+        let thread = opens.message.and_then(|id| self.reader.rows(&[id]).ok()?.first().map(|m| m.thread_id));
+        let row = thread.zip(self.current_label()).and_then(|(thread, label)| self.reader.position(label, thread).ok().flatten());
         if let Some(row) = row {
             self.select_row(row);
             self.app.invoke_reveal(row as i32);
@@ -652,13 +771,22 @@ impl Controller {
             return;
         }
         self.list.refresh();
-        let row = self.selected.get().and_then(|id| {
-            let label = self.current_label()?;
-            self.reader.position(label, id).ok().flatten()
-        });
+        let row = self.open_thread.get().and_then(|thread| self.list_position(thread));
         self.app.set_selected_row(row.map_or(-1, |r| r as i32));
+        if self.writing.borrow().is_none() {
+            self.reload_thread();
+        }
     }
 
+    /// Where a thread is in the list on screen.
+    fn list_position(&self, thread: i64) -> Option<usize> {
+        if self.app.get_searching() {
+            return self.list.result_position(thread);
+        }
+        self.reader.position(self.current_label()?, thread).ok().flatten()
+    }
+
+    /// The label on screen, if a list of one is what is showing.
     fn current_label(&self) -> Option<i64> {
         self.labels.borrow().get(self.app.get_active_label() as usize).map(|l| l.id)
     }
@@ -680,6 +808,7 @@ impl Controller {
                 kind: label_kind(l.role),
             })
             .collect();
+        self.app.set_can_label(labels.iter().any(|l| l.role == Role::All));
         let first_custom = labels.iter().position(|l| l.role == Role::None).unwrap_or(labels.len());
         self.app.set_first_custom_label(first_custom as i32);
         if let Some(index) = labels.iter().position(|l| Some(l.id) == current) {
@@ -700,19 +829,101 @@ impl Controller {
     }
 
     fn clear_message(&self) {
+        self.read_timer.stop();
         self.selected.set(None);
+        self.opening_draft.set(None);
+        self.open_thread.set(None);
+        self.thread.borrow_mut().clear();
+        self.thread_items.set_vec(Vec::new());
         self.selected_sender.borrow_mut().clear();
         self.app.set_selected_row(-1);
         self.app.set_image_bar(ImageBar::Hidden);
         self.app.set_pane(Pane::Empty);
+        self.app.set_picking(false);
         self.pane.hide();
     }
 
-    pub fn select_row(&self, row: usize) {
-        let Some(message) = self.list.message(row) else { return };
+    fn current_role(&self) -> Role {
+        if self.app.get_searching() {
+            return Role::None;
+        }
+        self.labels.borrow().get(self.app.get_active_label() as usize).map_or(Role::None, |l| l.role)
+    }
+
+    /// Opens what a row of the list stands for: a thread, or in Drafts and the Outbox, the
+    /// composer. Mail in the Outbox stops waiting and can be changed again.
+    pub fn select_row(self: &Rc<Self>, row: usize) {
+        let Some(head) = self.list.message(row) else { return };
+        self.finish_writing();
+        self.app.set_selected_row(row as i32);
+        self.opening_draft.set(None);
+        match self.current_role() {
+            Role::Drafts | Role::Outbox => self.open_draft(head.id),
+            _ if self.reader.draft(head.id).ok().flatten().is_some() => self.open_draft(head.id),
+            _ => self.open_thread(&head),
+        }
+    }
+
+    fn thread_rows(&self, head: &MessageRow) -> Vec<MessageRow> {
+        let binned = matches!(self.current_role(), Role::Trash | Role::Spam);
+        let rows = self.shown.get().and_then(|account| self.reader.thread(account, head.thread_id, binned).ok());
+        rows.filter(|rows| !rows.is_empty()).unwrap_or_else(|| vec![head.clone()])
+    }
+
+    /// Opens a thread at the first message still to read, or else at its newest.
+    fn open_thread(self: &Rc<Self>, head: &MessageRow) {
+        let thread = self.thread_rows(head);
+        let index = thread.iter().position(|m| !m.seen).unwrap_or(thread.len() - 1);
+        self.open_thread.set(Some(head.thread_id));
+        *self.thread.borrow_mut() = thread;
+        self.publish_thread();
+        self.open_at(index);
+        let weak = Rc::downgrade(self);
+        self.read_timer.start(TimerMode::SingleShot, actions::READ_DELAY, move || {
+            if let Some(this) = weak.upgrade() {
+                this.mark_read();
+            }
+        });
+    }
+
+    /// Picks up changes to the open thread without disturbing the message on show.
+    fn reload_thread(&self) {
+        let Some(head) = self.thread.borrow().first().cloned() else { return };
+        let thread = self.thread_rows(&head);
+        let open = self.selected.get().and_then(|id| thread.iter().position(|m| m.id == id));
+        *self.thread.borrow_mut() = thread;
+        self.publish_thread();
+        self.app.set_thread_open(open.map_or(-1, |i| i as i32));
+    }
+
+    fn publish_thread(&self) {
+        let thread = self.thread.borrow();
+        let items: Vec<ThreadItem> = thread
+            .iter()
+            .map(|m| ThreadItem {
+                sender: display_name(m).into(),
+                date: list::short_date(m.date, chrono::Local::now()).into(),
+                initials: initials(display_name(m)).into(),
+                tone: tone(&m.from_addr),
+                logo: self.list.logo(&m.from_addr, THREAD_AVATAR),
+                unread: !m.seen,
+            })
+            .collect();
+        update_rows(&self.thread_items, items);
+        self.app.set_starred(thread.iter().any(|m| m.flagged));
+        let role = self.current_role();
+        self.app.set_in_trash(role == Role::Trash);
+        self.app.set_in_spam(role == Role::Spam);
+        drop(thread);
+        self.app.set_in_inbox(self.thread_in_inbox());
+    }
+
+    /// Shows one message of the open thread.
+    fn open_at(&self, index: usize) {
+        let Some(message) = self.thread.borrow().get(index).cloned() else { return };
+        self.app.set_thread_open(index as i32);
         self.selected.set(Some(message.id));
         self.selected_sender.replace(message.from_addr.clone());
-        self.app.set_selected_row(row as i32);
         self.app.set_image_bar(ImageBar::Hidden);
         // The old message goes in the same frame as the click, whatever the new one takes.
         self.pane.hide();
@@ -726,15 +937,34 @@ impl Controller {
         }
         match self.reader.has_body(message.id) {
             Ok(true) => self.show_body(message.id),
-            _ => {
-                self.app.set_pane(Pane::Loading);
-                let asked = self.shown.get().zip(self.engine.borrow().as_ref()).map(|(account, engine)| {
-                    engine.fetch_body(account, message.id)
-                });
-                if asked == Some(false) {
-                    self.app.set_pane(Pane::Failed);
-                }
-            }
+            _ => self.fetch_selected_body(message.id),
+        }
+    }
+
+    /// Puts a message back in the reader after something covered it.
+    fn reopen(&self, id: i64) {
+        let index = self.thread.borrow().iter().position(|m| m.id == id);
+        if let Some(index) = index {
+            self.open_at(index);
+        }
+    }
+
+    fn fetch_selected_body(&self, id: i64) {
+        self.app.set_pane(Pane::Loading);
+        let asked = self.shown.get().zip(self.engine.borrow().as_ref()).map(|(account, engine)| {
+            engine.fetch_body(account, id)
+        });
+        if asked == Some(false) {
+            self.app.set_pane(Pane::Failed);
+        }
+    }
+
+    /// A body that was asked for has arrived.
+    fn body_ready(self: &Rc<Self>, id: i64) {
+        if self.opening_draft.take() == Some(id) {
+            self.open_draft(id);
+        } else {
+            self.show_body(id);
         }
     }
 
@@ -825,7 +1055,13 @@ impl Controller {
         self.app.set_image_bar(bar);
         let mut view = self.app.get_message();
         view.recipients = rendered.recipients.into();
-        view.attachments = rendered.attachments.join(", ").into();
+        let raw = self.selected.get().and_then(|id| self.reader.body(id).ok().flatten());
+        let files: Vec<FileItem> = raw
+            .map_or_else(Vec::new, |raw| compose::attachments(&raw))
+            .into_iter()
+            .map(|file| FileItem { size: writing::human_size(file.data.len()).into(), name: file.name.into() })
+            .collect();
+        view.attachments = ModelRc::new(VecModel::from(files));
         match rendered.body {
             Body::Text(text) => {
                 self.pane.hide();
@@ -850,7 +1086,8 @@ fn label_kind(role: Role) -> LabelKind {
         Role::Starred => LabelKind::Starred,
         Role::Sent => LabelKind::Sent,
         Role::Drafts => LabelKind::Drafts,
-        Role::All => LabelKind::All,
+        Role::Outbox => LabelKind::Outbox,
+        Role::All | Role::Archive => LabelKind::All,
         Role::Spam => LabelKind::Spam,
         Role::Trash => LabelKind::Trash,
         Role::None => LabelKind::Custom,
@@ -868,7 +1105,7 @@ fn header(m: &MessageRow) -> MessageView {
         tone: tone(&m.from_addr),
         logo: Image::default(),
         recipients: "".into(),
-        attachments: "".into(),
+        attachments: ModelRc::default(),
         text: "".into(),
     }
 }

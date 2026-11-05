@@ -13,6 +13,7 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = "0.3"
 image = { version = "0.25", default-features = false, features = ["gif", "ico", "jpeg", "png", "webp"] }
 keyring-core = "1"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"] }
 # mail-parser 1.0 is a recent rewrite, so stay on an exact version until it has been diffed on a real mailbox.
 mail-parser = "=1.0.1"
 psl = "2"

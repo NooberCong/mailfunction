@@ -1,4 +1,5 @@
-//! One pass of the sync loop for one folder (RFC 4549 order, CONDSTORE deltas).
+//! One pass of the sync loop for one folder (RFC 4549 order, CONDSTORE deltas). Local actions go
+//! first, so that what comes back already includes them.
 //!
 //! - New mail: everything from `next_uid` upward.
 //! - Flag and label changes: CHANGEDSINCE the stored modseq.
@@ -14,7 +15,9 @@ use std::collections::HashSet;
 use mail_parser::MessageParser;
 use sha2::{Digest, Sha256};
 
+use crate::engine::Event;
 use crate::imap::{Fetched, Imap, RemoteFolder};
+use crate::ops::replay;
 use crate::store::{Change, Folder, LabelSpec, NewMessage, Role, Store};
 use crate::{Error, Result};
 
@@ -69,7 +72,12 @@ fn new_message(fetched: Fetched) -> NewMessage {
     let sender = parsed.and_then(|m| m.from()).and_then(|list| list.first());
     let from_name = sender.as_ref().and_then(|s| s.name()).unwrap_or_default().to_string();
     let from_addr = sender.as_ref().and_then(|s| s.address()).unwrap_or_default().to_string();
-    let remote_id = match (fetched.gm_message_id, parsed.and_then(|m| m.message_id())) {
+    let mid = parsed.and_then(|m| m.message_id()).map(str::to_string);
+    let references = parsed.map_or_else(Vec::new, |m| {
+        let replied_to = m.in_reply_to().into_iter().flat_map(|l| l.iter().collect::<Vec<_>>());
+        m.references().into_iter().flat_map(|l| l.iter().collect::<Vec<_>>()).chain(replied_to).map(String::from).collect()
+    });
+    let remote_id = match (fetched.gm_message_id, mid.as_deref()) {
         (Some(id), _) => format!("gm:{id}"),
         // Two copies with one Message-ID in a folder collapse into one placement here. Gmail
         // cannot hit this; generic IMAP (iCloud, Phase 2) must key copies by UID as well.
@@ -85,6 +93,8 @@ fn new_message(fetched: Fetched) -> NewMessage {
         uid: fetched.uid,
         remote_id,
         gm_thread_id: fetched.gm_thread_id,
+        mid,
+        references,
         subject,
         from_name,
         from_addr,
@@ -185,7 +195,7 @@ pub async fn sync_account(
     imap: &mut Imap,
     store: &Store,
     account_id: i64,
-    mut on_change: impl FnMut(&[i64]),
+    mut on_event: impl FnMut(Event),
 ) -> Result<Vec<Folder>> {
     let remote = folders_to_sync(imap.list().await?, imap.gmail);
     if remote.is_empty() {
@@ -197,19 +207,31 @@ pub async fn sync_account(
         remote.iter().map(|f| store.folder(account_id, &f.path, &label_of(f))).collect::<Result<Vec<_>>>()?;
 
     // History is interleaved one step per folder, so no folder waits behind another's.
+    // Actions are replayed before every round, so a long first sync does not hold them up. The
+    // round that follows goes over every folder, so a moved message is found before the purge.
     let mut more = true;
     while more {
         more = false;
+        if replay(imap, store, account_id, false).await? > 0 {
+            on_event(Event::ActionRefused);
+        }
         for folder in &mut folders {
-            let outcome = sync_folder(imap, store, folder).await?;
+            let mut outcome = sync_folder(imap, store, folder).await?;
             if outcome.changed {
-                on_change(&outcome.arrived);
+                on_event(Event::Changed);
+                if !outcome.arrived.is_empty() {
+                    on_event(Event::Arrived(std::mem::take(&mut outcome.arrived)));
+                }
             }
             more |= outcome.more_history;
         }
     }
     // Only now: a message that left one folder may have turned up in a later one.
     store.purge_orphans(account_id)?;
+    // Last of all, because these have been failing, and new mail must not wait on them.
+    if replay(imap, store, account_id, true).await? > 0 {
+        on_event(Event::ActionRefused);
+    }
     Ok(folders)
 }
 

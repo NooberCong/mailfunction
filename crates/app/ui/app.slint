@@ -68,7 +68,7 @@ export global Theme {
     out property <length> gutter: 36px;
 }
 
-export enum LabelKind { inbox, starred, sent, drafts, all, spam, trash, custom }
+export enum LabelKind { inbox, starred, sent, drafts, outbox, all, spam, trash, custom }
 
 export struct LabelItem {
     name: string,
@@ -85,6 +85,8 @@ export struct RowItem {
     initials: string,
     tone: int,
     logo: image,
+    /// Messages in the thread, if there is more than one.
+    count: string,
 }
 
 export struct AccountItem {
@@ -100,17 +102,42 @@ export enum Pane { empty, loading, text, html, failed }
 
 export enum ImageBar { hidden, blocked, loading, failed, allowed }
 
+/// What the user can ask of the open thread, or of the app, from a button or a key.
+export enum Verb { archive, inbox, trash, spam, star, unread, reply, reply-all, forward, compose, undo }
+
+/// A file on a message: its name, and its size for reading.
+export struct FileItem {
+    name: string,
+    size: string,
+}
+
 export struct MessageView {
     subject: string,
     sender: string,
     address: string,
     date: string,
     recipients: string,
-    attachments: string,
+    attachments: [FileItem],
     text: string,
     initials: string,
     tone: int,
     logo: image,
+}
+
+/// One message of the open thread.
+export struct ThreadItem {
+    sender: string,
+    date: string,
+    initials: string,
+    tone: int,
+    logo: image,
+    unread: bool,
+}
+
+/// A label in the picker, and whether the open thread has it.
+export struct PickItem {
+    name: string,
+    on: bool,
 }
 
 component Icon inherits Path {
@@ -209,6 +236,7 @@ component RailItem inherits Rectangle {
                     : root.item.kind == LabelKind.starred ? "M12 3.5l2.6 5.4 5.9.8-4.3 4.1 1 5.9-5.2-2.8-5.2 2.8 1-5.9-4.3-4.1 5.9-.8z"
                     : root.item.kind == LabelKind.sent ? "M21 3L10.5 13.5M21 3l-6.5 18-4-7.5L3 9.5z"
                     : root.item.kind == LabelKind.drafts ? "M4 20l1-4L16 5a2.1 2.1 0 0 1 3 3L8 19zM14 7l3 3"
+                    : root.item.kind == LabelKind.outbox ? "M12 15V4M7.5 8.5L12 4l4.5 4.5M4 14v5a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5"
                     : root.item.kind == LabelKind.all ? "M3 5h18v4H3zM5 9v10h14V9M10 13h4"
                     : root.item.kind == LabelKind.spam ? "M8 3h8l5 5v8l-5 5H8l-5-5V8zM12 8v5M12 16.5v.01"
                     : root.item.kind == LabelKind.trash ? "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v5M14 11v5"
@@ -406,6 +434,42 @@ component AddAccount inherits Rectangle {
     touch := Press { }
 }
 
+component ComposeButton inherits Rectangle {
+    in property <bool> compact;
+    callback clicked <=> touch.clicked;
+
+    height: 38px;
+    border-radius: 10px;
+    background: touch.has-hover ? Theme.frame-chip : Theme.frame-hover;
+    animate background { duration: Theme.fast; }
+
+    HorizontalLayout {
+        padding-left: root.compact ? 0 : 12px;
+        spacing: 11px;
+        alignment: root.compact ? center : stretch;
+
+        Rectangle {
+            width: 18px;
+            horizontal-stretch: 0;
+            Icon {
+                y: (parent.height - self.height) / 2;
+                tint: Theme.on-frame;
+                commands: "M4 20l1-4L16 5a2.1 2.1 0 0 1 3 3L8 19zM14 7l3 3";
+            }
+        }
+        if !root.compact: Text {
+            text: "Compose";
+            color: Theme.on-frame;
+            font-size: Theme.body;
+            font-weight: 600;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+    }
+
+    touch := Press { }
+}
+
 component Rail inherits Rectangle {
     in property <[LabelItem]> labels;
     in property <int> active-label;
@@ -417,6 +481,7 @@ component Rail inherits Rectangle {
     callback select-account(int);
     callback remove-account(int);
     callback add-account();
+    callback compose();
 
     private property <length> account-step: 46px;
 
@@ -430,6 +495,16 @@ component Rail inherits Rectangle {
     VerticalLayout {
         padding-top: 8px;
         padding-bottom: 8px;
+
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            padding-bottom: 10px;
+            ComposeButton {
+                compact: root.compact;
+                clicked => { root.compose(); }
+            }
+        }
 
         Flickable {
             vertical-stretch: 1;
@@ -534,6 +609,13 @@ component MessageRow inherits Rectangle {
                     font-size: Theme.body;
                     font-weight: root.item.unread ? 600 : 500;
                     overflow: elide;
+                    horizontal-stretch: root.item.count == "" ? 1 : 0;
+                }
+                if root.item.count != "": Text {
+                    text: root.item.count;
+                    color: Theme.muted;
+                    font-size: Theme.small;
+                    vertical-alignment: center;
                     horizontal-stretch: 1;
                 }
                 Text {
@@ -897,6 +979,806 @@ component SyncButton inherits Rectangle {
     }
 }
 
+/// One action of the reader. `hint` is what the toolbar says while the pointer is on it.
+component Tool inherits Rectangle {
+    in property <string> icon;
+    in property <string> hint;
+    in property <bool> filled;
+    out property <bool> hovered: touch.has-hover;
+    callback clicked <=> touch.clicked;
+
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    background: touch.has-hover ? Theme.hover : transparent;
+    animate background { duration: Theme.fast; }
+
+    Icon {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 17px;
+        height: 17px;
+        tint: root.filled ? Theme.accent : touch.has-hover ? Theme.text : Theme.muted;
+        fill: root.filled ? Theme.accent : transparent;
+        commands: root.icon;
+    }
+
+    touch := Press { }
+}
+
+/// What can be done with the open thread. In Trash and Spam, leaving is the only way to go.
+component Toolbar inherits Rectangle {
+    in property <bool> starred;
+    in property <bool> in-inbox;
+    in property <bool> in-trash;
+    in property <bool> in-spam;
+    in property <bool> can-label;
+    callback verb(Verb);
+    callback pick-label();
+
+    private property <string> inbox-icon: "M3 13h5l2 3h4l2-3h5M5.8 5h12.4L21 13v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5z";
+    private property <string> hint: reply.hovered ? reply.hint
+        : reply-all.hovered ? reply-all.hint
+        : forward.hovered ? forward.hint
+        : star.hovered ? star.hint
+        : unread.hovered ? unread.hint
+        : spam.hovered ? spam.hint
+        : trash.hovered ? trash.hint
+        : "";
+
+    height: 50px;
+
+    HorizontalLayout {
+        padding-left: Theme.gutter - 8px;
+        padding-right: Theme.gutter - 8px;
+        padding-top: 12px;
+        spacing: 2px;
+        alignment: stretch;
+
+        reply := Tool {
+            hint: "Reply  r";
+            icon: "M9 7l-5 5 5 5M4 12h11a5 5 0 0 1 5 5v2";
+            clicked => { root.verb(Verb.reply); }
+        }
+        reply-all := Tool {
+            hint: "Reply all  a";
+            icon: "M12 7l-5 5 5 5M7 7l-5 5 5 5M7 12h9a5 5 0 0 1 5 5v2";
+            clicked => { root.verb(Verb.reply-all); }
+        }
+        forward := Tool {
+            hint: "Forward  f";
+            icon: "M15 7l5 5-5 5M20 12H9a5 5 0 0 0-5 5v2";
+            clicked => { root.verb(Verb.forward); }
+        }
+
+        Text {
+            text: root.hint;
+            color: Theme.muted;
+            font-size: Theme.small;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            horizontal-stretch: 1;
+        }
+        Rectangle { width: 10px; }
+
+        star := Tool {
+            hint: root.starred ? "Remove star  s" : "Star  s";
+            filled: root.starred;
+            icon: "M12 3.5l2.6 5.4 5.9.8-4.3 4.1 1 5.9-5.2-2.8-5.2 2.8 1-5.9-4.3-4.1 5.9-.8z";
+            clicked => { root.verb(Verb.star); }
+        }
+        unread := Tool {
+            hint: "Mark unread  u";
+            icon: "M3 6h18v13H3zM3 7l9 6.5L21 7";
+            clicked => { root.verb(Verb.unread); }
+        }
+        if root.can-label: Tool {
+            icon: "M3.5 12V4.5a1 1 0 0 1 1-1H12l8.5 8.5a1.5 1.5 0 0 1 0 2.1l-6.4 6.4a1.5 1.5 0 0 1-2.1 0zM8 8v.01";
+            clicked => { root.pick-label(); }
+        }
+        if !root.in-trash && !root.in-spam && root.in-inbox: Tool {
+            icon: "M3 5h18v4H3zM5 9v10h14V9M10 13h4";
+            clicked => { root.verb(Verb.archive); }
+        }
+        if !root.in-trash && !root.in-spam && !root.in-inbox: Tool {
+            icon: root.inbox-icon;
+            clicked => { root.verb(Verb.inbox); }
+        }
+        spam := Tool {
+            hint: root.in-spam ? "Not spam  !" : "Report spam  !";
+            icon: root.in-spam ? root.inbox-icon : "M8 3h8l5 5v8l-5 5H8l-5-5V8zM12 8v5M12 16.5v.01";
+            clicked => { root.verb(root.in-spam ? Verb.inbox : Verb.spam); }
+        }
+        trash := Tool {
+            hint: root.in-trash ? "Restore  #" : "Delete  #";
+            icon: root.in-trash ? root.inbox-icon : "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v5M14 11v5";
+            clicked => { root.verb(root.in-trash ? Verb.inbox : Verb.trash); }
+        }
+    }
+}
+
+/// The messages of a thread, one line each. The reader shows one at a time, because a webview
+/// cannot scroll inside a native list, and this is how to get to the others.
+component ThreadStrip inherits Rectangle {
+    in property <[ThreadItem]> items;
+    in property <int> active;
+    callback open(int);
+
+    private property <length> step: 36px;
+
+    height: Math.min(root.items.length, 4) * root.step + 8px;
+
+    Flickable {
+        y: 4px;
+        height: parent.height - 8px;
+        content-height: root.items.length * root.step;
+        interactive: root.items.length > 4;
+
+        for item[index] in root.items: Rectangle {
+            x: Theme.gutter - 10px;
+            y: index * root.step;
+            width: parent.width - 2 * Theme.gutter + 20px;
+            height: root.step - 2px;
+            border-radius: 8px;
+            background: index == root.active ? Theme.selected : touch.has-hover ? Theme.hover : transparent;
+            animate background { duration: Theme.fast; }
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                spacing: 10px;
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 0;
+                    Avatar {
+                        size: 22px;
+                        initials: item.initials;
+                        tone: item.tone;
+                        logo: item.logo;
+                    }
+                }
+                Text {
+                    text: item.sender;
+                    color: Theme.text;
+                    font-size: Theme.small;
+                    font-weight: item.unread ? 600 : 500;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                Text {
+                    text: item.date;
+                    color: item.unread ? Theme.accent : Theme.muted;
+                    font-size: Theme.small;
+                    vertical-alignment: center;
+                    horizontal-stretch: 0;
+                }
+            }
+
+            touch := Press {
+                clicked => { root.open(index); }
+            }
+        }
+    }
+}
+
+/// A file, to save from a message or to take off a draft.
+component FileChip inherits Rectangle {
+    in property <FileItem> file;
+    in property <bool> removable;
+    callback clicked();
+    callback remove();
+
+    height: 30px;
+    width: Math.min(layout.preferred-width, 230px);
+    border-radius: 8px;
+    background: touch.has-hover ? Theme.faint : Theme.hover;
+    animate background { duration: Theme.fast; }
+
+    touch := Press {
+        enabled: !root.removable;
+        clicked => { root.clicked(); }
+    }
+
+    layout := HorizontalLayout {
+        padding-left: 9px;
+        padding-right: root.removable ? 4px : 11px;
+        spacing: 7px;
+        Rectangle {
+            width: 14px;
+            horizontal-stretch: 0;
+            Icon {
+                y: (parent.height - self.height) / 2;
+                width: 14px;
+                height: 14px;
+                tint: Theme.muted;
+                stroke-width: 1.3px;
+                commands: "M16.5 7.5v9a4.5 4.5 0 0 1-9 0V6a3 3 0 0 1 6 0v9.5a1.5 1.5 0 0 1-3 0V8";
+            }
+        }
+        Text {
+            text: root.file.name;
+            color: Theme.text;
+            font-size: Theme.small;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: root.file.size;
+            color: Theme.muted;
+            font-size: Theme.small;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+        }
+        if root.removable: Rectangle {
+            width: 22px;
+            horizontal-stretch: 0;
+            Rectangle {
+                y: (parent.height - self.height) / 2;
+                height: 22px;
+                border-radius: 6px;
+                background: drop.has-hover ? Theme.line : transparent;
+                Icon {
+                    width: 12px;
+                    height: 12px;
+                    tint: Theme.muted;
+                    commands: "M6 6l12 12M18 6L6 18";
+                }
+                drop := Press {
+                    clicked => { root.remove(); }
+                }
+            }
+        }
+    }
+}
+
+/// A row of files that scrolls sideways rather than pushing the message down.
+component FileRow inherits Flickable {
+    in property <[FileItem]> files;
+    in property <bool> removable;
+    callback open(int);
+    callback remove(int);
+
+    height: 30px;
+    content-width: row.preferred-width;
+    interactive: false;
+
+    row := HorizontalLayout {
+        alignment: start;
+        spacing: 6px;
+        for file[index] in root.files: FileChip {
+            file: file;
+            removable: root.removable;
+            clicked => { root.open(index); }
+            remove => { root.remove(index); }
+        }
+    }
+}
+
+/// A one-line field of the composer, with its name in front.
+component Field inherits Rectangle {
+    in property <string> label;
+    in-out property <string> text <=> input.text;
+    callback edited();
+    /// A key the field has no use for, offered to whoever it may mean something to.
+    callback tab-pressed() -> bool;
+    public function focus-input() { input.focus(); }
+    public function caret-to-end() {
+        input.focus();
+        input.set-selection-offsets(self.text.character-count * 4, self.text.character-count * 4);
+    }
+
+    height: 42px;
+
+    HorizontalLayout {
+        padding-left: Theme.gutter;
+        padding-right: Theme.gutter;
+        spacing: 10px;
+        Text {
+            text: root.label;
+            width: 54px;
+            color: Theme.muted;
+            font-size: Theme.body;
+            vertical-alignment: center;
+        }
+        input := TextInput {
+            // Left to itself its minimum is its text, and a long address would push everything
+            // else out of the window.
+            min-width: 0;
+            horizontal-stretch: 1;
+            color: Theme.text;
+            font-size: Theme.body;
+            vertical-alignment: center;
+            selection-background-color: Theme.selected;
+            selection-foreground-color: Theme.text;
+            single-line: true;
+            edited => { root.edited(); }
+            key-pressed(event) => {
+                if (event.text == Key.Tab && !event.modifiers.shift && root.tab-pressed()) {
+                    return accept;
+                }
+                reject
+            }
+        }
+        @children
+    }
+
+    Rectangle {
+        x: Theme.gutter;
+        y: parent.height - 1px;
+        width: parent.width - 2 * Theme.gutter;
+        height: 1px;
+        background: input.has-focus ? Theme.accent : Theme.line;
+        animate background { duration: Theme.fast; }
+    }
+}
+
+component TextAction inherits Rectangle {
+    in property <string> text;
+    callback clicked <=> touch.clicked;
+
+    width: label.preferred-width + 12px;
+    border-radius: 6px;
+    background: touch.has-hover ? Theme.hover : transparent;
+
+    label := Text {
+        text: root.text;
+        color: Theme.muted;
+        font-size: Theme.small;
+    }
+    touch := Press { }
+}
+
+/// Writes a message. Plain text, which opens at once and needs no webview.
+component Composer inherits Rectangle {
+    in-out property <string> to;
+    in-out property <string> cc;
+    in-out property <string> bcc;
+    in-out property <string> subject;
+    in-out property <string> body;
+    in property <bool> copies;
+    in property <string> error;
+    in property <[FileItem]> files;
+    in property <[string]> suggestions;
+    /// Which field the suggestions are for: 0 To, 1 Cc, 2 Bcc, or -1 for none.
+    in property <int> suggesting: -1;
+    callback edited();
+    callback address-edited(int, string);
+    callback accept-suggestion(int);
+    callback show-copies();
+    callback send();
+    callback attach();
+    callback remove-file(int);
+    callback discard();
+    callback close();
+
+    public function focus-recipients() { to-field.focus-input(); }
+    public function end-of-address(field: int) {
+        if (field == 0) {
+            to-field.caret-to-end();
+        } else if (field == 1) {
+            cc-field.caret-to-end();
+        } else {
+            bcc-field.caret-to-end();
+        }
+    }
+    public function focus-body() {
+        text.focus();
+        text.set-selection-offsets(0, 0);
+    }
+
+    function offer-suggestion() -> bool {
+        if (root.suggestions.length == 0) {
+            return false;
+        }
+        root.accept-suggestion(0);
+        true
+    }
+
+    background: Theme.sheet;
+
+    // Nothing behind this should answer the pointer.
+    TouchArea { }
+
+    VerticalLayout {
+        Rectangle { height: 10px; }
+
+        to-field := Field {
+            label: "To";
+            text <=> root.to;
+            edited => { root.address-edited(0, self.text); }
+            tab-pressed => { root.offer-suggestion() }
+            if !root.copies: TextAction {
+                horizontal-stretch: 0;
+                text: "Cc Bcc";
+                clicked => { root.show-copies(); }
+            }
+        }
+        cc-field := Field {
+            visible: root.copies;
+            height: root.copies ? 42px : 0;
+            label: "Cc";
+            text <=> root.cc;
+            edited => { root.address-edited(1, self.text); }
+            tab-pressed => { root.offer-suggestion() }
+        }
+        bcc-field := Field {
+            visible: root.copies;
+            height: root.copies ? 42px : 0;
+            label: "Bcc";
+            text <=> root.bcc;
+            edited => { root.address-edited(2, self.text); }
+            tab-pressed => { root.offer-suggestion() }
+        }
+        Field {
+            label: "Subject";
+            text <=> root.subject;
+            edited => { root.edited(); }
+            tab-pressed => { false }
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            clip: true;
+
+            scroller := Flickable {
+                x: Theme.gutter;
+                y: 14px;
+                width: parent.width - 2 * Theme.gutter;
+                height: parent.height - 14px;
+                content-height: Math.max(text.preferred-height + 24px, self.height);
+
+                text := TextInput {
+                    width: parent.width;
+                    height: Math.max(self.preferred-height, scroller.height);
+                    text <=> root.body;
+                    single-line: false;
+                    wrap: word-wrap;
+                    color: Theme.text;
+                    selection-background-color: Theme.selected;
+                    selection-foreground-color: Theme.text;
+                    font-size: Theme.reading;
+                    edited => { root.edited(); }
+                    // Keeps the caret in view as the text grows past the pane.
+                    cursor-position-changed(position) => {
+                        if (position.y + scroller.content-y < 0) {
+                            scroller.content-y = -position.y;
+                        } else if (position.y + 24px + scroller.content-y > scroller.height) {
+                            scroller.content-y = scroller.height - position.y - 24px;
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.files.length > 0: HorizontalLayout {
+            padding-left: Theme.gutter;
+            padding-right: Theme.gutter;
+            padding-top: 8px;
+            FileRow {
+                files: root.files;
+                removable: true;
+                remove(index) => { root.remove-file(index); }
+            }
+        }
+
+        HorizontalLayout {
+            padding-left: Theme.gutter;
+            padding-right: Theme.gutter - 8px;
+            padding-top: 12px;
+            padding-bottom: 14px;
+            spacing: 8px;
+
+            Rectangle {
+                width: 92px;
+                height: 34px;
+                horizontal-stretch: 0;
+                border-radius: 9px;
+                background: Theme.accent;
+                opacity: send.has-hover ? 0.88 : 1;
+                animate opacity { duration: Theme.fast; }
+                Text {
+                    text: "Send";
+                    color: Theme.sheet;
+                    font-size: Theme.body;
+                    font-weight: 600;
+                }
+                send := Press {
+                    clicked => { root.send(); }
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 0;
+                Tool {
+                    icon: "M16.5 7.5v9a4.5 4.5 0 0 1-9 0V6a3 3 0 0 1 6 0v9.5a1.5 1.5 0 0 1-3 0V8";
+                    clicked => { root.attach(); }
+                }
+            }
+            Text {
+                text: root.error;
+                color: Theme.accent;
+                font-size: Theme.small;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 0;
+                Tool {
+                    icon: "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v5M14 11v5";
+                    clicked => { root.discard(); }
+                }
+            }
+        }
+    }
+
+    // Under the field being typed in. Nothing here is covered by the webview, which is out of
+    // the way while composing, so an ordinary overlay will do.
+    if root.suggesting >= 0 && root.suggestions.length > 0: Rectangle {
+        x: Theme.gutter + 64px;
+        y: 10px + (root.suggesting + 1) * 42px;
+        width: Math.min(parent.width - 2 * Theme.gutter - 64px, 380px);
+        height: root.suggestions.length * 34px + 8px;
+        border-radius: 10px;
+        background: Theme.sheet;
+        border-width: 1px;
+        border-color: Theme.faint;
+
+        for suggestion[index] in root.suggestions: Rectangle {
+            x: 4px;
+            y: 4px + index * 34px;
+            width: parent.width - 8px;
+            height: 34px;
+            border-radius: 7px;
+            background: pick.has-hover || index == 0 ? Theme.hover : transparent;
+            Text {
+                x: 10px;
+                width: parent.width - 20px;
+                text: suggestion;
+                color: Theme.text;
+                font-size: Theme.small;
+                overflow: elide;
+                vertical-alignment: center;
+                height: parent.height;
+            }
+            pick := Press {
+                clicked => { root.accept-suggestion(index); }
+            }
+        }
+    }
+}
+
+/// The field that takes over from the list's title while searching.
+component SearchField inherits Rectangle {
+    in-out property <string> text <=> input.text;
+    callback edited();
+    callback close();
+    public function focus-input() { input.focus(); }
+
+    height: 36px;
+    border-radius: 10px;
+    background: Theme.hover;
+
+    HorizontalLayout {
+        padding-left: 11px;
+        padding-right: 4px;
+        spacing: 8px;
+        Rectangle {
+            width: 16px;
+            horizontal-stretch: 0;
+            Icon {
+                y: (parent.height - self.height) / 2;
+                width: 16px;
+                height: 16px;
+                tint: Theme.muted;
+                commands: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM16.5 16.5L21 21";
+            }
+        }
+        input := TextInput {
+            min-width: 0;
+            horizontal-stretch: 1;
+            color: Theme.text;
+            font-size: Theme.body;
+            vertical-alignment: center;
+            selection-background-color: Theme.selected;
+            selection-foreground-color: Theme.text;
+            single-line: true;
+            edited => { root.edited(); }
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            Tool {
+                icon: "M6 6l12 12M18 6L6 18";
+                width: 28px;
+                height: 28px;
+                clicked => { root.close(); }
+            }
+        }
+    }
+}
+
+/// A small panel over the list, which is the one place the webview never covers.
+component Panel inherits Rectangle {
+    in property <string> title;
+    callback close();
+
+    background: Theme.sheet;
+
+    // Nothing behind this should answer the pointer.
+    TouchArea {
+        clicked => { root.close(); }
+    }
+
+    VerticalLayout {
+        padding-left: 20px;
+        padding-right: 20px;
+        padding-bottom: 12px;
+        Rectangle {
+            height: 46px;
+            Text {
+                x: 0;
+                text: root.title;
+                color: Theme.text;
+                font-size: Theme.body;
+                font-weight: 600;
+            }
+        }
+        @children
+    }
+}
+
+/// Adds and removes labels on the open thread.
+component LabelPicker inherits Panel {
+    in property <[PickItem]> items;
+    in-out property <int> cursor;
+    callback toggle(int);
+
+    title: "Label";
+
+    Flickable {
+        content-height: root.items.length * 36px;
+
+        for item[index] in root.items: Rectangle {
+            y: index * 36px;
+            height: 34px;
+            border-radius: 8px;
+            background: index == root.cursor || touch.has-hover ? Theme.hover : transparent;
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                spacing: 10px;
+                Text {
+                    text: item.name;
+                    color: Theme.text;
+                    font-size: Theme.body;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                if item.on: Rectangle {
+                    width: 16px;
+                    horizontal-stretch: 0;
+                    Icon {
+                        y: (parent.height - self.height) / 2;
+                        width: 16px;
+                        height: 16px;
+                        tint: Theme.accent;
+                        commands: "M5 12.5l4.5 4.5L19 7.5";
+                    }
+                }
+            }
+            touch := Press {
+                clicked => { root.toggle(index); }
+            }
+        }
+    }
+}
+
+/// Every key, for `?`.
+component KeysHelp inherits Panel {
+    title: "Keyboard";
+
+    Flickable {
+        content-height: 25 * 25px;
+
+        for entry[index] in [
+            { key: "j  k", what: "Next, previous thread" },
+            { key: "n  p", what: "Next, previous message" },
+            { key: "c", what: "Compose" },
+            { key: "r", what: "Reply" },
+            { key: "a", what: "Reply all" },
+            { key: "f", what: "Forward" },
+            { key: "e", what: "Archive" },
+            { key: "#", what: "Delete" },
+            { key: "!", what: "Report spam" },
+            { key: "s", what: "Star" },
+            { key: "u", what: "Mark read or unread" },
+            { key: "l", what: "Label" },
+            { key: "z", what: "Undo" },
+            { key: "/", what: "Search" },
+            { key: "g i", what: "Go to Inbox" },
+            { key: "g s", what: "Go to Starred" },
+            { key: "g t", what: "Go to Sent" },
+            { key: "g d", what: "Go to Drafts" },
+            { key: "g a", what: "Go to All Mail" },
+            { key: "Ctrl 1-9", what: "Switch account" },
+            { key: "Ctrl Enter", what: "Send" },
+            { key: "Esc", what: "Close or go back" },
+            { key: "?", what: "This list" },
+        ]: Rectangle {
+            y: index * 25px;
+            height: 25px;
+            Text {
+                x: 0;
+                width: 88px;
+                height: parent.height;
+                text: entry.key;
+                color: Theme.text;
+                font-size: Theme.small;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            Text {
+                x: 88px;
+                width: parent.width - 88px;
+                height: parent.height;
+                text: entry.what;
+                color: Theme.muted;
+                font-size: Theme.small;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+/// Says what just happened, and offers to take it back.
+component Notice inherits Rectangle {
+    in property <string> text;
+    in property <string> action;
+    callback clicked();
+
+    height: 40px;
+    border-radius: 10px;
+    background: Theme.dark ? #3a2e30 : #2b1c1f;
+
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 6px;
+        spacing: 8px;
+        Text {
+            text: root.text;
+            color: #ffffff;
+            font-size: Theme.small;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        if root.action != "": VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            Rectangle {
+                width: action-label.preferred-width + 18px;
+                height: 28px;
+                border-radius: 7px;
+                background: touch.has-hover ? #ffffff1f : transparent;
+                action-label := Text {
+                    text: root.action;
+                    color: #ff9dab;
+                    font-size: Theme.small;
+                    font-weight: 600;
+                }
+                touch := Press {
+                    clicked => { root.clicked(); }
+                }
+            }
+        }
+    }
+}
+
 /// Stands in for the list and the reader while an account has no folders to show them with.
 component NoMail inherits Sheet {
     in property <string> email;
@@ -984,6 +1866,41 @@ export component App inherits Window {
     in property <Pane> pane: Pane.empty;
     in property <ImageBar> image-bar: ImageBar.hidden;
     in property <MessageView> message;
+    /// The open thread's messages, and which is showing. One message needs no list.
+    in property <[ThreadItem]> thread;
+    in property <int> thread-open;
+    in property <bool> starred;
+    in property <bool> in-inbox;
+    in property <bool> in-trash;
+    in property <bool> in-spam;
+    /// Labels are a Gmail idea. Elsewhere a message is in one folder.
+    in property <bool> can-label;
+
+    in property <bool> composing;
+    in-out property <string> draft-to;
+    in-out property <string> draft-cc;
+    in-out property <string> draft-bcc;
+    in-out property <string> draft-subject;
+    in-out property <string> draft-body;
+    in property <bool> draft-copies;
+    in property <string> draft-error;
+    in property <[FileItem]> draft-files;
+    in property <[string]> suggestions;
+    in property <int> suggesting: -1;
+
+    /// The list shows what a search found rather than a label.
+    in-out property <bool> searching;
+    in-out property <string> query;
+    in property <bool> search-busy;
+
+    in property <[PickItem]> picks;
+    in-out property <bool> picking;
+    in-out property <int> pick-cursor;
+    in-out property <bool> showing-keys;
+
+    in property <string> notice;
+    in property <string> notice-action;
+
     /// Bumped to replay the entrance of the list, the message header and the message body.
     in property <int> list-key;
     in property <int> header-key;
@@ -999,6 +1916,8 @@ export component App inherits Window {
     // Set by a handler, not a binding: the rail's width feeds the window's size constraints.
     private property <bool> compact;
     private property <LabelItem> label: root.labels[root.active-label];
+    // `g` was pressed, and the next key says where to go.
+    private property <bool> going;
 
     callback sign-in();
     callback add-account();
@@ -1012,6 +1931,25 @@ export component App inherits Window {
     callback remove-account(int);
     callback select-label(int);
     callback select-row(int);
+    callback verb(Verb);
+    callback open-thread-message(int);
+    callback save-attachment(int);
+    callback pick-labels();
+    callback toggle-label(int);
+    callback go-to(LabelKind);
+    callback leave-message();
+    callback search-edited();
+    callback search-closed();
+    callback draft-edited();
+    callback address-edited(int, string);
+    callback accept-suggestion(int);
+    callback show-copies();
+    callback send-draft();
+    callback attach-files();
+    callback remove-draft-file(int);
+    callback discard-draft();
+    callback close-draft();
+    callback notice-clicked();
     callback slot-changed();
     callback theme-changed();
 
@@ -1029,6 +1967,16 @@ export component App inherits Window {
     }
 
     public function scroll-to-top() { list.content-y = 0; }
+
+    public function focus-list() { keys.focus(); }
+
+    public function focus-recipients() { composer.focus-recipients(); }
+
+    public function focus-draft-body() { composer.focus-body(); }
+
+    public function end-of-address(field: int) { composer.end-of-address(field); }
+
+    public function focus-search() { search.focus-input(); }
 
     function move(by: int) {
         let next = Math.clamp(root.selected-row + by, 0, root.rows.length - 1);
@@ -1058,6 +2006,30 @@ export component App inherits Window {
                     return accept;
                 }
             }
+            if (event.modifiers.control || event.modifiers.alt || root.composing) {
+                return reject;
+            }
+            if (root.picking) {
+                if (event.text == Key.DownArrow || event.text == "j") {
+                    root.pick-cursor = Math.min(root.pick-cursor + 1, root.picks.length - 1);
+                } else if (event.text == Key.UpArrow || event.text == "k") {
+                    root.pick-cursor = Math.max(root.pick-cursor - 1, 0);
+                } else if (event.text == Key.Return || event.text == " ") {
+                    root.toggle-label(root.pick-cursor);
+                } else {
+                    return reject;
+                }
+                return accept;
+            }
+            if (root.going) {
+                root.going = false;
+                if (event.text == "i") { root.go-to(LabelKind.inbox); }
+                else if (event.text == "s") { root.go-to(LabelKind.starred); }
+                else if (event.text == "t") { root.go-to(LabelKind.sent); }
+                else if (event.text == "d") { root.go-to(LabelKind.drafts); }
+                else if (event.text == "a") { root.go-to(LabelKind.all); }
+                return accept;
+            }
             if (event.text == Key.DownArrow || event.text == "j") {
                 root.move(1);
                 return accept;
@@ -1066,7 +2038,59 @@ export component App inherits Window {
                 root.move(-1);
                 return accept;
             }
+            if (event.text == "n" || event.text == "p") {
+                let next = root.thread-open + (event.text == "n" ? 1 : -1);
+                if (next >= 0 && next < root.thread.length) {
+                    root.open-thread-message(next);
+                }
+                return accept;
+            }
+            if (event.text == "e") { root.verb(root.in-trash || root.in-spam ? Verb.inbox : Verb.archive); return accept; }
+            if (event.text == "#" || event.text == Key.Delete) { root.verb(root.in-trash ? Verb.inbox : Verb.trash); return accept; }
+            if (event.text == "!") { root.verb(root.in-spam ? Verb.inbox : Verb.spam); return accept; }
+            if (event.text == "s") { root.verb(Verb.star); return accept; }
+            if (event.text == "u") { root.verb(Verb.unread); return accept; }
+            if (event.text == "c") { root.verb(Verb.compose); return accept; }
+            if (event.text == "r") { root.verb(Verb.reply); return accept; }
+            if (event.text == "a") { root.verb(Verb.reply-all); return accept; }
+            if (event.text == "f") { root.verb(Verb.forward); return accept; }
+            if (event.text == "z") { root.verb(Verb.undo); return accept; }
+            if (event.text == "l") { root.pick-labels(); return accept; }
+            if (event.text == "g") { root.going = true; return accept; }
+            if (event.text == "?") { root.showing-keys = !root.showing-keys; return accept; }
+            if (event.text == "/") {
+                root.searching = true;
+                root.focus-search();
+                return accept;
+            }
             reject
+        }
+
+        // Before any field sees them, because these mean the same wherever the cursor is.
+        capture-key-pressed(event) => {
+            if (!root.signed-in || root.adding) {
+                return reject;
+            }
+            if (event.text == Key.Return && event.modifiers.control && root.composing) {
+                root.send-draft();
+                return accept;
+            }
+            if (event.text != Key.Escape) {
+                return reject;
+            }
+            if (root.composing) {
+                root.close-draft();
+            } else if (root.showing-keys) {
+                root.showing-keys = false;
+            } else if (root.picking) {
+                root.picking = false;
+            } else if (root.searching) {
+                root.search-closed();
+            } else {
+                root.leave-message();
+            }
+            keys.focus();
+            accept
         }
 
         SignIn {
@@ -1108,6 +2132,7 @@ export component App inherits Window {
                     root.add-account();
                     keys.focus();
                 }
+                compose => { root.verb(Verb.compose); }
             }
 
             Sheet {
@@ -1124,7 +2149,7 @@ export component App inherits Window {
                                 padding-right: 20px;
                                 padding-top: 8px;
                                 spacing: 8px;
-                                Text {
+                                if !root.searching: Text {
                                     text: root.label.name;
                                     color: Theme.text;
                                     font-size: Theme.heading;
@@ -1133,7 +2158,7 @@ export component App inherits Window {
                                     overflow: elide;
                                     horizontal-stretch: 1;
                                 }
-                                if root.label.unread != "": Text {
+                                if !root.searching && root.label.unread != "": Text {
                                     text: root.label.unread + " unread";
                                     color: Theme.accent;
                                     font-size: Theme.small;
@@ -1141,8 +2166,22 @@ export component App inherits Window {
                                     vertical-alignment: center;
                                     horizontal-stretch: 0;
                                 }
-                                // The padding lines it up with the letters, which sit low in their box.
-                                if !root.needs-sign-in: VerticalLayout {
+                                // The padding lines these up with the letters, which sit low in their box.
+                                if !root.searching: VerticalLayout {
+                                    alignment: center;
+                                    padding-top: 4px;
+                                    horizontal-stretch: 0;
+                                    Tool {
+                                        width: 28px;
+                                        height: 28px;
+                                        icon: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM16.5 16.5L21 21";
+                                        clicked => {
+                                            root.searching = true;
+                                            root.focus-search();
+                                        }
+                                    }
+                                }
+                                if !root.searching && !root.needs-sign-in: VerticalLayout {
                                     alignment: center;
                                     padding-top: 4px;
                                     horizontal-stretch: 0;
@@ -1156,8 +2195,22 @@ export component App inherits Window {
                                 }
                             }
 
+                            // Always there, so that it can take the focus the moment it shows.
+                            search := SearchField {
+                                x: 14px;
+                                y: 16px;
+                                width: parent.width - 28px;
+                                visible: root.searching;
+                                text <=> root.query;
+                                edited => { root.search-edited(); }
+                                close => {
+                                    root.search-closed();
+                                    keys.focus();
+                                }
+                            }
+
                             // Runs only while syncing, and touches two rows of pixels.
-                            if root.syncing: Rectangle {
+                            if root.syncing || root.search-busy: Rectangle {
                                 y: parent.height - 2px;
                                 height: 2px;
                                 clip: true;
@@ -1243,16 +2296,63 @@ export component App inherits Window {
                             }
 
                             if root.rows.length == 0 && root.label.name != "": Text {
-                                text: root.syncing ? "Getting your mail" : root.label.name + " is empty";
+                                text: root.searching ? (root.query == "" ? "" : root.search-busy ? "Searching" : "Nothing found")
+                                    : root.syncing ? "Getting your mail" : root.label.name + " is empty";
                                 color: Theme.muted;
                                 font-size: Theme.body;
+                            }
+
+                            if root.picking: LabelPicker {
+                                items: root.picks;
+                                cursor <=> root.pick-cursor;
+                                toggle(index) => { root.toggle-label(index); }
+                                close => {
+                                    root.picking = false;
+                                    keys.focus();
+                                }
+                            }
+
+                            if root.showing-keys: KeysHelp {
+                                close => {
+                                    root.showing-keys = false;
+                                    keys.focus();
+                                }
+                            }
+
+                            if root.notice != "": Notice {
+                                x: 12px;
+                                y: parent.height - self.height - 12px;
+                                width: parent.width - 24px;
+                                text: root.notice;
+                                action: root.notice-action;
+                                clicked => {
+                                    root.notice-clicked();
+                                    keys.focus();
+                                }
                             }
                         }
                     }
 
                     Rectangle { width: 1px; background: Theme.line; }
 
+                    Rectangle {
                     VerticalLayout {
+                        if root.pane != Pane.empty: Toolbar {
+                            starred: root.starred;
+                            in-inbox: root.in-inbox;
+                            in-trash: root.in-trash;
+                            in-spam: root.in-spam;
+                            can-label: root.can-label;
+                            verb(what) => {
+                                root.verb(what);
+                                keys.focus();
+                            }
+                            pick-label => {
+                                root.pick-labels();
+                                keys.focus();
+                            }
+                        }
+
                         Reveal {
                             key: root.header-key;
                             vertical-stretch: 0;
@@ -1260,8 +2360,8 @@ export component App inherits Window {
                             if root.pane != Pane.empty: VerticalLayout {
                                 padding-left: Theme.gutter;
                                 padding-right: Theme.gutter;
-                                padding-top: 26px;
-                                padding-bottom: 18px;
+                                padding-top: 12px;
+                                padding-bottom: 16px;
                                 spacing: 14px;
 
                                 Text {
@@ -1326,28 +2426,19 @@ export component App inherits Window {
                                     }
                                 }
 
-                                if root.message.attachments != "": HorizontalLayout {
-                                    spacing: 7px;
-                                    Rectangle {
-                                        width: 15px;
-                                        horizontal-stretch: 0;
-                                        Icon {
-                                            y: (parent.height - self.height) / 2;
-                                            width: 15px;
-                                            height: 15px;
-                                            tint: Theme.muted;
-                                            stroke-width: 1.3px;
-                                            commands: "M16.5 7.5v9a4.5 4.5 0 0 1-9 0V6a3 3 0 0 1 6 0v9.5a1.5 1.5 0 0 1-3 0V8";
-                                        }
-                                    }
-                                    Text {
-                                        text: root.message.attachments;
-                                        color: Theme.muted;
-                                        font-size: Theme.small;
-                                        overflow: elide;
-                                        horizontal-stretch: 1;
-                                    }
+                                if root.message.attachments.length > 0: FileRow {
+                                    files: root.message.attachments;
+                                    open(index) => { root.save-attachment(index); }
                                 }
+                            }
+                        }
+
+                        if root.pane != Pane.empty && root.thread.length > 1: ThreadStrip {
+                            items: root.thread;
+                            active: root.thread-open;
+                            open(index) => {
+                                root.open-thread-message(index);
+                                keys.focus();
                             }
                         }
 
@@ -1425,6 +2516,37 @@ export component App inherits Window {
                                 width: parent.width - 2 * Theme.gutter;
                             }
                         }
+                    }
+
+                    // Stays in place, hidden, so that it can take the focus as it opens.
+                    composer := Composer {
+                        visible: root.composing;
+                        to <=> root.draft-to;
+                        cc <=> root.draft-cc;
+                        bcc <=> root.draft-bcc;
+                        subject <=> root.draft-subject;
+                        body <=> root.draft-body;
+                        copies: root.draft-copies;
+                        error: root.draft-error;
+                        files: root.draft-files;
+                        suggestions: root.suggestions;
+                        suggesting: root.suggesting;
+                        edited => { root.draft-edited(); }
+                        address-edited(field, text) => { root.address-edited(field, text); }
+                        accept-suggestion(index) => { root.accept-suggestion(index); }
+                        show-copies => { root.show-copies(); }
+                        send => { root.send-draft(); }
+                        attach => { root.attach-files(); }
+                        remove-file(index) => { root.remove-draft-file(index); }
+                        discard => {
+                            root.discard-draft();
+                            keys.focus();
+                        }
+                        close => {
+                            root.close-draft();
+                            keys.focus();
+                        }
+                    }
                     }
                 }
 

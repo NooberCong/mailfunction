@@ -27,6 +27,8 @@ pub struct MessageList {
     /// False in Spam: a lookup would tell a spammer's domain that the address is alive, and a
     /// familiar logo is the last thing a forgery should get.
     show_logos: Cell<bool>,
+    /// What a search found, which is shown instead of the label while there is a search.
+    results: RefCell<Option<Vec<MessageRow>>>,
     notify: ModelNotify,
 }
 
@@ -39,6 +41,7 @@ impl MessageList {
             pages: RefCell::default(),
             logos,
             show_logos: Cell::new(true),
+            results: RefCell::default(),
             notify: ModelNotify::default(),
         }
     }
@@ -46,7 +49,48 @@ impl MessageList {
     pub fn show_label(&self, label: i64, show_logos: bool) {
         self.label.set(label);
         self.show_logos.set(show_logos);
-        self.refresh();
+        self.results.borrow_mut().take();
+        self.pages.borrow_mut().clear();
+        self.count.set(self.reader.message_count(label).unwrap_or(0));
+        self.notify.reset();
+    }
+
+    pub fn show_results(&self, rows: Vec<MessageRow>) {
+        self.show_logos.set(true);
+        self.count.set(rows.len());
+        *self.results.borrow_mut() = Some(rows);
+        self.notify.reset();
+    }
+
+    /// Adds what the server found to the results, newest first, leaving out threads already there.
+    pub fn add_results(&self, rows: Vec<MessageRow>) {
+        let mut results = self.results.borrow_mut();
+        let Some(results) = results.as_mut() else { return };
+        let before = results.len();
+        for row in rows {
+            if !results.iter().any(|r| r.thread_id == row.thread_id) {
+                results.push(row);
+            }
+        }
+        if results.len() != before {
+            results.sort_by_key(|r| std::cmp::Reverse(r.date));
+            self.count.set(results.len());
+            self.notify.reset();
+        }
+    }
+
+    /// Takes a thread out of the results. A list of a label sees this for itself.
+    pub fn drop_thread(&self, thread: Option<i64>) {
+        let mut results = self.results.borrow_mut();
+        if let Some(results) = results.as_mut() {
+            results.retain(|r| Some(r.thread_id) != thread);
+            self.count.set(results.len());
+            self.notify.reset();
+        }
+    }
+
+    pub fn result_position(&self, thread: i64) -> Option<usize> {
+        self.results.borrow().as_ref()?.iter().position(|r| r.thread_id == thread)
     }
 
     /// The logo of a message's sender, for an avatar of `size` logical pixels.
@@ -68,11 +112,32 @@ impl MessageList {
         }
     }
 
-    /// Picks up changes in the store.
+    /// Picks up changes in the store. With the same number of rows only their contents change,
+    /// so the list stays where it is, and the row under the pointer keeps its hover.
     pub fn refresh(&self) {
+        let fresh = {
+            let results = self.results.borrow();
+            results.as_ref().map(|rows| {
+                let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+                self.reader.rows(&ids).unwrap_or_default()
+            })
+        };
+        if let Some(rows) = fresh {
+            self.count.set(rows.len());
+            *self.results.borrow_mut() = Some(rows);
+            self.notify.reset();
+            return;
+        }
+        let shown: Vec<usize> = self.pages.borrow().keys().copied().collect();
         self.pages.borrow_mut().clear();
-        self.count.set(self.reader.message_count(self.label.get()).unwrap_or(0));
-        self.notify.reset();
+        let count = self.reader.message_count(self.label.get()).unwrap_or(0);
+        if self.count.replace(count) != count {
+            self.notify.reset();
+            return;
+        }
+        for row in shown.into_iter().flat_map(|page| page * PAGE..(page + 1) * PAGE).filter(|row| *row < count) {
+            self.notify.row_changed(row);
+        }
     }
 
     fn page(&self, index: usize) -> Rc<Vec<MessageRow>> {
@@ -90,6 +155,9 @@ impl MessageList {
     }
 
     pub fn message(&self, row: usize) -> Option<MessageRow> {
+        if let Some(results) = self.results.borrow().as_ref() {
+            return results.get(row).cloned();
+        }
         self.page(row / PAGE).get(row % PAGE).cloned()
     }
 }
@@ -112,6 +180,7 @@ impl Model for MessageList {
             initials: initials(display_name(&m)).into(),
             tone: tone(&m.from_addr),
             logo: self.logo(&m.from_addr, AVATAR),
+            count: if m.count > 1 { m.count.to_string().into() } else { "".into() },
         })
     }
 

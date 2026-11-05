@@ -1,7 +1,11 @@
 //! Where the window meets Windows: the title bar takes the app's colours, so the frame reads as
 //! one piece while Snap Layouts, resizing and the caption buttons stay native.
 
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use std::num::NonZeroIsize;
+
+use raw_window_handle::{
+    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle,
+};
 use slint::{Color, ComponentHandle};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -55,6 +59,28 @@ pub fn set_icon(app: &App) {
     for (slot, metric) in [(ICON_SMALL, SM_CXSMICON), (ICON_BIG, SM_CXICON)] {
         let Some(icon) = exe_icon(EXE_ICON, unsafe { GetSystemMetrics(metric) }) else { continue };
         unsafe { SendMessageW(hwnd, WM_SETICON, Some(WPARAM(slot as usize)), Some(LPARAM(icon.0 as isize))) };
+    }
+}
+
+/// What a file dialog needs to sit on top of the window, from any thread.
+pub(crate) fn dialog_parent(app: &App) -> DialogParent {
+    DialogParent(hwnd(app).map(|hwnd| hwnd.0 as isize))
+}
+
+/// A window to own a dialog, which unlike the window itself can be handed to another thread.
+pub(crate) struct DialogParent(Option<isize>);
+
+impl HasWindowHandle for DialogParent {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        let handle = self.0.and_then(NonZeroIsize::new).ok_or(HandleError::Unavailable)?;
+        // The window outlives every dialog it owns, which close with it.
+        Ok(unsafe { WindowHandle::borrow_raw(RawWindowHandle::Win32(Win32WindowHandle::new(handle))) })
+    }
+}
+
+impl HasDisplayHandle for DialogParent {
+    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+        Ok(DisplayHandle::windows())
     }
 }
 

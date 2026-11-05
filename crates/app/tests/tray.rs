@@ -169,6 +169,8 @@ fn seed(dir: &Path) {
         port: 1,
         security: Security::Plain,
         auth: AuthKind::Password,
+        smtp_host: "localhost".into(),
+        smtp_port: 25,
     };
     let account = store.add_account(&account).unwrap();
     let inbox = store.folder(account, "INBOX", &LabelSpec::system(Role::Inbox)).unwrap();
@@ -176,6 +178,8 @@ fn seed(dir: &Path) {
         uid,
         remote_id: format!("tray-{uid}"),
         gm_thread_id: None,
+        mid: None,
+        references: vec![],
         subject: "Waiting".into(),
         from_name: "Ann".into(),
         from_addr: "ann@example.com".into(),

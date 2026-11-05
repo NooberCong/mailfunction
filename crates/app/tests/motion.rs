@@ -157,6 +157,8 @@ fn seed(dir: &std::path::Path) -> (Store, i64) {
             port: 993,
             security: Security::Tls,
             auth: AuthKind::Google,
+            smtp_host: "localhost".into(),
+            smtp_port: 25,
         })
         .unwrap();
     let inbox = store.folder(account, "INBOX", &LabelSpec::system(Role::Inbox)).unwrap();
@@ -166,12 +168,16 @@ fn seed(dir: &std::path::Path) -> (Store, i64) {
             uid: i + 1,
             remote_id: format!("m{i}"),
             gm_thread_id: None,
+            mid: None,
+            references: vec![],
             subject: format!("Lịch họp tuần sau và tài liệu cần chuẩn bị {i}"),
             from_name: format!("Nguyễn Thị Minh Anh {i}"),
             from_addr: format!("person{i}@example.vn"),
             date: 1_793_000_000 - i64::from(i) * 3600,
             size: 1000,
-            seen: i % 3 != 0,
+            // All read: an unread message rightly repaints its row once it counts as read, and
+            // that one change would land inside the checks that nothing paints.
+            seen: true,
             flagged: i % 7 == 0,
             labels: vec![],
         })

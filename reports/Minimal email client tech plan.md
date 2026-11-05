@@ -124,12 +124,48 @@ Three findings change the design:
 
 Still open:
 
-- Gmail itself is untested. Its extensions are covered by a scripted server built from Google's documentation, so the real authenticated capability list, X-GM-THRID on a real mailbox, and the "In production" token test remain to be done.
-- `async-imap` needed no patch, because raw commands expose X-GM-THRID and `EXAMINE (CONDSTORE)`. Partial fetch is not built: opening a message downloads all of it, attachments included, and a hostile server could exhaust memory with an oversized body. Bodies are only ever fetched from the provider over verified TLS, so this waits for attachment handling in Phase 1.
-- The `https://mail.google.com/` scope grants full mailbox control, and IMAP has no narrower option, so "read-only" is enforced by this client rather than by Google. A stolen refresh token could do anything.
+- Reading real Gmail now works, confirmed on a 45,000-message mailbox. Writing to it is another matter: see Phase 1 results below. The "In production" token test still needs its seven days.
+- `async-imap` needed no patch, because raw commands expose X-GM-THRID and `EXAMINE (CONDSTORE)`. Bodies now arrive in 4 MB pieces and stop at 96 MB, so no one response is unbounded, though opening a message still downloads all of it, attachments included.
+- The `https://mail.google.com/` scope grants full mailbox control, and IMAP has no narrower option. A stolen refresh token could do anything.
 - Two copies with the same Message-ID in one folder collapse into one placement on generic IMAP. Gmail cannot hit this, but iCloud can, so Phase 2 must fix it.
 - `j` and `k` do not work while focus is inside an HTML message; Esc or a click on the list returns it. Esc itself is untested, because it needs real input.
 - Other display scales are covered offscreen only. Multi-monitor, screen readers and real newsletters are untested. Vietnamese text renders correctly, and IME input is untested until search adds a text box.
+
+## Phase 1 results (November 2026)
+
+Triage, the operation queue, threads, compose, drafts, send, attachments, search and the keyboard are built, along with undo send, spam and not-spam, labels and address suggestions. Measured in release on the seeded 100,000-message mailbox:
+
+| Operation | Result | Budget |
+|---|---|---|
+| Archiving a thread (store and queue) | 0.2 ms | 20 ms |
+| Opening a thread | 0.1 ms | 50 ms |
+| Deepest page of threads | 16 ms | 50 ms |
+| Search, a rare word | 8 ms | 100 ms |
+| Search, a word in every message | 18 ms | 250 ms |
+| Resync of 1,000 flag changes | 24 ms | 500 ms |
+
+Migrating a copy of the real 45,000-message store took 0.54 s and lost nothing. On a real window against Dovecot, an action reaches the server about 30 ms after it is made.
+
+Five findings changed the design:
+
+- **A list of threads needs a marker, not a query.** Grouping at read time cannot walk an index, so `message_label.head` marks each thread's newest message in each label, and the partial index on it keeps lists a plain walk.
+- **The hottest writes cannot trust the query planner.** Keeping `head` correct as one SQL UPDATE turned a 24 ms resync into 15 seconds, because the planner chose a scan. A thread is a few rows, so they are compared in Rust through a pinned index. Adding an index for search then made opening a thread 100 times slower by tempting the planner away from the right one, which is why that query is pinned too. Neither shows on a small mailbox, only at scale.
+- **Actions share the sync connection on purpose.** A separate connection would be simpler, but it could move a message while a pass is working out what has gone, and the purge at the end of the pass would then delete its body.
+- **`đ` is not an accent.** SQLite's tokenizer strips combining marks, but `đ` is a letter of its own, so `hoa don` could not find `Hóa đơn`. It is folded by hand on both sides of the index.
+- **A draft is mail that exists here first.** It gets a `message` row with a `local:` identity at once, and a copy coming back through sync takes that row over by Message-ID, so nothing appears twice. Every upload gets a new Message-ID, because Gmail treats a repeated one as the same message.
+
+An independent review of the write path then found ten bugs that the tests had not, four of them reproduced by running them. Each is fixed and most have a test. Three lessons from it hold beyond this code. Merely opening a draft must not count as editing it, or arrowing through Drafts rewrites mail written elsewhere. A UID means nothing without its UIDVALIDITY, so an action checks it before touching anything. And a failing action must never stand between the user and new mail, so anything that keeps failing waits until the end of the pass.
+
+Still open:
+
+- **Nothing here has written to real Gmail.** Every write is proved on Dovecot, and Gmail's own commands (X-GM-LABELS, moves through its special folders, deleting a draft by way of Trash) are pinned by a scripted server. That shows what is sent, not what Gmail does with it. Check archive, delete, send and a draft edited twice on a real account before relying on any of them.
+- The exit criterion is 30 days as the only client with no data loss, and that clock has not started.
+- Compose is plain text. Rich text, signatures and aliases are not built, and neither is printing or a `mailto:` handler. A rich draft from another client survives being looked at, but editing one here replaces it with plain text and drops its inline images.
+- A thread can only be acted on as a whole, and there is no selecting several at once.
+- Search only sees body text that is stored here, so older mail is found through the server. Results the server finds in history that has not synced yet have no row to show.
+- The reader shows one message of a thread at a time, with the others a line each above it. A webview cannot scroll inside a native list, so this is a design choice rather than a shortcut.
+- `j` and `k` still do not work while focus is inside an HTML message; Esc or a click on the list returns it.
+- IME input and drag and drop are built on Slint and winit's own support, but are untested, as they need real input.
 
 ## Interface notes (November 2026)
 

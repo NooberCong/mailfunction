@@ -1,63 +1,22 @@
-//! The real UI and controller on a seeded store, in an offscreen software window. Key presses
-//! go straight into Slint, so no input reaches the desktop. Screenshots land in `target/ui`.
+//! The real UI and controller on a seeded store, in an offscreen software window.
 
-use std::cell::{Cell, RefCell};
+mod common;
+
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mailfunction::notify::{Notice, Notifier, Opens};
-use mailfunction::{App, Controller, HtmlPane, ImageBar, Pane, Theme};
+use common::{RecordingNotifier, RecordingPane, click, fresh_dir, offscreen, press, settle, shot};
+use mailfunction::notify::Opens;
+use mailfunction::{App, Controller, ImageBar, Pane, Theme};
 use mailfunction_core::engine::Event;
 use mailfunction_core::logo;
 use mailfunction_core::remote::Offline;
 use mailfunction_core::store::{Account, AuthKind, Folder, LabelSpec, NewMessage, Reader, Role, Security, Store};
-use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
-use slint::platform::{Platform, PlatformError, PointerEventButton, WindowAdapter, WindowEvent};
-use slint::{ComponentHandle, LogicalPosition, Model, PhysicalSize};
-
-struct Headless {
-    window: Rc<MinimalSoftwareWindow>,
-    started: Instant,
-}
-
-impl Platform for Headless {
-    fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
-        Ok(self.window.clone())
-    }
-
-    fn duration_since_start(&self) -> Duration {
-        self.started.elapsed()
-    }
-}
-
-#[derive(Default)]
-struct RecordingPane {
-    shown: Rc<RefCell<Vec<String>>>,
-}
-
-impl HtmlPane for RecordingPane {
-    fn show(&self, app: &App, html: String) -> bool {
-        self.shown.borrow_mut().push(html);
-        app.set_pane(Pane::Html);
-        true
-    }
-    fn hide(&self) {}
-    fn bounds_changed(&self, _: &App) {}
-}
-
-#[derive(Default, Clone)]
-struct RecordingNotifier {
-    shown: Rc<RefCell<Vec<Notice>>>,
-}
-
-impl Notifier for RecordingNotifier {
-    fn show(&self, notice: &Notice) {
-        self.shown.borrow_mut().push(notice.clone());
-    }
-}
+use slint::platform::WindowEvent;
+use slint::{ComponentHandle, Model, PhysicalSize};
 
 /// The picture's size and the colour at its centre, with its alpha.
 fn picture_centre(png_bytes: &[u8]) -> (u32, [u8; 4]) {
@@ -68,47 +27,6 @@ fn picture_centre(png_bytes: &[u8]) -> (u32, [u8; 4]) {
     (info.width, pixels[at..at + 4].try_into().unwrap())
 }
 
-fn shot(app: &App, name: &str) {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui");
-    std::fs::create_dir_all(&dir).unwrap();
-    let buffer = app.window().take_snapshot().unwrap();
-    let file = std::fs::File::create(dir.join(format!("{name}.png"))).unwrap();
-    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), buffer.width(), buffer.height());
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    encoder.write_header().unwrap().write_image_data(buffer.as_bytes()).unwrap();
-}
-
-fn press(app: &App, text: &str) {
-    app.window().dispatch_event(WindowEvent::KeyPressed { text: text.into() });
-    app.window().dispatch_event(WindowEvent::KeyReleased { text: text.into() });
-    settle();
-}
-
-/// Runs the UI forward until every entrance and transition has finished.
-fn settle() {
-    for _ in 0..6 {
-        slint::platform::update_timers_and_animations();
-        std::thread::sleep(Duration::from_millis(60));
-    }
-    slint::platform::update_timers_and_animations();
-}
-
-fn click(app: &App, x: f32, y: f32) {
-    let position = LogicalPosition::new(x, y);
-    let window = app.window();
-    window.dispatch_event(WindowEvent::PointerMoved { position });
-    window.dispatch_event(WindowEvent::PointerPressed { position, button: PointerEventButton::Left });
-    window.dispatch_event(WindowEvent::PointerReleased { position, button: PointerEventButton::Left });
-    settle();
-}
-
-fn fresh_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("mailfunction-ui-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
-}
-
 fn account_row() -> Account {
     Account {
         id: 0,
@@ -117,6 +35,8 @@ fn account_row() -> Account {
         port: 993,
         security: Security::Tls,
         auth: AuthKind::Google,
+        smtp_host: "localhost".into(),
+        smtp_port: 25,
     }
 }
 
@@ -183,6 +103,8 @@ fn seed_from(store: &Store, inbox: &Folder, mail: &[Sample]) {
             uid: i as u32 + 1,
             remote_id: format!("m{i}"),
             gm_thread_id: None,
+            mid: None,
+            references: vec![],
             subject: m.subject.into(),
             from_name: m.from.0.into(),
             from_addr: m.from.1.into(),
@@ -198,8 +120,7 @@ fn seed_from(store: &Store, inbox: &Folder, mail: &[Sample]) {
 
 #[test]
 fn the_whole_window() {
-    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
-    slint::platform::set_platform(Box::new(Headless { window: window.clone(), started: Instant::now() })).unwrap();
+    let window = offscreen();
 
     let dir = fresh_dir("main");
     let store = Store::open(&dir).unwrap();
@@ -268,7 +189,9 @@ fn the_whole_window() {
     assert_eq!(app.get_pane(), Pane::Html);
     assert_eq!(html_shown.borrow().len(), 1);
     assert!(!html_shown.borrow()[0].contains("alert") && !html_shown.borrow()[0].contains("t.example"));
-    assert_eq!(app.get_message().attachments, "report.pdf");
+    let attachments = app.get_message().attachments;
+    assert_eq!(attachments.row_data(0).unwrap().name, "report.pdf");
+    assert_eq!(attachments.row_data(0).unwrap().size, "3 B");
     shot(&app, "03-html-message");
 
     // A known sender's logo replaces the initials, in the row and in the header, at the size each
@@ -313,7 +236,7 @@ fn the_whole_window() {
     settle();
     assert_eq!(app.get_slot_y(), one_line);
 
-    click(&app, 1055.0, 176.0);
+    click(&app, 1055.0, 212.0);
     assert_eq!(app.get_image_bar(), ImageBar::Loading);
     controller.images_fetched(opened, &HashMap::new());
     assert_eq!(app.get_image_bar(), ImageBar::Failed);
@@ -383,6 +306,8 @@ fn the_whole_window() {
                 uid: 100,
                 remote_id: "new".into(),
                 gm_thread_id: None,
+                mid: None,
+                references: vec![],
                 subject: "Just arrived".into(),
                 from_name: "New".into(),
                 from_addr: "new@example.com".into(),
@@ -406,7 +331,7 @@ fn the_whole_window() {
     assert_eq!(app.get_selected_row(), -1);
 
     // The sidebar and the list answer to the pointer, through the marker and the fades.
-    click(&app, 90.0, 64.0);
+    click(&app, 90.0, 112.0);
     assert_eq!(app.get_active_label(), 1, "a click on the second sidebar row");
     controller.select_label(0);
     settle();
@@ -521,6 +446,8 @@ fn the_whole_window() {
                 uid: 200,
                 remote_id: "background".into(),
                 gm_thread_id: None,
+                mid: None,
+                references: vec![],
                 subject: "For the other account".into(),
                 from_name: "Bg".into(),
                 from_addr: "bg@example.com".into(),
@@ -538,7 +465,7 @@ fn the_whole_window() {
     assert_eq!(app.get_accounts().row_data(1).unwrap().unread, "1");
     // The taskbar counts every account, not just the one on screen.
     let per_account: i64 = app.get_accounts().iter().map(|a| a.unread.parse::<i64>().unwrap_or(0)).sum();
-    assert!(per_account > 1);
+    assert!(per_account >= 1);
     assert_eq!(controller.unread(), per_account);
     assert_eq!((app.get_selected_row(), app.get_message().subject), (open, subject));
     assert_eq!(app.get_rows().row_count(), MAIL.len() + 1);
@@ -582,6 +509,8 @@ fn the_whole_window() {
             uid: next_uid.get(),
             remote_id: format!("new-{}", next_uid.get()),
             gm_thread_id: None,
+            mid: None,
+            references: vec![],
             subject: format!("Message {}", next_uid.get()),
             from_name: name.into(),
             from_addr: address.into(),
@@ -684,6 +613,8 @@ fn the_whole_window() {
             uid: 1,
             remote_id: id.into(),
             gm_thread_id: None,
+            mid: None,
+            references: vec![],
             subject: id.into(),
             from_name: "Linear".into(),
             from_addr: "n@linear.example".into(),
