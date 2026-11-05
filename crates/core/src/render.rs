@@ -14,18 +14,18 @@ use mail_parser::{MessageParser, MessageRef, PartKind};
 pub const CONTENT_SECURITY_POLICY: &str =
     "default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'";
 
+/// Mail is designed for a white page and brings its own spacing, so a newsletter fills the pane
+/// in either theme. Only mail with no layout of its own, such as a personal note, gets a margin.
 const SHEET: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><style>\
     html{background:#fff;color:#231417;color-scheme:light}\
-    body{margin:0;padding:22px 36px;font:14px/1.6 'Segoe UI Variable Text','Segoe UI',sans-serif;overflow-wrap:anywhere;\
+    body{margin:0;padding:0;font:14px/1.6 'Segoe UI Variable Text','Segoe UI',sans-serif;overflow-wrap:anywhere;\
     animation:mf-in .17s cubic-bezier(.22,1,.36,1)}\
+    body:not(:has(table)){padding:22px 36px}\
     @keyframes mf-in{from{opacity:0;transform:translateY(6px)}}\
     img{max-width:100%;height:auto}\
     ::-webkit-scrollbar{width:10px;height:10px}\
     ::-webkit-scrollbar-thumb{background:#e6dadc;border-radius:5px;border:2px solid #fff}\
     @media (prefers-reduced-motion:reduce){body{animation:none}}\
-    @media (prefers-color-scheme:dark){html{background:#1b1516}\
-    body{margin:16px 36px;padding:20px 24px;background:#fff;border-radius:12px}\
-    ::-webkit-scrollbar-thumb{background:#4a3a3d;border-color:#1b1516}}\
     </style></head><body>";
 
 /// Inline images larger than this are dropped rather than embedded in the page.
@@ -141,6 +141,8 @@ fn sanitise(
     let cleaned = Builder::default()
         .add_tags(["center", "font", "style", "tbody", "thead", "tfoot"])
         .rm_clean_content_tags(["style"])
+        // A removed tag leaves its text behind, and a title would land at the top of the body.
+        .add_clean_content_tags(["title"])
         .add_generic_attributes(["align", "bgcolor", "class", "dir", "height", "id", "style", "valign", "width"])
         .add_tag_attributes("font", ["color", "face", "size"])
         .add_tag_attributes("table", ["border", "cellpadding", "cellspacing"])
@@ -270,6 +272,23 @@ mod tests {
         assert!(!document("<img src='cid:other'>", &images).contains("cid:"));
         assert!(!clean("<img src='data:image/svg+xml;base64,AAAA'>").contains("svg"));
         assert!(clean("<img src='data:image/gif;base64,AAAA'>").contains("data:image/gif"));
+    }
+
+    #[test]
+    fn a_title_is_not_body_text_and_hidden_preview_text_stays_hidden() {
+        let out = clean(
+            "<html><head><title>The subject again</title></head><body>\
+             <div style='display:none;max-height:0'>Preview</div><p>Hello</p></body></html>",
+        );
+        assert!(!out.contains("The subject again"), "{out}");
+        assert!(out.contains("display:none") && out.contains("Hello"), "{out}");
+    }
+
+    #[test]
+    fn mail_fills_the_pane_and_only_mail_without_a_layout_gets_a_margin() {
+        assert!(SHEET.contains("body{margin:0;padding:0;"));
+        assert!(SHEET.contains("body:not(:has(table)){padding:22px 36px}"));
+        assert!(!SHEET.contains("prefers-color-scheme"), "the page must not change with the theme");
     }
 
     #[test]

@@ -3079,6 +3079,7 @@ dependencies = [
 name = "mailfunction"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "async-imap",
  "chrono",
  "mailfunction-core",
@@ -3089,6 +3090,7 @@ dependencies = [
  "tokio",
  "webview2-com",
  "windows",
+ "windows-core",
  "winresource",
  "wry",
 ]

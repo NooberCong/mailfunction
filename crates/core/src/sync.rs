@@ -108,6 +108,8 @@ fn change(fetched: Fetched) -> Change {
 pub struct Outcome {
     pub changed: bool,
     pub more_history: bool,
+    /// Messages that came in since the last sync. Backfilled history is not among them.
+    pub arrived: Vec<i64>,
 }
 
 /// Brings one folder up to date, apart from history older than one backfill step.
@@ -118,6 +120,7 @@ pub async fn sync_folder(imap: &mut Imap, store: &Store, folder: &mut Folder) ->
         return Err(Error::Protocol(format!("{} reported no UIDVALIDITY or UIDNEXT", folder.path)));
     }
     let mut changed = false;
+    let mut arrived = Vec::new();
 
     if folder.uid_validity != status.uid_validity {
         if folder.uid_validity != 0 {
@@ -139,7 +142,7 @@ pub async fn sync_folder(imap: &mut Imap, store: &Store, folder: &mut Folder) ->
         let fresh = imap.fetch_headers(folder.next_uid, None).await?;
         changed |= !fresh.is_empty();
         let messages: Vec<_> = fresh.into_iter().map(new_message).collect();
-        store.save_messages(folder, &messages)?;
+        arrived = store.save_messages(folder, &messages)?;
         folder.next_uid = status.uid_next;
         store.save_progress(folder)?;
     }
@@ -157,7 +160,7 @@ pub async fn sync_folder(imap: &mut Imap, store: &Store, folder: &mut Folder) ->
         if store.uid_count(folder)? != status.exists {
             changed |= remove_expunged(imap, store, folder).await?;
         }
-        return Ok(Outcome { changed, more_history: false });
+        return Ok(Outcome { changed, more_history: false, arrived });
     }
 
     let low = folder.backfill_uid.saturating_sub(BACKFILL_SPAN).max(1);
@@ -172,16 +175,17 @@ pub async fn sync_folder(imap: &mut Imap, store: &Store, folder: &mut Folder) ->
         changed = true;
     }
     store.save_progress(folder)?;
-    Ok(Outcome { changed, more_history: !folder.backfilled() })
+    Ok(Outcome { changed, more_history: !folder.backfilled(), arrived })
 }
 
 /// One complete pass over an account: lists folders, syncs them all including history, then
-/// deletes what no folder claimed. Returns the folders, most important first.
+/// deletes what no folder claimed. Returns the folders, most important first. `on_change` is told
+/// what arrived with each change.
 pub async fn sync_account(
     imap: &mut Imap,
     store: &Store,
     account_id: i64,
-    mut on_change: impl FnMut(),
+    mut on_change: impl FnMut(&[i64]),
 ) -> Result<Vec<Folder>> {
     let remote = folders_to_sync(imap.list().await?, imap.gmail);
     if remote.is_empty() {
@@ -199,7 +203,7 @@ pub async fn sync_account(
         for folder in &mut folders {
             let outcome = sync_folder(imap, store, folder).await?;
             if outcome.changed {
-                on_change();
+                on_change(&outcome.arrived);
             }
             more |= outcome.more_history;
         }

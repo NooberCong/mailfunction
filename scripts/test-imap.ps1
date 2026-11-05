@@ -12,6 +12,8 @@ try {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     rustup run stable-x86_64-pc-windows-msvc cargo test -p mailfunction --test live
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    rustup run stable-x86_64-pc-windows-msvc cargo test -p mailfunction --test tray
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } finally {
     docker rm -f mf-dovecot | Out-Null
 }

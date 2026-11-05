@@ -37,6 +37,8 @@ const PICTURE_RECHECK_SECONDS: i64 = 7 * 24 * 3600;
 pub enum Event {
     /// The store has new data for lists.
     Changed,
+    /// These messages have just come in.
+    Arrived(Vec<i64>),
     Syncing,
     UpToDate,
     Offline,
@@ -238,9 +240,12 @@ async fn sync_session(
     let mut imap = connect(credentials).await?;
     loop {
         listener(Event::Syncing);
-        let folders = sync_account(&mut imap, store, credentials.account.id, || {
+        let folders = sync_account(&mut imap, store, credentials.account.id, |arrived| {
             listener(Event::Changed);
             prefetch.notify_one();
+            if !arrived.is_empty() {
+                listener(Event::Arrived(arrived.to_vec()));
+            }
         })
         .await?;
         listener(Event::UpToDate);
@@ -326,13 +331,15 @@ impl BodyFetcher {
             return Ok(());
         }
         let (path, uid) = reader.location(id)?.ok_or_else(|| Error::Protocol("message has no location".into()))?;
-        // One retry, because the idle connection may have been closed since the last use.
+        // One retry, because the idle connection may have been closed since the last use, and a
+        // folder opened before this message arrived does not show it until opened again.
         for attempt in 0..2 {
             match self.fetch_once(&path, uid, credentials).await {
                 Ok(Some(raw)) => {
                     store.save_body(id, &raw)?;
                     return Ok(());
                 }
+                Ok(None) if attempt == 0 => self.open = None,
                 Ok(None) => return Err(Error::Protocol(format!("UID {uid} is gone from {path}"))),
                 Err(e) if attempt == 1 => return Err(e),
                 Err(_) => {

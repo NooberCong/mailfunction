@@ -11,6 +11,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use mailfunction::notify::{Notice, Notifier};
 use mailfunction::{App, Controller, HtmlPane, Pane, Theme};
 use mailfunction_core::engine::Event;
 use mailfunction_core::remote::Offline;
@@ -39,6 +40,12 @@ impl Platform for Clock {
     fn duration_since_start(&self) -> Duration {
         self.now.get()
     }
+}
+
+struct Silent;
+
+impl Notifier for Silent {
+    fn show(&self, _: &Notice) {}
 }
 
 struct NoHtml;
@@ -198,7 +205,7 @@ fn motion_is_cheap_and_stops() {
     let app = App::new().unwrap();
     window.dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: SCALE });
     window.set_size(PhysicalSize::new(SIZE.0, SIZE.1));
-    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(NoHtml), Arc::new(Offline)).unwrap();
+    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(NoHtml), Box::new(Silent), Arc::new(Offline)).unwrap();
     app.show().unwrap();
     window.dispatch_event(WindowEvent::WindowActiveChanged(true));
     controller.load_accounts().unwrap();

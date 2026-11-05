@@ -10,15 +10,18 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW, SM_CXICON, SM_CXSMICON,
-    SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SystemParametersInfoW, WM_SETICON,
+    GetSystemMetrics, HICON, ICON_BIG, ICON_SMALL, IMAGE_ICON, IsIconic, IsWindowVisible, LR_DEFAULTCOLOR, LoadImageW,
+    SM_CXICON, SM_CXSMICON, SPI_GETCLIENTAREAANIMATION, SW_HIDE, SW_RESTORE, SW_SHOW,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetForegroundWindow, ShowWindow, SystemParametersInfoW,
+    WM_SETICON,
 };
 use windows::core::{BOOL, PCWSTR};
 
 use crate::{App, Theme};
 
-/// The resource id given to the icon in `build.rs`.
-const EXE_ICON: usize = 1;
+/// The resource ids given to the icons in `build.rs`.
+pub(crate) const EXE_ICON: usize = 1;
+pub(crate) const UNREAD_ICON: usize = 2;
 
 fn colorref(color: Color) -> COLORREF {
     COLORREF(u32::from(color.red()) | u32::from(color.green()) << 8 | u32::from(color.blue()) << 16)
@@ -29,7 +32,7 @@ fn set<T>(hwnd: HWND, attribute: DWMWINDOWATTRIBUTE, value: &T) {
     let _ = unsafe { DwmSetWindowAttribute(hwnd, attribute, std::ptr::from_ref(value).cast(), size_of::<T>() as u32) };
 }
 
-fn hwnd(app: &App) -> Option<HWND> {
+pub(crate) fn hwnd(app: &App) -> Option<HWND> {
     let window = app.window().window_handle();
     match window.window_handle().ok()?.as_raw() {
         RawWindowHandle::Win32(win32) => Some(HWND(win32.hwnd.get() as *mut _)),
@@ -37,18 +40,53 @@ fn hwnd(app: &App) -> Option<HWND> {
     }
 }
 
+/// An icon embedded in the executable, at a size in pixels.
+pub(crate) fn exe_icon(resource: usize, size: i32) -> Option<HICON> {
+    let exe = unsafe { GetModuleHandleW(None) }.ok()?;
+    let name = PCWSTR(resource as *const u16);
+    let icon = unsafe { LoadImageW(Some(exe.into()), name, IMAGE_ICON, size, size, LR_DEFAULTCOLOR) }.ok()?;
+    Some(HICON(icon.0))
+}
+
 /// Gives the window the icon embedded in the executable, for the title bar and taskbar.
 pub fn set_icon(app: &App) {
     let Some(hwnd) = hwnd(app) else { return };
-    let resource = PCWSTR(EXE_ICON as *const u16);
-    let Ok(exe) = (unsafe { GetModuleHandleW(None) }) else { return };
     // Each slot loads its own size: the title bar would otherwise shrink the large icon.
     for (slot, metric) in [(ICON_SMALL, SM_CXSMICON), (ICON_BIG, SM_CXICON)] {
-        let size = unsafe { GetSystemMetrics(metric) };
-        let Ok(icon) = (unsafe { LoadImageW(Some(exe.into()), resource, IMAGE_ICON, size, size, LR_DEFAULTCOLOR) }) else {
-            continue;
-        };
+        let Some(icon) = exe_icon(EXE_ICON, unsafe { GetSystemMetrics(metric) }) else { continue };
         unsafe { SendMessageW(hwnd, WM_SETICON, Some(WPARAM(slot as usize)), Some(LPARAM(icon.0 as isize))) };
+    }
+}
+
+/// Takes the window off the screen and the taskbar. Slint's own hide would destroy the native
+/// window, and everything that hangs from it: the webview, the tray icon and their listeners.
+pub(crate) fn hide(app: &App) {
+    if let Some(hwnd) = hwnd(app) {
+        let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+    }
+}
+
+/// Brings the window to the front, from wherever it was. Returns whether it had been hidden.
+pub(crate) fn raise(app: &App) -> bool {
+    let Some(hwnd) = hwnd(app) else { return false };
+    unsafe {
+        let hidden = !IsWindowVisible(hwnd).as_bool();
+        if hidden {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+        }
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(hwnd);
+        hidden
+    }
+}
+
+/// Keeps the unread count on the taskbar from now on, on the button and in the notification area.
+pub fn watch_taskbar(app: &App) {
+    if let Some(hwnd) = hwnd(app) {
+        crate::badge::watch(hwnd);
+        crate::tray::watch(hwnd);
     }
 }
 

@@ -1,9 +1,14 @@
 //! The window. [`Controller`] connects the Slint UI to the store and the engine. HTML mail goes
 //! through [`HtmlPane`], so tests can drive all of this without a desktop.
 
+pub mod badge;
 pub mod chrome;
+mod disc;
+pub mod instance;
 pub mod list;
 pub mod logos;
+pub mod notify;
+pub mod tray;
 pub mod webview;
 
 use std::cell::{Cell, RefCell};
@@ -20,7 +25,8 @@ use mailfunction_core::remote::Network;
 use mailfunction_core::{logo, oauth, secrets};
 use mailfunction_core::render::{self, Body, Rendered};
 use mailfunction_core::store::{Account, AuthKind, LabelRow, MessageRow, Reader, Role, Security, Store};
-use slint::{ComponentHandle, Image, Model, ModelRc, Timer, TimerMode, VecModel};
+use notify::{Notice, Notifier, Opens};
+use slint::{CloseRequestResponse, Color, ComponentHandle, Image, Model, ModelRc, Timer, TimerMode, VecModel};
 
 slint::include_modules!();
 
@@ -38,13 +44,22 @@ const IMAPS_PORT: u16 = 993;
 const HEADER_AVATAR: f32 = 40.0;
 const ACCOUNT_AVATAR: f32 = 28.0;
 
+/// A sender's picture on a notification, in pixels. Windows scales it down to fit the display.
+const NOTICE_PICTURE: u32 = 128;
+/// How large a sender's initials are on that picture, as a share of it.
+const NOTICE_INITIALS_SCALE: f32 = 0.4;
+/// More new mail than this at once becomes one notice, as after a night with the app closed.
+const MOST_NOTICES: usize = 3;
+/// How many senders a summary names.
+const SENDERS_NAMED: usize = 3;
+
 thread_local! {
     /// The controller, for work that finishes on another thread. `Rc` cannot cross threads,
     /// so those threads post plain data to the event loop and it is looked up here.
     static CONTROLLER: RefCell<Weak<Controller>> = const { RefCell::new(Weak::new()) };
 }
 
-fn on_ui_thread(work: impl FnOnce(&Rc<Controller>) + Send + 'static) {
+pub fn on_ui_thread(work: impl FnOnce(&Rc<Controller>) + Send + 'static) {
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(controller) = CONTROLLER.with(|c| c.borrow().upgrade()) {
             work(&controller);
@@ -98,6 +113,10 @@ pub struct Controller {
     list: Rc<MessageList>,
     logos: Rc<Logos>,
     network: Arc<dyn Network>,
+    badge: badge::Badge,
+    tray: tray::Tray,
+    /// Unread Inbox mail across every account, as the taskbar button shows it.
+    unread: Cell<i64>,
     labels: RefCell<Vec<LabelRow>>,
     label_items: Rc<VecModel<LabelItem>>,
     /// Every signed-in account. Mail stays local to its account; only one is on screen.
@@ -111,6 +130,7 @@ pub struct Controller {
     selected_sender: RefCell<String>,
     last_open: Cell<Option<Instant>>,
     pane: Box<dyn HtmlPane>,
+    notifier: Box<dyn Notifier>,
     engine: RefCell<Option<Engine>>,
     client: Option<oauth::Client>,
     refresh: Timer,
@@ -122,6 +142,7 @@ impl Controller {
         dir: &Path,
         client: Option<oauth::Client>,
         pane: Box<dyn HtmlPane>,
+        notifier: Box<dyn Notifier>,
         network: Arc<dyn Network>,
     ) -> mailfunction_core::Result<Rc<Self>> {
         let store = Arc::new(Store::open(dir)?);
@@ -141,6 +162,9 @@ impl Controller {
             list,
             logos,
             network,
+            badge: badge::Badge::default(),
+            tray: tray::Tray::default(),
+            unread: Cell::new(0),
             labels: RefCell::default(),
             label_items,
             accounts: RefCell::default(),
@@ -151,6 +175,7 @@ impl Controller {
             selected_sender: RefCell::default(),
             last_open: Cell::new(None),
             pane,
+            notifier,
             engine: RefCell::default(),
             client,
             refresh: Timer::default(),
@@ -161,6 +186,13 @@ impl Controller {
     }
 
     fn connect_callbacks(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.app.window().on_close_requested(move || {
+            if let Some(this) = weak.upgrade() {
+                this.close_window();
+            }
+            CloseRequestResponse::KeepWindowShown
+        });
         let weak = Rc::downgrade(self);
         self.app.on_select_label(move |index| {
             if let Some(this) = weak.upgrade() {
@@ -407,6 +439,7 @@ impl Controller {
     pub fn on_event(self: &Rc<Self>, account: i64, event: Event) {
         match event {
             Event::Changed => self.schedule_refresh(account),
+            Event::Arrived(messages) => self.announce(account, &messages),
             Event::Syncing => self.set_link(account, Link::Syncing),
             Event::UpToDate => {
                 self.set_link(account, Link::Quiet);
@@ -424,6 +457,92 @@ impl Controller {
                     self.logo_ready(&logo::picture_key(&email));
                 }
             }
+        }
+    }
+
+    /// Tells the user about new mail. Only unread Inbox mail is news: the rest is their own sent
+    /// mail, spam, or mail they have already read somewhere else.
+    fn announce(&self, account: i64, arrived: &[i64]) {
+        let messages = self.reader.unread_in_inbox(arrived).unwrap_or_default();
+        let accounts = self.accounts.borrow();
+        let Some(mailbox) = accounts.iter().find(|m| m.account.id == account) else { return };
+        let address = (accounts.len() > 1).then(|| mailbox.account.email.clone());
+        if messages.len() > MOST_NOTICES {
+            let mut senders: Vec<&str> = Vec::new();
+            for name in messages.iter().map(display_name) {
+                if senders.len() < SENDERS_NAMED && !senders.contains(&name) {
+                    senders.push(name);
+                }
+            }
+            self.notifier.show(&Notice {
+                title: format!("{} new emails", messages.len()),
+                text: senders.join(", "),
+                account: address,
+                picture: None,
+                opens: Opens { account, message: None },
+            });
+            return;
+        }
+        // Oldest first, so that the newest ends up on top of the stack.
+        for message in messages.iter().rev() {
+            let view = header(message);
+            self.notifier.show(&Notice {
+                title: view.sender.to_string(),
+                text: view.subject.to_string(),
+                account: address.clone(),
+                picture: self.sender_picture(message, &view),
+                opens: Opens { account, message: Some(message.id) },
+            });
+        }
+    }
+
+    /// The sender's logo, or else their initials in the colours the list gives them.
+    fn sender_picture(&self, message: &MessageRow, view: &MessageView) -> Option<Vec<u8>> {
+        let logo = logo::sender_domain(&message.from_addr).and_then(|domain| self.logos.png(&domain, NOTICE_PICTURE));
+        logo.or_else(|| {
+            let tones = self.app.global::<Theme>().get_tones();
+            let tone = tones.row_data(view.tone as usize % tones.row_count())?;
+            let rgb = |colour: Color| [colour.red(), colour.green(), colour.blue()];
+            let (back, ink) = (rgb(tone.back), rgb(tone.ink));
+            let pixels = disc::draw(&view.initials, NOTICE_PICTURE, back, ink, NOTICE_INITIALS_SCALE);
+            logo::png(pixels.into_flattened(), NOTICE_PICTURE)
+        })
+    }
+
+    /// Closing the window leaves the app running, so that mail keeps arriving. The browser goes,
+    /// as it is most of the app's memory and nobody is looking at it.
+    fn close_window(&self) {
+        chrome::hide(&self.app);
+        self.pane.hide();
+    }
+
+    /// Brings the window up, opening again the page that closing it let go of.
+    pub fn reveal(&self) {
+        let returning = chrome::raise(&self.app);
+        if returning
+            && matches!(self.app.get_pane(), Pane::Html | Pane::Loading)
+            && let Ok(row) = usize::try_from(self.app.get_selected_row())
+        {
+            self.select_row(row);
+        }
+    }
+
+    /// Brings up what a clicked notification is about.
+    pub fn open(&self, opens: Opens) {
+        self.reveal();
+        if !self.accounts.borrow().iter().any(|m| m.account.id == opens.account) {
+            return;
+        }
+        self.app.set_adding(false);
+        if self.shown.get() != Some(opens.account) {
+            self.show(opens.account);
+        }
+        let inbox = self.labels.borrow().iter().position(|l| l.role == Role::Inbox).unwrap_or_default();
+        self.select_label(inbox);
+        let row = opens.message.zip(self.current_label()).and_then(|(id, label)| self.reader.position(label, id).ok().flatten());
+        if let Some(row) = row {
+            self.select_row(row);
+            self.app.invoke_reveal(row as i32);
         }
     }
 
@@ -445,6 +564,8 @@ impl Controller {
     fn publish_accounts(&self) {
         let unread = self.reader.inbox_unread().unwrap_or_default();
         let accounts = self.accounts.borrow();
+        self.unread.set(accounts.iter().filter_map(|m| unread.get(&m.account.id)).sum());
+        self.show_badge();
         let items = accounts
             .iter()
             .map(|m| AccountItem {
@@ -466,6 +587,30 @@ impl Controller {
         let link = active.map(|i| &accounts[i].link);
         self.app.set_syncing(link == Some(&Link::Syncing));
         self.app.set_needs_sign_in(matches!(link, Some(Link::SignedOut(_))));
+    }
+
+    fn show_badge(&self) {
+        if let Some(hwnd) = chrome::hwnd(&self.app) {
+            self.badge.show(hwnd, self.unread.get());
+            self.tray.show(hwnd, self.unread.get());
+        }
+    }
+
+    /// Puts the count back on a taskbar button that has just appeared.
+    pub fn refresh_badge(&self) {
+        self.badge.forget();
+        self.show_badge();
+    }
+
+    /// Puts the icon back in a notification area that has just restarted.
+    pub fn restore_tray(&self) {
+        self.tray.forget();
+        self.show_badge();
+    }
+
+    /// Unread Inbox mail across every account.
+    pub fn unread(&self) -> i64 {
+        self.unread.get()
     }
 
     /// The account's own picture if it has one, or else its provider's logo.

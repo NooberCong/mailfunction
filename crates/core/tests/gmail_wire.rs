@@ -114,7 +114,7 @@ async fn gmail_labels_ids_and_folders_map_onto_the_store() {
     let credential = Credential::Password("x".into());
     let mut imap = Imap::connect(&account, &credential).await.unwrap();
     assert!(imap.gmail);
-    sync_account(&mut imap, &store, account.id, || {}).await.unwrap();
+    sync_account(&mut imap, &store, account.id, |_| {}).await.unwrap();
 
     let label = |name: &str| reader.labels(account.id).unwrap().into_iter().find(|l| l.name == name);
     let subjects = |name: &str| -> Vec<String> {
@@ -140,7 +140,7 @@ async fn gmail_labels_ids_and_folders_map_onto_the_store() {
 
     // A later pass sees a label removed and a star added through CONDSTORE.
     script.lock().unwrap().changed = true;
-    sync_account(&mut imap, &store, account.id, || {}).await.unwrap();
+    sync_account(&mut imap, &store, account.id, |_| {}).await.unwrap();
     assert!(subjects("Receipts").is_empty());
     assert_eq!(subjects("Inbox"), ["First"]);
     assert_eq!(subjects("All Mail"), ["Second", "First"], "the folder label survives a label change");

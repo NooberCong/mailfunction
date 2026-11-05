@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use mailfunction::notify::Toasts;
 use mailfunction::webview::Webview;
-use mailfunction::{App, Controller, Theme, chrome};
+use mailfunction::{App, Controller, Theme, chrome, instance, on_ui_thread};
 use mailfunction_core::oauth;
 use mailfunction_core::remote::Web;
 use slint::ComponentHandle;
@@ -19,6 +20,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(dir) => PathBuf::from(dir),
         None => env_path("LOCALAPPDATA").join("mailfunction"),
     };
+    if !instance::claim(&data) {
+        return Ok(());
+    }
     let client_file = env_path("USERPROFILE").join(".config").join("mailfunction").join("google-client.json");
 
     let app = App::new()?;
@@ -29,7 +33,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.set_sign_in_message(format!("Google client file not found:\n{}", client_file.display()).into());
     }
     let pane = Rc::new(Webview::new(data.join("webview")));
-    let controller = Controller::new(app.clone_strong(), &data, client, Box::new(pane), Arc::new(Web::default()))?;
+    let toasts = Box::new(Toasts::new(&data));
+    let controller = Controller::new(app.clone_strong(), &data, client, Box::new(pane), toasts, Arc::new(Web::default()))?;
     controller.load_accounts()?;
     controller.start_engine();
     app.show()?;
@@ -39,7 +44,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     slint::invoke_from_event_loop(move || {
         if let Some(app) = window.upgrade() {
             chrome::set_icon(&app);
+            chrome::watch_taskbar(&app);
         }
+        on_ui_thread(|this| this.refresh_badge());
     })?;
     slint::run_event_loop()?;
     Ok(())

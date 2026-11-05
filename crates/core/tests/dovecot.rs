@@ -18,8 +18,12 @@ use mailfunction_core::store::{Account, AuthKind, Folder, LabelRow, MessageRow, 
 use mailfunction_core::sync::{folders_to_sync, label_of, sync_account, sync_folder};
 use tokio::net::TcpStream;
 
-const PORT: u16 = 14143;
 const PASSWORD: &str = "pass";
+
+/// Another session may be using the usual port, so it can be moved.
+fn port() -> u16 {
+    std::env::var("MAILFUNCTION_IMAP_PORT").map_or(14143, |port| port.parse().unwrap())
+}
 
 struct Harness {
     dir: PathBuf,
@@ -48,13 +52,13 @@ async fn harness(name: &str) -> Harness {
         id: 0,
         email: user.clone(),
         host: "127.0.0.1".into(),
-        port: PORT,
+        port: port(),
         security: Security::Plain,
         auth: AuthKind::Password,
     };
     account.id = store.add_account(&account).unwrap();
     let reader = Reader::open(&dir).unwrap();
-    let tcp = TcpStream::connect(("127.0.0.1", PORT)).await.expect("start Dovecot: scripts/test-imap.ps1");
+    let tcp = TcpStream::connect(("127.0.0.1", port())).await.expect("start Dovecot: scripts/test-imap.ps1");
     let mut client = Client::new(tcp);
     client.read_response().await.unwrap();
     let admin = client.login(&user, PASSWORD).await.map_err(|(e, _)| e).unwrap();
@@ -90,7 +94,7 @@ impl Harness {
     /// One complete pass over every folder, on a fresh connection, as an app start would be.
     async fn sync(&self) {
         let mut imap = self.connect().await;
-        sync_account(&mut imap, &self.store, self.account.id, || {}).await.unwrap();
+        sync_account(&mut imap, &self.store, self.account.id, |_| {}).await.unwrap();
     }
 
     fn label(&self, name: &str) -> LabelRow {
@@ -327,6 +331,91 @@ async fn the_engine_syncs_hears_new_mail_through_idle_and_fetches_bodies() {
 
 #[tokio::test]
 #[ignore = "needs a local Dovecot: scripts/test-imap.ps1"]
+async fn mail_that_arrives_after_the_body_connection_opened_its_folder_can_be_read() {
+    let mut h = harness("late-body").await;
+    h.deliver("INBOX", "a", "Existing").await;
+    secrets::save(&h.account.email, PASSWORD).unwrap();
+
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let mut engine = Engine::start(h.dir.clone(), h.store.clone(), None, move |_, e| {
+        let _ = tx.send(e);
+    });
+    engine.add(h.account.clone());
+    wait_for(&mut events, Event::UpToDate).await;
+    let first = h.rows("Inbox")[0].id;
+    assert!(engine.fetch_body(h.account.id, first));
+    wait_for(&mut events, Event::BodyReady(first)).await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    h.deliver("INBOX", "b", "Just arrived").await;
+    wait_for(&mut events, Event::Changed).await;
+    let late = h.rows("Inbox").into_iter().find(|m| m.subject == "Just arrived").unwrap().id;
+    assert!(engine.fetch_body(h.account.id, late));
+    wait_for(&mut events, Event::BodyReady(late)).await;
+
+    secrets::delete(&h.account.email).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs a local Dovecot: scripts/test-imap.ps1"]
+async fn only_mail_that_really_arrives_counts_as_arrived() {
+    let mut h = harness("arrivals").await;
+    h.deliver("INBOX", "old", "History").await;
+    h.admin.create("Archive").await.unwrap();
+    secrets::save(&h.account.email, PASSWORD).unwrap();
+
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let mut engine = Engine::start(h.dir.clone(), h.store.clone(), None, move |_, e| {
+        let _ = tx.send(e);
+    });
+    engine.add(h.account.clone());
+    let mut first_sync = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let event = events.recv().await.expect("engine stopped");
+            let done = event == Event::UpToDate;
+            first_sync.push(event);
+            if done {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!first_sync.iter().any(|e| matches!(e, Event::Arrived(_))), "history is not news: {first_sync:?}");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    h.deliver("INBOX", "new", "Fresh").await;
+    let arrived = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Event::Arrived(ids) = events.recv().await.expect("engine stopped") {
+                return ids;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let rows = h.reader.unread_in_inbox(&arrived).unwrap();
+    assert_eq!(rows.iter().map(|m| m.subject.as_str()).collect::<Vec<_>>(), ["Fresh"]);
+
+    // Filed mail gets a new UID in its new folder, but it is the same message.
+    wait_for(&mut events, Event::UpToDate).await;
+    h.admin.select("INBOX").await.unwrap();
+    h.admin.uid_copy("1:*", "Archive").await.unwrap();
+    engine.sync_now(h.account.id);
+    wait_for(&mut events, Event::Syncing).await;
+    let mut after_copy = Vec::new();
+    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(2), events.recv()).await {
+        after_copy.push(event);
+    }
+    assert!(!after_copy.iter().any(|e| matches!(e, Event::Arrived(_))), "a copy is not news: {after_copy:?}");
+    assert_eq!(h.rows("Archive").len(), 2, "the copies were never synced, so this proves nothing");
+
+    secrets::delete(&h.account.email).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs a local Dovecot: scripts/test-imap.ps1"]
 async fn accounts_sync_side_by_side_and_stop_one_at_a_time() {
     let mut h = harness("multi").await;
     h.deliver("INBOX", "a", "For the first").await;
@@ -341,7 +430,7 @@ async fn accounts_sync_side_by_side_and_stop_one_at_a_time() {
     let third = Account { id: h.store.add_account(&third).unwrap(), ..third };
     secrets::save(&third.email, "wrong").unwrap();
 
-    let tcp = TcpStream::connect(("127.0.0.1", PORT)).await.unwrap();
+    let tcp = TcpStream::connect(("127.0.0.1", port())).await.unwrap();
     let mut client = Client::new(tcp);
     client.read_response().await.unwrap();
     let mut second_admin = client.login(&second_user, PASSWORD).await.map_err(|(e, _)| e).unwrap();
@@ -422,6 +511,6 @@ async fn accounts_sync_side_by_side_and_stop_one_at_a_time() {
 async fn a_wrong_password_asks_for_sign_in_instead_of_retrying_forever() {
     let h = harness("badpass").await;
     let account = Account { email: format!("{}@", h.account.email), ..h.account.clone() };
-    let error = Imap::connect(&Account { port: PORT, ..account }, &Credential::Password(String::new())).await;
+    let error = Imap::connect(&Account { port: port(), ..account }, &Credential::Password(String::new())).await;
     assert!(matches!(error, Err(mailfunction_core::Error::Auth(_))), "{:?}", error.err());
 }

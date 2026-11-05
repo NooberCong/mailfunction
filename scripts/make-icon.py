@@ -1,4 +1,5 @@
-"""Draws crates/app/ui/icon.ico: an @ built from overlapping red ribbons on a white tile.
+"""Draws crates/app/ui/icon.ico: an @ built from overlapping red ribbons on a white tile. Also
+draws icon-unread.ico, the same at the sizes the notification area uses, with a dot for unread mail.
 
 Needs numpy and Pillow. Run from anywhere:  python scripts/make-icon.py [preview.png]
 
@@ -15,9 +16,13 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
 OUT = Path(__file__).resolve().parent.parent / "crates" / "app" / "ui" / "icon.ico"
+UNREAD = OUT.with_name("icon-unread.ico")
 
 N = 1024  # drawings are made at this size and scaled down
 SOLID_RED = "#d81e2c"
+DOT_RED = (0xD8, 0x0D, 0x20, 255)  # the same red as the unread count on the taskbar button
+DOT = 0.42  # the dot's width, as a fraction of the icon
+DOT_GAP = 0.08  # the clear ring around it, which keeps it apart from the @ on any taskbar
 
 
 def arc(cx, cy, r, start, end):
@@ -128,12 +133,36 @@ STYLES = {
 SIZES = {256: "full", 128: "full", 64: "full", 48: "bold", 40: "bold", 32: "bold", 24: "tiny", 20: "tiny", 16: "tiny"}
 
 
+def with_dot(icon):
+    """Cuts a ring out of the corner and sets the dot in it, so that red can sit on the red @."""
+    zoom = 8
+    size = icon.width * zoom
+    right = size - 1
+    left = right - size * DOT
+
+    def disc(grow):
+        mask = Image.new("L", (size, size), 0)
+        ImageDraw.Draw(mask).ellipse((left - grow, left - grow, right + grow, right + grow), fill=255)
+        return mask.resize(icon.size, Image.LANCZOS)
+
+    alpha = np.asarray(icon.getchannel("A"), float) * (1 - np.asarray(disc(size * DOT_GAP), float) / 255)
+    cut = icon.copy()
+    cut.putalpha(Image.fromarray((alpha + 0.5).astype(np.uint8)))
+    dot = Image.new("RGBA", icon.size, DOT_RED)
+    dot.putalpha(disc(0))
+    return Image.alpha_composite(cut, dot)
+
+
 def main():
     masters = {name: draw_tile(style) for name, style in STYLES.items()}
     masters["full"] = with_shadow(masters["full"])
     images = [fit(masters[name], n, name != "full") for n, name in SIZES.items()]
     images[0].save(OUT, format="ICO", sizes=[i.size for i in images], append_images=images[1:])
     print(f"wrote {OUT} ({OUT.stat().st_size} bytes)")
+    # Windows wants a PNG for the app's name on a notification.
+    next(i for i in images if i.width == 64).save(OUT.with_suffix(".png"))
+    unread = [with_dot(i) for i in images if i.width <= 48]
+    unread[0].save(UNREAD, format="ICO", sizes=[i.size for i in unread], append_images=unread[1:])
 
     if len(sys.argv) > 1:
         sheet = Image.new("RGBA", (1400, 640), "#6b2330")

@@ -248,6 +248,18 @@ pub struct MessageRow {
     pub flagged: bool,
 }
 
+fn message_row(r: &rusqlite::Row) -> rusqlite::Result<MessageRow> {
+    Ok(MessageRow {
+        id: r.get(0)?,
+        from_name: r.get(1)?,
+        from_addr: r.get(2)?,
+        subject: r.get(3)?,
+        date: r.get(4)?,
+        seen: r.get(5)?,
+        flagged: r.get(6)?,
+    })
+}
+
 fn configure(conn: &Connection, dir: &Path, cache_kib: i64) -> Result<()> {
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute("ATTACH DATABASE ?1 AS bodies", [dir.join("bodies.db").to_string_lossy()])?;
@@ -385,35 +397,46 @@ impl Store {
         })
     }
 
-    /// Stores a batch of new or rediscovered messages. Safe to repeat, so a crash before the
-    /// folder's progress is saved only means fetching the same batch again.
-    pub fn save_messages(&self, folder: &Folder, messages: &[NewMessage]) -> Result<()> {
+    /// Stores a batch of new or rediscovered messages, and returns the ids of those never seen
+    /// before. Safe to repeat, so a crash before the folder's progress is saved only means
+    /// fetching the same batch again.
+    pub fn save_messages(&self, folder: &Folder, messages: &[NewMessage]) -> Result<Vec<i64>> {
         self.with_tx(|tx| {
             let mut labels = HashMap::new();
+            let mut added = Vec::new();
             for m in messages {
-                tx.execute(
-                    "INSERT INTO message
-                       (account_id, remote_id, gm_thread_id, subject, from_name, from_addr, date, size, seen, flagged)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                     ON CONFLICT (account_id, remote_id) DO UPDATE SET seen = ?9, flagged = ?10",
-                    params![
-                        folder.account_id,
-                        m.remote_id,
-                        m.gm_thread_id.map(|t| t as i64),
-                        m.subject,
-                        m.from_name,
-                        m.from_addr,
-                        m.date,
-                        m.size,
-                        m.seen,
-                        m.flagged,
-                    ],
-                )?;
-                let id: i64 = tx.query_row(
-                    "SELECT id FROM message WHERE account_id = ?1 AND remote_id = ?2",
-                    params![folder.account_id, m.remote_id],
-                    |r| r.get(0),
-                )?;
+                let known: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM message WHERE account_id = ?1 AND remote_id = ?2",
+                        params![folder.account_id, m.remote_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let id = if let Some(id) = known {
+                    tx.execute("UPDATE message SET seen = ?2, flagged = ?3 WHERE id = ?1", params![id, m.seen, m.flagged])?;
+                    id
+                } else {
+                    tx.execute(
+                        "INSERT INTO message
+                           (account_id, remote_id, gm_thread_id, subject, from_name, from_addr, date, size, seen, flagged)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        params![
+                            folder.account_id,
+                            m.remote_id,
+                            m.gm_thread_id.map(|t| t as i64),
+                            m.subject,
+                            m.from_name,
+                            m.from_addr,
+                            m.date,
+                            m.size,
+                            m.seen,
+                            m.flagged,
+                        ],
+                    )?;
+                    let id = tx.last_insert_rowid();
+                    added.push(id);
+                    id
+                };
                 // A reused UID can only mean a stale row from before a rescan.
                 tx.execute(
                     "UPDATE placement SET uid = NULL WHERE folder_id = ?1 AND uid = ?2 AND message_id <> ?3",
@@ -426,7 +449,7 @@ impl Store {
                 )?;
                 set_labels(tx, folder.account_id, id, m.flagged, Some(&m.labels), &mut labels)?;
             }
-            Ok(())
+            Ok(added)
         })
     }
 
@@ -664,6 +687,22 @@ impl Reader {
         Ok(counts.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Those of `ids` that are unread in the Inbox, newest first.
+    pub fn unread_in_inbox(&self, ids: &[i64]) -> Result<Vec<MessageRow>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT m.id, m.from_name, m.from_addr, m.subject, m.date, m.seen, m.flagged FROM message m
+             WHERE m.id = ?1 AND m.seen = 0 AND EXISTS (
+                 SELECT 1 FROM message_label ml JOIN label l ON l.id = ml.label_id
+                 WHERE ml.message_id = m.id AND l.role = 'inbox')",
+        )?;
+        let mut rows = Vec::new();
+        for id in ids {
+            rows.extend(stmt.query_row([id], message_row).optional()?);
+        }
+        rows.sort_by_key(|m| std::cmp::Reverse((m.date, m.id)));
+        Ok(rows)
+    }
+
     /// Labels in sidebar order: system labels first, then user labels by name.
     pub fn labels(&self, account_id: i64) -> Result<Vec<LabelRow>> {
         let mut unread: HashMap<i64, i64> = HashMap::new();
@@ -719,17 +758,7 @@ impl Reader {
              ORDER BY ml.date DESC, ml.message_id DESC
              LIMIT ?2 OFFSET ?3",
         )?;
-        let rows = stmt.query_map(params![label_id, limit as i64, offset as i64], |r| {
-            Ok(MessageRow {
-                id: r.get(0)?,
-                from_name: r.get(1)?,
-                from_addr: r.get(2)?,
-                subject: r.get(3)?,
-                date: r.get(4)?,
-                seen: r.get(5)?,
-                flagged: r.get(6)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![label_id, limit as i64, offset as i64], message_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -791,6 +820,24 @@ mod tests {
         account: i64,
         inbox: Folder,
         _dir: TempDir,
+    }
+
+    #[test]
+    fn only_a_message_never_seen_before_is_new_and_only_unread_inbox_mail_is_news() {
+        let f = fixture();
+        let added = f.store.save_messages(&f.inbox, &[message(1, "first", 1), message(2, "second", 2)]).unwrap();
+        assert_eq!(added.len(), 2);
+        let work = f.store.folder(f.account, "Work", &LabelSpec::user("Work")).unwrap();
+        assert!(f.store.save_messages(&work, &[message(9, "first", 1)]).unwrap().is_empty(), "the same mail, filed");
+
+        let news = f.reader.unread_in_inbox(&added).unwrap();
+        assert_eq!(news.iter().map(|m| m.id).collect::<Vec<_>>(), [added[1], added[0]], "newest first");
+
+        let read = NewMessage { seen: true, ..message(3, "read", 3) };
+        let added = f.store.save_messages(&f.inbox, &[read]).unwrap();
+        assert!(f.reader.unread_in_inbox(&added).unwrap().is_empty());
+        let filed = f.store.save_messages(&work, &[message(10, "filed", 4)]).unwrap();
+        assert!(f.reader.unread_in_inbox(&filed).unwrap().is_empty());
     }
 
     fn fixture() -> Fixture {

@@ -725,16 +725,30 @@ component SignIn inherits Rectangle {
     if root.can-go-back: Rectangle {
         x: 12px;
         y: 10px;
-        width: 72px;
+        width: 84px;
         height: 34px;
         border-radius: 9px;
         background: back.has-hover ? Theme.frame-hover : transparent;
         animate background { duration: Theme.fast; }
-        Text {
-            text: "Back";
-            color: Theme.on-frame;
-            font-size: Theme.body;
-            font-weight: 500;
+        HorizontalLayout {
+            alignment: center;
+            spacing: 6px;
+            VerticalLayout {
+                alignment: center;
+                Icon {
+                    width: 16px;
+                    height: 16px;
+                    tint: Theme.on-frame;
+                    commands: "M19 12H5M11 18l-6-6 6-6";
+                }
+            }
+            Text {
+                text: "Back";
+                color: Theme.on-frame;
+                font-size: Theme.body;
+                font-weight: 500;
+                vertical-alignment: center;
+            }
         }
         back := Press {
             clicked => { root.back(); }

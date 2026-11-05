@@ -238,9 +238,18 @@ fn prepare(bytes: &[u8]) -> Option<Vec<u8>> {
         imageops::overlay(&mut tile, &icon, i64::from((STORED - fit_w) / 2), i64::from((STORED - fit_h) / 2));
         tile
     };
+    encode(&tile)
+}
+
+fn encode(image: &RgbaImage) -> Option<Vec<u8>> {
     let mut png = Vec::new();
-    tile.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
+    image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
     Some(png)
+}
+
+/// A square of `size` pixels, given as RGBA, as a PNG.
+pub fn png(pixels: Vec<u8>, size: u32) -> Option<Vec<u8>> {
+    encode(&RgbaImage::from_raw(size, size, pixels)?)
 }
 
 fn cropped_square(image: &RgbaImage) -> RgbaImage {

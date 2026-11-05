@@ -87,11 +87,23 @@ impl Logos {
 
     /// A domain's logo for an avatar of `size` logical pixels, or an empty image if there is none.
     pub fn image(&self, domain: &str, size: f32) -> Image {
+        self.look_up(domain);
+        self.stored(domain, size)
+    }
+
+    /// A domain's logo as a round PNG of `size` pixels, if it has one yet.
+    pub fn png(&self, domain: &str, size: u32) -> Option<Vec<u8>> {
+        let stored = self.look_up(domain)?;
+        logo::png(logo::avatar(&stored, size)?.into_raw(), size)
+    }
+
+    /// What the store has for a domain, asking in the background if that may be out of date.
+    fn look_up(&self, domain: &str) -> Option<Vec<u8>> {
         let known = self.reader.logo(domain).ok().flatten();
         if known.as_ref().is_none_or(|(_, checked)| now() - checked > RECHECK_SECONDS) {
             self.ask(domain);
         }
-        self.stored(domain, size)
+        known?.0
     }
 
     /// As [`Self::image`], for what the store already has, without looking anything up.

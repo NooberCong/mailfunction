@@ -8,6 +8,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use mailfunction::notify::{Notice, Notifier, Opens};
 use mailfunction::{App, Controller, HtmlPane, ImageBar, Pane, Theme};
 use mailfunction_core::engine::Event;
 use mailfunction_core::logo;
@@ -45,6 +46,26 @@ impl HtmlPane for RecordingPane {
     }
     fn hide(&self) {}
     fn bounds_changed(&self, _: &App) {}
+}
+
+#[derive(Default, Clone)]
+struct RecordingNotifier {
+    shown: Rc<RefCell<Vec<Notice>>>,
+}
+
+impl Notifier for RecordingNotifier {
+    fn show(&self, notice: &Notice) {
+        self.shown.borrow_mut().push(notice.clone());
+    }
+}
+
+/// The picture's size and the colour at its centre, with its alpha.
+fn picture_centre(png_bytes: &[u8]) -> (u32, [u8; 4]) {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(png_bytes)).read_info().unwrap();
+    let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut pixels).unwrap();
+    let at = (info.height / 2 * info.width + info.width / 2) as usize * 4;
+    (info.width, pixels[at..at + 4].try_into().unwrap())
 }
 
 fn shot(app: &App, name: &str) {
@@ -186,7 +207,9 @@ fn the_whole_window() {
     window.set_size(PhysicalSize::new(1280, 760));
     let pane = RecordingPane::default();
     let html_shown = pane.shown.clone();
-    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(pane), Arc::new(Offline)).unwrap();
+    let notifier = RecordingNotifier::default();
+    let notices = notifier.shown.clone();
+    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(pane), Box::new(notifier), Arc::new(Offline)).unwrap();
     app.show().unwrap();
     window.dispatch_event(WindowEvent::WindowActiveChanged(true));
 
@@ -221,6 +244,7 @@ fn the_whole_window() {
     let names: Vec<_> = labels.iter().map(|l| l.name.to_string()).collect();
     assert_eq!(names, ["Inbox", "Starred", "Sent", "Trash", "Công việc", "Hóa đơn"]);
     assert_eq!(labels.row_data(0).unwrap().unread, "2");
+    assert_eq!(controller.unread(), 2);
     assert_eq!(app.get_pane(), Pane::Empty);
     settle();
     shot(&app, "02-inbox");
@@ -512,6 +536,10 @@ fn the_whole_window() {
     std::thread::sleep(Duration::from_millis(450));
     settle();
     assert_eq!(app.get_accounts().row_data(1).unwrap().unread, "1");
+    // The taskbar counts every account, not just the one on screen.
+    let per_account: i64 = app.get_accounts().iter().map(|a| a.unread.parse::<i64>().unwrap_or(0)).sum();
+    assert!(per_account > 1);
+    assert_eq!(controller.unread(), per_account);
     assert_eq!((app.get_selected_row(), app.get_message().subject), (open, subject));
     assert_eq!(app.get_rows().row_count(), MAIL.len() + 1);
 
@@ -544,6 +572,81 @@ fn the_whole_window() {
     assert!(app.get_adding());
     click(&app, 40.0, 26.0);
     assert!(!app.get_adding(), "the back button");
+
+    // New mail: only what is unread in the Inbox is news, and a notice says who it is from.
+    let work_spam = store.folder(work, "Spam", &LabelSpec::system(Role::Spam)).unwrap();
+    let next_uid = Cell::new(300);
+    let arrive = |folder: &Folder, name: &str, address: &str, seen: bool| {
+        next_uid.set(next_uid.get() + 1);
+        let message = NewMessage {
+            uid: next_uid.get(),
+            remote_id: format!("new-{}", next_uid.get()),
+            gm_thread_id: None,
+            subject: format!("Message {}", next_uid.get()),
+            from_name: name.into(),
+            from_addr: address.into(),
+            date: NOW + i64::from(next_uid.get()),
+            size: 1,
+            seen,
+            flagged: false,
+            labels: vec![],
+        };
+        store.save_messages(folder, &[message]).unwrap()[0]
+    };
+    let person = arrive(&work_inbox, "Ann <Lee>", "ann@gmail.com", false);
+    let read_elsewhere = arrive(&work_inbox, "Read", "read@gmail.com", true);
+    let junk = arrive(&work_spam, "Junk", "junk@gmail.com", false);
+    controller.on_event(work, Event::Arrived(vec![person, read_elsewhere, junk]));
+    let notice = notices.borrow().last().unwrap().clone();
+    assert_eq!(notices.borrow().len(), 1);
+    assert_eq!((notice.title.as_str(), notice.text.as_str()), ("Ann <Lee>", "Message 301"));
+    assert_eq!(notice.account.as_deref(), Some("work@studio.example"), "two accounts need telling apart");
+    assert_eq!(notice.opens, Opens { account: work, message: Some(person) });
+    let (size, centre) = picture_centre(notice.picture.as_ref().unwrap());
+    assert_eq!((size, centre[3]), (128, 255), "initials stand in for a logo");
+
+    // A sender with a logo shows it, and the newest of a few ends up on top.
+    notices.borrow_mut().clear();
+    let older = arrive(&work_inbox, "Linear", "n@linear.example", false);
+    let newer = arrive(&work_inbox, "Ann", "ann@gmail.com", false);
+    controller.on_event(work, Event::Arrived(vec![newer, older]));
+    let shown: Vec<_> = notices.borrow().iter().map(|n| n.opens.message).collect();
+    assert_eq!(shown, [Some(older), Some(newer)]);
+    let logo = notices.borrow()[0].picture.clone().unwrap();
+    assert_eq!(picture_centre(&logo).1, [94, 106, 210, 255]);
+
+    // A flood is one notice, naming a few senders once each.
+    notices.borrow_mut().clear();
+    let flood = ["Ann", "Ann", "Bob", "Cy", "Di"].map(|name| arrive(&work_inbox, name, "x@gmail.com", false));
+    controller.on_event(work, Event::Arrived(flood.to_vec()));
+    let summary = notices.borrow()[0].clone();
+    assert_eq!(notices.borrow().len(), 1);
+    assert_eq!((summary.title.as_str(), summary.text.as_str()), ("5 new emails", "Di, Cy, Bob"));
+    assert_eq!((summary.picture.as_ref(), summary.opens.message), (None, None));
+
+    // Nothing to tell, nothing shown.
+    notices.borrow_mut().clear();
+    controller.on_event(work, Event::Arrived(vec![read_elsewhere, junk]));
+    assert!(notices.borrow().is_empty());
+
+    // A click leads to the message, wherever the app was.
+    controller.select_account(0);
+    app.invoke_add_account();
+    controller.open(notice.opens);
+    assert!(!app.get_adding());
+    assert_eq!((app.get_active_account(), app.get_active_label()), (1, 0));
+    assert_eq!(controller.selected_message(), Some(person));
+    assert_eq!(app.get_message().sender, "Ann <Lee>");
+    assert_eq!(app.get_rows().row_data(app.get_selected_row() as usize).unwrap().sender, "Ann <Lee>");
+    settle();
+    shot(&app, "09-opened-from-notification");
+
+    // A summary leads to the Inbox, and an account since removed leads nowhere.
+    controller.select_label(1);
+    controller.open(summary.opens);
+    assert_eq!((app.get_active_label(), controller.selected_message()), (0, None));
+    controller.open(Opens { account: 999, message: Some(person) });
+    assert_eq!(app.get_active_account(), 1);
 
     // Removing an account: hovering offers it, and it takes a second click.
     let work_row_y = rows_y + 46.0 + 22.0;

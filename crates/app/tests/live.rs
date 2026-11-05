@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+use mailfunction::notify::{ACTIVATOR, APP_ID, Toasts};
 use mailfunction::webview::Webview;
 use mailfunction::{App, Controller, Pane, Theme, chrome};
 use mailfunction_core::remote::Offline;
@@ -22,18 +23,27 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::{ComponentHandle, Model, PhysicalSize};
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
 use webview2_com::{CapturePreviewCompletedHandler, take_pwstr};
+use windows::UI::Notifications::ToastNotificationManager;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
-use windows::Win32::System::Com::{STATFLAG_NONAME, STGC_DEFAULT, STREAM_SEEK_SET};
+use windows::Win32::System::Com::{
+    CLSCTX_LOCAL_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, STATFLAG_NONAME, STGC_DEFAULT,
+    STREAM_SEEK_SET,
+};
+use windows::Win32::UI::Notifications::INotificationActivationCallback;
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SHCreateMemStream, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetCursor, HTCLIENT, IDC_HAND, LoadCursorW, PostMessageW, SendMessageW, WM_MOUSEMOVE, WM_SETCURSOR,
+    GetClientRect, GetCursor, HTCLIENT, IDC_HAND, IsWindowVisible, LoadCursorW, PostMessageW, SendMessageW, WM_CLOSE,
+    WM_MOUSEMOVE, WM_SETCURSOR,
 };
-use windows::core::PWSTR;
+use windows::core::{HSTRING, PCWSTR, PWSTR};
 use wry::WebViewExtWindows;
 
-const DOVECOT_PORT: u16 = 14143;
+/// Another session may be using the usual port, so it can be moved.
+fn dovecot_port() -> u16 {
+    std::env::var("MAILFUNCTION_IMAP_PORT").map_or(14143, |port| port.parse().unwrap())
+}
 
 fn sleep(ms: u64) -> impl Future<Output = ()> {
     let (tx, rx) = mpsc::channel::<()>();
@@ -414,7 +424,7 @@ async fn clickable_things_show_the_hand(app: &App) {
 fn deliver(user: String, messages: Vec<Vec<u8>>) {
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", DOVECOT_PORT))
+            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", dovecot_port()))
                 .await
                 .expect("start Dovecot: scripts/test-imap.ps1");
             let mut client = async_imap::Client::new(tcp);
@@ -427,6 +437,27 @@ fn deliver(user: String, messages: Vec<Vec<u8>>) {
     })
     .join()
     .unwrap();
+}
+
+/// What Windows holds for the app, as each notification's XML.
+fn delivered_toasts() -> Vec<String> {
+    let history = ToastNotificationManager::History().unwrap();
+    let toasts = history.GetHistoryWithId(&HSTRING::from(APP_ID)).unwrap();
+    toasts.into_iter().map(|toast| toast.Content().unwrap().GetXml().unwrap().to_string()).collect()
+}
+
+fn clear_toasts() {
+    ToastNotificationManager::History().unwrap().ClearWithId(&HSTRING::from(APP_ID)).unwrap();
+}
+
+/// Does what the shell does for a click on a notification, from outside the app's process.
+fn click_toast(launch: &str) {
+    unsafe {
+        CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap();
+        let activator: INotificationActivationCallback = CoCreateInstance(&ACTIVATOR, None, CLSCTX_LOCAL_SERVER).unwrap();
+        let (app_id, launch) = (HSTRING::from(APP_ID), HSTRING::from(launch));
+        activator.Activate(PCWSTR(app_id.as_ptr()), PCWSTR(launch.as_ptr()), &[]).unwrap();
+    }
 }
 
 async fn scenario(app: App, dir: PathBuf, user: String, controller: Rc<Controller>, view: Rc<Webview>) {
@@ -518,7 +549,7 @@ async fn scenario(app: App, dir: PathBuf, user: String, controller: Rc<Controlle
         id: 0,
         email: email.into(),
         host: "127.0.0.1".into(),
-        port: DOVECOT_PORT,
+        port: dovecot_port(),
         security: Security::Plain,
         auth: AuthKind::Password,
     };
@@ -562,6 +593,82 @@ async fn scenario(app: App, dir: PathBuf, user: String, controller: Rc<Controlle
     })
     .await;
 
+    println!("notifications");
+    clear_toasts();
+    let mail = b"From: Linh Tran <linh@gmail.com>\r\nTo: me@example.com\r\nSubject: Lunch on Friday?\r\n\
+                 Message-ID: <lunch@x>\r\nDate: Wed, 04 Nov 2026 12:00:00 +0700\r\n\
+                 Content-Type: text/plain; charset=utf-8\r\n\r\nThe usual place.\r\n";
+    deliver(user.clone(), vec![mail.to_vec()]);
+    until("IDLE to notification", || !delivered_toasts().is_empty()).await;
+    let toasts = delivered_toasts();
+    assert_eq!(toasts.len(), 1, "{toasts:?}");
+    assert!(toasts[0].contains("Linh Tran") && toasts[0].contains("Lunch on Friday?"), "{}", toasts[0]);
+    let picture = toasts[0].split(r#"src=""#).nth(1).unwrap().split('"').next().unwrap();
+    assert!(std::path::Path::new(picture).exists(), "the picture Windows was given: {picture}");
+
+    let inbox = reader.labels(reader.accounts().unwrap()[0].id).unwrap()[0].id;
+    let lunch = reader.messages(inbox, 0, 100).unwrap().into_iter().find(|m| m.subject == "Lunch on Friday?").unwrap().id;
+    controller.select_label(1);
+    assert_ne!(controller.selected_message(), Some(lunch));
+    let launch = toasts[0].split(r#"launch=""#).nth(1).unwrap().split('"').next().unwrap();
+    let mut click = std::process::Command::new(std::env::current_exe().unwrap()).args(["--click", launch]).spawn().unwrap();
+    until("click to message", || controller.selected_message() == Some(lunch)).await;
+    assert!(click.wait().unwrap().success());
+    assert_eq!(app.get_active_label(), 0);
+    until("message on screen", || app.get_pane() == Pane::Text).await;
+    assert_eq!(app.get_message().subject, "Lunch on Friday?");
+    clear_toasts();
+
+    println!("the window closed");
+    let hwnd = window(&app);
+    let showing = || unsafe { IsWindowVisible(HWND(hwnd as _)) }.as_bool();
+    let close = || unsafe { PostMessageW(Some(HWND(hwnd as _)), WM_CLOSE, WPARAM(0), LPARAM(0)) }.unwrap();
+    let scale = app.window().scale_factor();
+    let width = (app.get_slot_x() * scale) as i32;
+    let height = ((app.get_slot_y() + app.get_slot_h()) * scale) as i32;
+    let list = (0, 0, width, height);
+    let page = ((app.get_slot_x() * scale) as i32, (app.get_slot_y() * scale) as i32, (app.get_slot_w() * scale) as i32, (app.get_slot_h() * scale) as i32);
+
+    // A page lets go of its browser while nobody can see it, and comes back with the window.
+    let messages = reader.messages(inbox, 0, 100).unwrap();
+    let newsletter = messages.iter().find(|m| m.subject.starts_with("Bản tin")).unwrap().id;
+    controller.select_row(reader.position(inbox, newsletter).unwrap().unwrap());
+    until("page on screen", || app.get_pane() == Pane::Html).await;
+    sleep(500).await;
+    let on_screen = grab(hwnd, page).unwrap();
+    close();
+    until("window gone", || !showing()).await;
+    assert!(bounds(&view).0 < 0, "the page stayed up behind a closed window");
+    sleep(800).await;
+    controller.reveal();
+    assert!(showing());
+    until("page back", || app.get_pane() == Pane::Html).await;
+    assert_eq!(controller.selected_message(), Some(newsletter));
+    assert_on_slot(&app, &view);
+    until("page painted", || grab(hwnd, page).is_some_and(|now| looks_like(&now, &on_screen))).await;
+
+    // Mail still arrives, is still announced, and is on screen when the window returns.
+    let list_before = grab(hwnd, list).unwrap();
+    close();
+    until("window gone", || !showing()).await;
+    let mail = b"From: Minh Pham <minh@gmail.com>\r\nTo: me@example.com\r\nSubject: Keys are at reception\r\n\
+                 Message-ID: <keys@x>\r\nDate: Wed, 04 Nov 2026 13:00:00 +0700\r\n\
+                 Content-Type: text/plain; charset=utf-8\r\n\r\nSee you there.\r\n";
+    deliver(user.clone(), vec![mail.to_vec()]);
+    until("IDLE to notification, window closed", || !delivered_toasts().is_empty()).await;
+    assert!(!showing(), "new mail opened the window");
+    let toast = delivered_toasts().remove(0);
+    assert!(toast.contains("Keys are at reception"), "{toast}");
+    let keys = reader.messages(inbox, 0, 100).unwrap().into_iter().find(|m| m.subject.starts_with("Keys")).unwrap().id;
+    let launch = toast.split(r#"launch=""#).nth(1).unwrap().split('"').next().unwrap();
+    let mut click = std::process::Command::new(std::env::current_exe().unwrap()).args(["--click", launch]).spawn().unwrap();
+    until("click to message, window closed", || showing() && controller.selected_message() == Some(keys)).await;
+    assert!(click.wait().unwrap().success());
+    until("message on screen", || app.get_pane() == Pane::Text).await;
+    assert_eq!(app.get_message().subject, "Keys are at reception");
+    until("list repainted", || grab(hwnd, list).is_some_and(|now| now != list_before)).await;
+    clear_toasts();
+
     secrets::delete(&user).unwrap();
     println!("all live checks passed");
 
@@ -575,8 +682,14 @@ async fn scenario(app: App, dir: PathBuf, user: String, controller: Rc<Controlle
 }
 
 fn main() {
-    if std::env::args().any(|a| a == "--list") {
+    let args: Vec<_> = std::env::args().collect();
+    if args.iter().any(|a| a == "--list") {
         return;
+    }
+    if let [_, flag, launch] = args.as_slice()
+        && flag == "--click"
+    {
+        return click_toast(launch);
     }
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
     let user = format!("live-{nanos}");
@@ -591,7 +704,7 @@ fn main() {
                 id: 0,
                 email: user.clone(),
                 host: "127.0.0.1".into(),
-                port: DOVECOT_PORT,
+                port: dovecot_port(),
                 security: Security::Plain,
                 auth: AuthKind::Password,
             })
@@ -601,7 +714,8 @@ fn main() {
 
     let app = App::new().unwrap();
     let view = Rc::new(Webview::new(dir.join("webview")));
-    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(view.clone()), Arc::new(Offline)).unwrap();
+    let toasts = Box::new(Toasts::new(&dir));
+    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(view.clone()), toasts, Arc::new(Offline)).unwrap();
     controller.load_accounts().unwrap();
     app.show().unwrap();
     chrome::set_icon(&app);
