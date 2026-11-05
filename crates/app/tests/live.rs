@@ -4,10 +4,10 @@
 //! its own window, and moves nothing on the desktop. Run with `scripts/test-imap.ps1`.
 
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -15,10 +15,11 @@ use std::time::{Duration, Instant};
 
 use mailfunction::notify::{ACTIVATOR, APP_ID, Toasts};
 use mailfunction::webview::Webview;
-use mailfunction::{App, Controller, Pane, Theme, Verb, chrome};
-use mailfunction_core::remote::Offline;
+use mailfunction::{App, Controller, ImageBar, Pane, Theme, Verb, chrome};
+use mailfunction_core::remote::{Logo, Network};
 use mailfunction_core::render;
 use mailfunction_core::secrets;
+use mailfunction_core::settings::{Appearance, Settings, TextSize};
 use mailfunction_core::store::{Account, AuthKind, Reader, Security, Store};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::{ComponentHandle, Model, PhysicalSize};
@@ -240,10 +241,8 @@ fn window(app: &App) -> isize {
 
 type Frame = Vec<u8>;
 
-/// A coarse grid of colours over part of a window, webview included. Read-only. Colour matters:
-/// a page fading in from white passes through the brightness of any darker page.
-fn grab(hwnd: isize, (x, y, width, height): (i32, i32, i32, i32)) -> Option<Frame> {
-    const GRID: i32 = 24;
+/// The window's whole client area, webview included, as blue, green, red and a spare byte.
+fn client_pixels(hwnd: isize) -> Option<(i32, i32, Vec<u8>)> {
     let hwnd = HWND(hwnd as _);
     unsafe {
         let mut client = RECT::default();
@@ -267,16 +266,70 @@ fn grab(hwnd: isize, (x, y, width, height): (i32, i32, i32, i32)) -> Option<Fram
         let _ = DeleteObject(bitmap.into());
         let _ = DeleteDC(memory);
         ReleaseDC(Some(hwnd), dc);
-        let mut frame = Vec::with_capacity((GRID * GRID * 3) as usize);
-        for row in 0..GRID {
-            for column in 0..GRID {
-                let px = (x + width * column / GRID).min(w - 1);
-                let py = (y + height * row / GRID).min(h - 1);
-                let at = ((py * w + px) * 4) as usize;
-                frame.extend_from_slice(&pixels[at..at + 3]);
-            }
+        Some((w, h, pixels))
+    }
+}
+
+/// A coarse grid of colours over part of a window. Read-only. Colour matters: a page fading in
+/// from white passes through the brightness of any darker page.
+fn grab(hwnd: isize, (x, y, width, height): (i32, i32, i32, i32)) -> Option<Frame> {
+    const GRID: i32 = 24;
+    let (w, h, pixels) = client_pixels(hwnd)?;
+    let mut frame = Vec::with_capacity((GRID * GRID * 3) as usize);
+    for row in 0..GRID {
+        for column in 0..GRID {
+            let px = (x + width * column / GRID).min(w - 1);
+            let py = (y + height * row / GRID).min(h - 1);
+            let at = ((py * w + px) * 4) as usize;
+            frame.extend_from_slice(&pixels[at..at + 3]);
         }
-        Some(frame)
+    }
+    Some(frame)
+}
+
+/// Saves the window as it really is on screen, to `target/ui`.
+fn save_window(hwnd: isize, name: &str) {
+    let (w, h, mut pixels) = client_pixels(hwnd).unwrap();
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+        pixel[3] = 255;
+    }
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = std::fs::File::create(dir.join(format!("{name}.png"))).unwrap();
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.write_header().unwrap().write_image_data(&pixels).unwrap();
+}
+
+/// How much of the window is the red of [`RED_DOT`], in pixels.
+fn red_pixels(hwnd: isize) -> usize {
+    let (.., pixels) = client_pixels(hwnd).unwrap();
+    pixels.chunks_exact(4).filter(|p| p[2] > 240 && p[1] < 20 && p[0] < 20).count()
+}
+
+/// How bright the top left of the list is, which is sheet and nothing else.
+fn sheet_brightness(hwnd: isize, app: &App) -> u32 {
+    let (w, _, pixels) = client_pixels(hwnd).unwrap();
+    let s = app.window().scale_factor();
+    let at = (((20.0 * s) as i32 * w + (app.get_slot_x() * s) as i32 - (30.0 * s) as i32) * 4) as usize;
+    pixels[at..at + 3].iter().map(|c| u32::from(*c)).sum()
+}
+
+const RED_DOT: &str = "data:image/gif;base64,R0lGODlhAQABAIAAAP8AAP8AACwAAAAAAQABAAACAkQBADs=";
+
+/// Answers for one image. The real fetcher refuses a loopback address, so nothing local could
+/// stand in for a sender's server.
+struct RedDot;
+
+impl Network for RedDot {
+    fn images(&self, urls: &[String]) -> HashMap<String, String> {
+        urls.iter().map(|url| (url.clone(), RED_DOT.to_string())).collect()
+    }
+
+    fn logo(&self, _: &str) -> Logo {
+        Logo::Unknown
     }
 }
 
@@ -480,6 +533,107 @@ fn delivered_to_mailpit(subject: &str) -> usize {
     body.split("\"ID\"").count() - 1
 }
 
+/// The message as mailpit received it, headers and all.
+fn received_by_mailpit(subject: &str) -> String {
+    let url = format!("http://127.0.0.1:18025/api/v1/search?query=subject:{subject}");
+    let found = ureq::get(&url).call().unwrap().body_mut().read_to_string().unwrap();
+    let id = found.split("\"ID\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    let url = format!("http://127.0.0.1:18025/api/v1/message/{id}/raw");
+    ureq::get(&url).call().unwrap().body_mut().read_to_string().unwrap()
+}
+
+/// What only a real desktop can show about the settings.
+async fn settings(app: &App, controller: &Rc<Controller>, view: &Rc<Webview>, user: &str, dir: &Path) {
+    println!("settings");
+    let hwnd = window(app);
+    let change = async |edit: fn(&mut Settings)| {
+        let mut settings = Settings::from(app.global::<Theme>().get_preferences());
+        edit(&mut settings);
+        app.global::<Theme>().set_preferences(settings.into());
+        sleep(150).await;
+        assert_eq!(controller.settings(), settings);
+    };
+
+    println!("  a page does not cover the screen");
+    let before = app.get_rows().row_count();
+    let mail = b"From: Brand <news@brand.example>\r\nTo: me@example.com\r\nSubject: Remote picture\r\n\
+                 Message-ID: <picture@x>\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
+                 <img width=\"160\" height=\"160\" src=\"https://images.example/dot.gif\">\r\n";
+    deliver(user.to_string(), vec![mail.to_vec()]);
+    until("picture mail", || app.get_rows().row_count() == before + 1).await;
+    controller.select_row(0);
+    until("page up, images blocked", || app.get_pane() == Pane::Html && app.get_image_bar() == ImageBar::Blocked).await;
+    sleep(400).await;
+    assert_eq!(red_pixels(hwnd), 0, "an image got in without being asked for");
+    controller.open_settings();
+    assert!(bounds(view).0 < 0, "the page stayed up over the settings");
+    app.set_settings_page(1);
+    sleep(400).await;
+    save_window(hwnd, "live-settings");
+
+    println!("  show all images");
+    change(|s| s.show_all_images = true).await;
+    controller.close_settings();
+    until("page back", || app.get_pane() == Pane::Html).await;
+    assert_eq!(app.get_image_bar(), ImageBar::Hidden);
+    until("the picture on the page", || red_pixels(hwnd) > 1000).await;
+    let medium = red_pixels(hwnd);
+    save_window(hwnd, "live-all-images");
+
+    println!("  text size zooms the page");
+    controller.open_settings();
+    change(|s| s.text_size = TextSize::Large).await;
+    controller.close_settings();
+    until("page back", || app.get_pane() == Pane::Html).await;
+    until("the picture grows with the text", || red_pixels(hwnd) as f32 > medium as f32 * 1.25).await;
+    controller.open_settings();
+    change(|s| {
+        s.text_size = TextSize::Medium;
+        s.show_all_images = false;
+    })
+    .await;
+    controller.close_settings();
+    until("back to blocked", || app.get_image_bar() == ImageBar::Blocked).await;
+
+    println!("  appearance");
+    let dark = {
+        change(|s| s.appearance = Appearance::Dark).await;
+        sleep(400).await;
+        save_window(hwnd, "live-dark");
+        sheet_brightness(hwnd, app)
+    };
+    change(|s| s.appearance = Appearance::Light).await;
+    sleep(400).await;
+    let light = sheet_brightness(hwnd, app);
+    assert!(dark < 150 && light > 600, "dark {dark}, light {light}");
+    change(|s| s.appearance = Appearance::System).await;
+    sleep(400).await;
+    assert!([dark, light].contains(&sheet_brightness(hwnd, app)));
+
+    println!("  name, signature and no undo, as received");
+    controller.open_settings();
+    app.invoke_identity_edited(0, "Kong Nguyễn".into(), "Sent from afar".into(), true);
+    change(|s| s.undo_send_seconds = 0).await;
+    controller.close_settings();
+    let subject = format!("livesigned{}", std::process::id());
+    app.invoke_verb(Verb::Compose);
+    assert!(app.get_draft_body().contains("Sent from afar"));
+    app.set_draft_to("someone@example.com".into());
+    app.set_draft_subject(subject.as_str().into());
+    let sent = Instant::now();
+    app.invoke_send_draft();
+    assert_eq!(app.get_notice_action(), "");
+    until("gone with no wait", || delivered_to_mailpit(&subject) == 1).await;
+    assert!(sent.elapsed() < Duration::from_secs(5), "it waited: {:?}", sent.elapsed());
+    let raw = received_by_mailpit(&subject);
+    assert!(raw.contains("=?utf-8?b?S29uZyBOZ3V54buFbg==?=") || raw.contains("Kong Nguyễn"), "{raw}");
+    assert!(raw.contains(&format!("<{user}>")), "{raw}");
+    assert!(raw.contains("-- \r\nSent from afar"), "{raw}");
+    println!("  and in the store");
+    assert_eq!(Reader::open(dir).unwrap().settings(), controller.settings());
+    change(|s| s.undo_send_seconds = 10).await;
+}
+
 /// A day's actions from the real window, each one checked on the real server.
 async fn daily_use(app: &App, controller: &Rc<Controller>, user: &str) {
     println!("daily use");
@@ -583,13 +737,18 @@ async fn scenario(app: App, dir: PathBuf, user: String, controller: Rc<Controlle
     capture(&view, "live-newsletter.png").await;
 
     // Dark mode: the page follows the theme, and the title bar follows the app.
-    app.global::<Theme>().set_dark(true);
+    let appearance = |choice: Appearance| {
+        let theme = app.global::<Theme>();
+        let settings = Settings { appearance: choice, ..theme.get_preferences().into() };
+        theme.set_preferences(settings.into());
+    };
+    appearance(Appearance::Dark);
     view.with_view(|v| v.set_theme(wry::Theme::Dark).unwrap());
     controller.select_row(0);
     until("HTML message shown in dark mode", || app.get_pane() == Pane::Html).await;
     sleep(1500).await;
     capture(&view, "live-newsletter-dark.png").await;
-    app.global::<Theme>().set_dark(false);
+    appearance(Appearance::Light);
     view.with_view(|v| v.set_theme(wry::Theme::Light).unwrap());
     sleep(1500).await;
 
@@ -757,6 +916,8 @@ async fn scenario(app: App, dir: PathBuf, user: String, controller: Rc<Controlle
     until("list repainted", || grab(hwnd, list).is_some_and(|now| now != list_before)).await;
     clear_toasts();
 
+    settings(&app, &controller, &view, &user, &dir).await;
+
     secrets::delete(&user).unwrap();
     println!("all live checks passed");
 
@@ -806,7 +967,7 @@ fn main() {
     let app = App::new().unwrap();
     let view = Rc::new(Webview::new(dir.join("webview")));
     let toasts = Box::new(Toasts::new(&dir));
-    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(view.clone()), toasts, Arc::new(Offline)).unwrap();
+    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(view.clone()), toasts, Arc::new(RedDot)).unwrap();
     controller.load_accounts().unwrap();
     app.show().unwrap();
     chrome::set_icon(&app);

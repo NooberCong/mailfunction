@@ -416,7 +416,7 @@ fn the_whole_window() {
     assert_eq!(app.get_active_label(), 0);
 
     // A click on an account's row switches to it, and the pointer finds the row by its place.
-    let rows_y = 760.0 - 8.0 - 36.0 - 2.0 * 46.0;
+    let rows_y = 760.0 - 8.0 - 2.0 * 36.0 - 2.0 * 46.0;
     click(&app, 90.0, rows_y + 22.0);
     assert_eq!(app.get_active_account(), 0);
     assert_eq!(app.get_rows().row_count(), MAIL.len() + 1);

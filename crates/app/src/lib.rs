@@ -9,6 +9,8 @@ pub mod instance;
 pub mod list;
 pub mod logos;
 pub mod notify;
+mod settings;
+pub mod startup;
 pub mod tray;
 pub mod webview;
 mod writing;
@@ -27,6 +29,7 @@ use mailfunction_core::remote::Network;
 use mailfunction_core::{logo, oauth, secrets};
 use mailfunction_core::compose;
 use mailfunction_core::render::{self, Body, Rendered};
+use mailfunction_core::settings::{Identity, MarkRead, Settings};
 use mailfunction_core::store::{Account, AuthKind, LabelRow, MessageRow, Reader, Role, Security, Store};
 use notify::{Notice, Notifier, Opens};
 use slint::{CloseRequestResponse, Color, ComponentHandle, Image, Model, ModelRc, Timer, TimerMode, VecModel};
@@ -109,6 +112,15 @@ enum Link {
 struct Mailbox {
     account: Account,
     link: Link,
+    identity: Identity,
+    /// The identity has changes the store has not seen yet.
+    unsaved: bool,
+}
+
+impl Mailbox {
+    fn new(account: Account, identity: Identity) -> Self {
+        Self { account, link: Link::Quiet, identity, unsaved: false }
+    }
 }
 
 pub struct Controller {
@@ -158,6 +170,10 @@ pub struct Controller {
     engine: RefCell<Option<Engine>>,
     client: Option<oauth::Client>,
     refresh: Timer,
+    settings: Cell<Settings>,
+    /// The thread to go back to when the settings close.
+    returning_to: Cell<Option<i64>>,
+    identity_save: Timer,
 }
 
 impl Controller {
@@ -171,7 +187,11 @@ impl Controller {
     ) -> mailfunction_core::Result<Rc<Self>> {
         let store = Arc::new(Store::open(dir)?);
         let reader = Rc::new(Reader::open(dir)?);
+        let settings = reader.settings();
+        app.global::<Theme>().set_preferences(settings.into());
+        app.set_version(env!("CARGO_PKG_VERSION").into());
         let logos = Rc::new(Logos::new(reader.clone(), &store, network.clone(), app.as_weak()));
+        logos.set_enabled(settings.sender_logos);
         let list = Rc::new(MessageList::new(reader.clone(), logos.clone()));
         app.set_rows(ModelRc::from(list.clone()));
         let label_items = Rc::new(VecModel::default());
@@ -221,6 +241,9 @@ impl Controller {
             engine: RefCell::default(),
             client,
             refresh: Timer::default(),
+            settings: Cell::new(settings),
+            returning_to: Cell::new(None),
+            identity_save: Timer::default(),
         });
         CONTROLLER.with(|c| *c.borrow_mut() = Rc::downgrade(&this));
         this.connect_callbacks();
@@ -278,6 +301,7 @@ impl Controller {
 
     fn connect_callbacks(self: &Rc<Self>) {
         self.connect_mail_callbacks();
+        self.connect_settings_callbacks();
         let weak = Rc::downgrade(self);
         self.app.window().on_close_requested(move || {
             if let Some(this) = weak.upgrade() {
@@ -374,8 +398,12 @@ impl Controller {
 
     /// Reads the accounts from the store and shows the first.
     pub fn load_accounts(&self) -> mailfunction_core::Result<()> {
-        let accounts = self.reader.accounts()?;
-        *self.accounts.borrow_mut() = accounts.into_iter().map(|account| Mailbox { account, link: Link::Quiet }).collect();
+        let mut mailboxes = Vec::new();
+        for account in self.reader.accounts()? {
+            let identity = self.reader.identity(account.id)?;
+            mailboxes.push(Mailbox::new(account, identity));
+        }
+        *self.accounts.borrow_mut() = mailboxes;
         self.show_first();
         Ok(())
     }
@@ -433,7 +461,7 @@ impl Controller {
         }
         {
             let mut accounts = self.accounts.borrow_mut();
-            let mailbox = Mailbox { account, link: Link::Quiet };
+            let mailbox = Mailbox::new(account, self.reader.identity(id)?);
             match accounts.iter_mut().find(|m| m.account.id == id) {
                 Some(existing) => *existing = mailbox,
                 None => accounts.push(mailbox),
@@ -465,6 +493,9 @@ impl Controller {
             let _ = secrets::delete(&removed.email);
             let _ = store.remove_account(removed.id);
         });
+        if self.accounts.borrow().is_empty() {
+            self.leave_settings();
+        }
         if self.shown.get() == Some(removed.id) {
             self.show_first();
         } else {
@@ -577,23 +608,30 @@ impl Controller {
     /// Tells the user about new mail. Only unread Inbox mail is news: the rest is their own sent
     /// mail, spam, or mail they have already read somewhere else.
     fn announce(&self, account: i64, arrived: &[i64]) {
+        let settings = self.settings.get();
         let messages = self.reader.unread_in_inbox(arrived).unwrap_or_default();
         let accounts = self.accounts.borrow();
         let Some(mailbox) = accounts.iter().find(|m| m.account.id == account) else { return };
+        if !settings.notifications || !mailbox.identity.notify || messages.is_empty() {
+            return;
+        }
         let address = (accounts.len() > 1).then(|| mailbox.account.email.clone());
-        if messages.len() > MOST_NOTICES {
+        let silent = !settings.notification_sound;
+        if messages.len() > MOST_NOTICES || !settings.notification_preview {
             let mut senders: Vec<&str> = Vec::new();
-            for name in messages.iter().map(display_name) {
+            for name in messages.iter().map(display_name).filter(|_| settings.notification_preview) {
                 if senders.len() < SENDERS_NAMED && !senders.contains(&name) {
                     senders.push(name);
                 }
             }
+            let one = (messages.len() == 1).then(|| messages[0].id);
             self.notifier.show(&Notice {
-                title: format!("{} new emails", messages.len()),
+                title: if one.is_some() { "New email".into() } else { format!("{} new emails", messages.len()) },
                 text: senders.join(", "),
                 account: address,
                 picture: None,
-                opens: Opens { account, message: None },
+                silent,
+                opens: Opens { account, message: one },
             });
             return;
         }
@@ -605,6 +643,7 @@ impl Controller {
                 text: view.subject.to_string(),
                 account: address.clone(),
                 picture: self.sender_picture(message, &view),
+                silent,
                 opens: Opens { account, message: Some(message.id) },
             });
         }
@@ -623,11 +662,16 @@ impl Controller {
         })
     }
 
-    /// Closing the window leaves the app running, so that mail keeps arriving. The browser goes,
-    /// as it is most of the app's memory and nobody is looking at it.
+    /// Closing the window leaves the app running, so that mail keeps arriving, unless the user
+    /// would rather it did not. The browser goes either way, as it is most of the app's memory
+    /// and nobody is looking at it.
     fn close_window(&self) {
+        self.save_identities();
         chrome::hide(&self.app);
         self.pane.hide();
+        if !self.settings.get().keep_running {
+            let _ = slint::quit_event_loop();
+        }
     }
 
     /// Brings the window up, opening again the page that closing it let go of.
@@ -649,6 +693,7 @@ impl Controller {
             return;
         }
         self.app.set_adding(false);
+        self.leave_settings();
         self.finish_writing();
         self.close_search();
         if self.shown.get() != Some(opens.account) {
@@ -698,6 +743,9 @@ impl Controller {
                     Link::SignedOut(_) => "Needs sign-in".into(),
                     Link::Quiet | Link::Syncing => "".into(),
                 },
+                name: m.identity.name.as_str().into(),
+                signature: m.identity.signature.as_str().into(),
+                notify: m.identity.notify,
             })
             .collect();
         update_rows(&self.account_items, items);
@@ -710,9 +758,14 @@ impl Controller {
 
     fn show_badge(&self) {
         if let Some(hwnd) = chrome::hwnd(&self.app) {
-            self.badge.show(hwnd, self.unread.get());
-            self.tray.show(hwnd, self.unread.get());
+            self.badge.show(hwnd, self.taskbar_count());
+            self.tray.show(hwnd, self.taskbar_count());
         }
+    }
+
+    /// The number on the taskbar and in the notification area.
+    pub fn taskbar_count(&self) -> i64 {
+        if self.settings.get().taskbar_count { self.unread.get() } else { 0 }
     }
 
     /// Puts the count back on a taskbar button that has just appeared.
@@ -878,8 +931,13 @@ impl Controller {
         *self.thread.borrow_mut() = thread;
         self.publish_thread();
         self.open_at(index);
+        let delay = match self.settings.get().mark_read {
+            MarkRead::OnOpening => actions::READ_DELAY,
+            MarkRead::AfterAWhile => actions::READ_LATER,
+            MarkRead::Never => return,
+        };
         let weak = Rc::downgrade(self);
-        self.read_timer.start(TimerMode::SingleShot, actions::READ_DELAY, move || {
+        self.read_timer.start(TimerMode::SingleShot, delay, move || {
             if let Some(this) = weak.upgrade() {
                 this.mark_read();
             }
@@ -977,8 +1035,12 @@ impl Controller {
         };
         if rendered.remote_images.is_empty() {
             self.display(rendered, ImageBar::Hidden);
+        } else if self.all_images_load(id) {
+            self.app.set_pane(Pane::Loading);
+            self.fetch_images(id, rendered.remote_images);
         } else if self.sender_allowed() {
             self.app.set_pane(Pane::Loading);
+            self.app.set_image_bar(ImageBar::Loading);
             self.fetch_images(id, rendered.remote_images);
         } else {
             self.display(rendered, ImageBar::Blocked);
@@ -990,11 +1052,20 @@ impl Controller {
         self.shown.get().is_some_and(|account| self.reader.images_allowed(account, &sender).unwrap_or(false))
     }
 
+    /// Images load without asking, except in Spam, where loading one tells a spammer the address
+    /// is read. Searches reach Spam too, so this goes by the message and not by the list on show.
+    fn all_images_load(&self, id: i64) -> bool {
+        let held = self.reader.message_labels(id).unwrap_or_default();
+        let spam = self.labels.borrow().iter().any(|l| l.role == Role::Spam && held.contains(&l.id));
+        self.settings.get().show_all_images && !spam
+    }
+
     /// Fetches the selected message's images, because the user asked for them.
     fn load_images(&self) {
         let Some(id) = self.selected.get() else { return };
         let rendered = self.reader.body(id).ok().flatten().and_then(|raw| render::message(&raw));
         if let Some(rendered) = rendered {
+            self.app.set_image_bar(ImageBar::Loading);
             self.fetch_images(id, rendered.remote_images);
         }
     }
@@ -1011,7 +1082,6 @@ impl Controller {
 
     /// The webview has no network, so the images are fetched here and go in as `data:` URLs.
     fn fetch_images(&self, id: i64, urls: Vec<String>) {
-        self.app.set_image_bar(ImageBar::Loading);
         let network = self.network.clone();
         std::thread::spawn(move || {
             let images = network.images(&urls);
@@ -1026,7 +1096,7 @@ impl Controller {
         }
         let rendered = self.reader.body(id).ok().flatten().and_then(|raw| render::message_with_images(&raw, images));
         let Some(rendered) = rendered else { return };
-        let bar = match (images.is_empty(), self.sender_allowed()) {
+        let bar = match (images.is_empty(), !self.all_images_load(id) && self.sender_allowed()) {
             (true, _) => ImageBar::Failed,
             (false, true) => ImageBar::Allowed,
             (false, false) => ImageBar::Hidden,

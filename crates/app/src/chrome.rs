@@ -97,6 +97,8 @@ pub(crate) fn raise(app: &App) -> bool {
     let Some(hwnd) = hwnd(app) else { return false };
     unsafe {
         let hidden = !IsWindowVisible(hwnd).as_bool();
+        // A window started in the background has yet to be shown even once, which is Slint's job.
+        let _ = app.show();
         if hidden {
             let _ = ShowWindow(hwnd, SW_SHOW);
         }

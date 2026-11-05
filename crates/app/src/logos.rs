@@ -2,7 +2,7 @@
 //! at once from memory or the store, and anything missing is looked up in the background. Until
 //! then the row shows initials, and if the lookup finds nothing it keeps them.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
@@ -66,6 +66,8 @@ pub struct Logos {
     network: Arc<dyn Network>,
     window: slint::Weak<App>,
     queue: Arc<Queue>,
+    /// Off means nothing is shown and nobody is asked.
+    enabled: Cell<bool>,
     /// Each domain is looked up at most once a run, however often its rows are drawn.
     asked: RefCell<HashSet<String>>,
     /// Finished images by domain and size in physical pixels. Empty for a domain with no logo.
@@ -80,13 +82,21 @@ impl Logos {
             network,
             window,
             queue: Arc::default(),
+            enabled: Cell::new(true),
             asked: RefCell::default(),
             images: RefCell::default(),
         }
     }
 
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.set(enabled);
+    }
+
     /// A domain's logo for an avatar of `size` logical pixels, or an empty image if there is none.
     pub fn image(&self, domain: &str, size: f32) -> Image {
+        if !self.enabled.get() {
+            return Image::default();
+        }
         self.look_up(domain);
         self.stored(domain, size)
     }
@@ -99,6 +109,9 @@ impl Logos {
 
     /// What the store has for a domain, asking in the background if that may be out of date.
     fn look_up(&self, domain: &str) -> Option<Vec<u8>> {
+        if !self.enabled.get() {
+            return None;
+        }
         let known = self.reader.logo(domain).ok().flatten();
         if known.as_ref().is_none_or(|(_, checked)| now() - checked > RECHECK_SECONDS) {
             self.ask(domain);

@@ -14,6 +14,8 @@ const NOTICE_TIME: Duration = Duration::from_secs(6);
 /// How long a thread must stay open to count as read, so that moving through the list does not
 /// read everything on the way past.
 pub(crate) const READ_DELAY: Duration = Duration::from_millis(400);
+/// The same, for someone who would rather decide after a look at it.
+pub(crate) const READ_LATER: Duration = Duration::from_secs(3);
 /// A pause in typing long enough to be worth a search.
 const SEARCH_DELAY: Duration = Duration::from_millis(220);
 const SEARCH_RESULTS: usize = 200;
@@ -92,7 +94,7 @@ impl Controller {
             }
             None => {
                 let count = self.list.row_count();
-                if count == 0 || row < 0 {
+                if count == 0 || row < 0 || !self.settings.get().open_next {
                     self.clear_message();
                 } else {
                     let next = (row as usize).min(count - 1);

@@ -3,6 +3,7 @@
 
 use mailfunction_core::compose::{Attachment, Compose};
 use mailfunction_core::ops::Triage;
+use mailfunction_core::settings::{Identity, Settings};
 use mailfunction_core::store::{Account, AuthKind, Change, Folder, LabelRow, LabelSpec, NewMessage, Reader, Role, Security, Store};
 
 struct Fixture {
@@ -556,6 +557,8 @@ fn a_store_from_before_the_queue_migrates_with_its_mail() {
     assert_eq!(rows.iter().map(|m| (m.subject.as_str(), m.count)).collect::<Vec<_>>(), [("Second", 2), ("Alone", 1)]);
     assert_eq!(reader.search(account.id, "alone", 10).unwrap().len(), 1, "headers are indexed");
     assert_eq!(reader.search(account.id, "past", 10).unwrap()[0].subject, "Second", "and bodies already here");
+    assert_eq!(reader.settings(), Settings::default());
+    assert_eq!(reader.identity(account.id).unwrap(), Identity::default());
     drop((store, reader));
     let _ = std::fs::remove_dir_all(&dir);
 }

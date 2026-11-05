@@ -8,10 +8,30 @@ struct Tone {
     ink: color,
 }
 
+/// What the user has chosen. The numbered ones are the options of their `Choice`.
+export struct Preferences {
+    appearance: int,
+    compact-list: bool,
+    start-with-windows: bool,
+    keep-running: bool,
+    show-all-images: bool,
+    sender-logos: bool,
+    text-size: int,
+    mark-read: int,
+    open-next: bool,
+    undo-send: int,
+    offline-messages: int,
+    notifications: bool,
+    notification-sound: bool,
+    notification-preview: bool,
+    taskbar-count: bool,
+}
+
 export global Theme {
     in-out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
     /// Off when Windows is set not to show animations.
     in-out property <bool> motion: true;
+    in-out property <Preferences> preferences;
 
     // The frame: title bar, sidebar and sign-in. The title bar is painted to match `frame-top`.
     out property <color> frame-top: dark ? #5c1524 : #b01730;
@@ -54,7 +74,7 @@ export global Theme {
 
     out property <length> small: 11.5px;
     out property <length> body: 13px;
-    out property <length> reading: 14px;
+    out property <length> reading: preferences.text-size == 0 ? 13px : preferences.text-size == 2 ? 16px : 14px;
     out property <length> heading: 20px;
     out property <length> title: 22px;
 
@@ -62,7 +82,7 @@ export global Theme {
     out property <duration> glide: motion ? 170ms : 0ms;
     out property <duration> settle: motion ? 220ms : 0ms;
 
-    out property <length> row: 68px;
+    out property <length> row: preferences.compact-list ? 56px : 68px;
     out property <length> rail-step: 38px;
     out property <length> rail-gap: 18px;
     out property <length> gutter: 36px;
@@ -96,6 +116,9 @@ export struct AccountItem {
     logo: image,
     unread: string,
     status: string,
+    name: string,
+    signature: string,
+    notify: bool,
 }
 
 export enum Pane { empty, loading, text, html, failed }
@@ -426,8 +449,11 @@ component AccountRow inherits Rectangle {
     }
 }
 
-component AddAccount inherits Rectangle {
+/// A quiet line at the foot of the sidebar.
+component RailAction inherits Rectangle {
     in property <bool> compact;
+    in property <string> icon;
+    in property <string> text;
     callback clicked <=> touch.clicked;
 
     height: 36px;
@@ -448,11 +474,11 @@ component AddAccount inherits Rectangle {
                 width: 18px;
                 height: 18px;
                 tint: Theme.on-frame-muted;
-                commands: "M12 5v14M5 12h14";
+                commands: root.icon;
             }
         }
         if !root.compact: Text {
-            text: "Add account";
+            text: root.text;
             color: Theme.on-frame-muted;
             font-size: Theme.small;
             vertical-alignment: center;
@@ -510,6 +536,7 @@ component Rail inherits Rectangle {
     callback select-account(int);
     callback remove-account(int);
     callback add-account();
+    callback open-settings();
     callback compose();
 
     private property <length> account-step: 46px;
@@ -584,9 +611,22 @@ component Rail inherits Rectangle {
         HorizontalLayout {
             padding-left: 12px;
             padding-right: 12px;
-            AddAccount {
+            RailAction {
                 compact: root.compact;
+                icon: "M12 5v14M5 12h14";
+                text: "Add account";
                 clicked => { root.add-account(); }
+            }
+        }
+
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            RailAction {
+                compact: root.compact;
+                icon: "M4 7h9M17 7h3M4 17h3M11 17h9M15 5v4M9 15v4";
+                text: "Settings";
+                clicked => { root.open-settings(); }
             }
         }
     }
@@ -753,6 +793,39 @@ component GoogleMark inherits Rectangle {
     }
 }
 
+component BackButton inherits Rectangle {
+    callback clicked <=> touch.clicked;
+
+    width: 84px;
+    height: 34px;
+    border-radius: 9px;
+    background: touch.has-hover ? Theme.frame-hover : transparent;
+    animate background { duration: Theme.fast; }
+
+    HorizontalLayout {
+        alignment: center;
+        spacing: 6px;
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                width: 16px;
+                height: 16px;
+                tint: Theme.on-frame;
+                commands: "M19 12H5M11 18l-6-6 6-6";
+            }
+        }
+        Text {
+            text: "Back";
+            color: Theme.on-frame;
+            font-size: Theme.body;
+            font-weight: 500;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := Press { }
+}
+
 component SignIn inherits Rectangle {
     in property <string> message;
     in property <bool> enabled;
@@ -833,37 +906,10 @@ component SignIn inherits Rectangle {
         }
     }
 
-    if root.can-go-back: Rectangle {
+    if root.can-go-back: BackButton {
         x: 12px;
         y: 10px;
-        width: 84px;
-        height: 34px;
-        border-radius: 9px;
-        background: back.has-hover ? Theme.frame-hover : transparent;
-        animate background { duration: Theme.fast; }
-        HorizontalLayout {
-            alignment: center;
-            spacing: 6px;
-            VerticalLayout {
-                alignment: center;
-                Icon {
-                    width: 16px;
-                    height: 16px;
-                    tint: Theme.on-frame;
-                    commands: "M19 12H5M11 18l-6-6 6-6";
-                }
-            }
-            Text {
-                text: "Back";
-                color: Theme.on-frame;
-                font-size: Theme.body;
-                font-weight: 500;
-                vertical-alignment: center;
-            }
-        }
-        back := Press {
-            clicked => { root.back(); }
-        }
+        clicked => { root.back(); }
     }
 }
 
@@ -901,6 +947,7 @@ component Sheet inherits Rectangle {
 /// icon's points instead, and the path is only rebuilt while syncing.
 component BarAction inherits Rectangle {
     in property <string> text;
+    out property <bool> hovered: touch.has-hover;
     callback clicked <=> touch.clicked;
 
     width: label.preferred-width + 20px;
@@ -1723,7 +1770,7 @@ component KeysHelp inherits Panel {
     title: "Keyboard";
 
     Flickable {
-        content-height: 25 * 25px;
+        content-height: 26 * 25px;
 
         for entry[index] in [
             { key: "j  k", what: "Next, previous thread" },
@@ -1747,6 +1794,7 @@ component KeysHelp inherits Panel {
             { key: "g a", what: "Go to All Mail" },
             { key: "Ctrl 1-9", what: "Switch account" },
             { key: "Ctrl Enter", what: "Send" },
+            { key: "Ctrl ,", what: "Settings" },
             { key: "Esc", what: "Close or go back" },
             { key: "?", what: "This list" },
         ]: Rectangle {
@@ -1879,6 +1927,503 @@ component NoMail inherits Sheet {
     }
 }
 
+/// An on or off, drawn by its row, which is what takes the click.
+component Switch inherits Rectangle {
+    in property <bool> on;
+
+    width: 34px;
+    height: 20px;
+    border-radius: 10px;
+    background: root.on ? Theme.accent : Theme.dark ? #4a3b3e : #d9cbcd;
+    animate background { duration: Theme.fast; }
+
+    Rectangle {
+        x: root.on ? 16px : 2px;
+        y: 2px;
+        width: 16px;
+        height: 16px;
+        border-radius: 8px;
+        background: #ffffff;
+        animate x { duration: Theme.fast; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+    }
+}
+
+struct ChoiceOption {
+    label: string,
+    value: int,
+}
+
+/// One of a few, all in view.
+component Choice inherits Rectangle {
+    in property <[ChoiceOption]> options;
+    in-out property <int> value;
+
+    height: 30px;
+    width: row.preferred-width;
+    border-radius: 8px;
+    background: Theme.hover;
+
+    row := HorizontalLayout {
+        padding: 2px;
+        for option in root.options: Rectangle {
+            width: label.preferred-width + 24px;
+            border-radius: 6px;
+            background: option.value == root.value ? Theme.selected : transparent;
+            animate background { duration: Theme.fast; }
+            label := Text {
+                text: option.label;
+                color: option.value == root.value ? Theme.accent : Theme.muted;
+                font-size: Theme.small;
+                font-weight: option.value == root.value ? 600 : 500;
+            }
+            Press {
+                clicked => { root.value = option.value; }
+            }
+        }
+    }
+}
+
+/// A line of the settings: what it is, and its control at the end.
+component Setting inherits Rectangle {
+    in property <string> title;
+    in property <string> hint;
+    in property <bool> enabled: true;
+    /// The whole line is the control, as it is for a switch.
+    in property <bool> pressable;
+    callback clicked <=> touch.clicked;
+
+    min-height: layout.min-height;
+    preferred-height: layout.preferred-height;
+    opacity: root.enabled ? 1 : 0.45;
+    animate opacity { duration: Theme.fast; }
+
+    layout := HorizontalLayout {
+        padding-top: 13px;
+        padding-bottom: 13px;
+        spacing: 24px;
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            horizontal-stretch: 1;
+            Text {
+                text: root.title;
+                color: Theme.text;
+                font-size: Theme.body;
+                font-weight: 500;
+                overflow: elide;
+            }
+            if root.hint != "": Text {
+                text: root.hint;
+                color: Theme.muted;
+                font-size: Theme.small;
+                overflow: elide;
+            }
+        }
+        @children
+    }
+
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: Theme.line;
+    }
+
+    touch := Press {
+        enabled: root.pressable && root.enabled;
+    }
+}
+
+component Toggle inherits Setting {
+    in-out property <bool> on;
+    callback toggled();
+
+    pressable: true;
+    clicked => {
+        root.on = !root.on;
+        root.toggled();
+    }
+
+    VerticalLayout {
+        alignment: center;
+        horizontal-stretch: 0;
+        Switch {
+            on: root.on;
+        }
+    }
+}
+
+component Choosing inherits Setting {
+    in property <[ChoiceOption]> options;
+    in-out property <int> value;
+
+    VerticalLayout {
+        alignment: center;
+        horizontal-stretch: 0;
+        Choice {
+            options: root.options;
+            value <=> root.value;
+        }
+    }
+}
+
+/// Text the user keeps, with its name in front. It grows with what is typed.
+component SettingsField inherits Rectangle {
+    in property <string> label;
+    in property <string> placeholder;
+    in property <bool> multiline;
+    in-out property <string> text <=> input.text;
+    callback edited();
+
+    private property <length> box-height: Math.max(input.preferred-height + 16px, root.multiline ? 84px : 34px);
+
+    height: root.box-height;
+
+    Text {
+        x: 0;
+        y: 0;
+        height: 34px;
+        text: root.label;
+        color: Theme.muted;
+        font-size: Theme.body;
+        vertical-alignment: center;
+    }
+
+    Rectangle {
+        x: 84px;
+        width: parent.width - 84px;
+        height: root.box-height;
+        border-radius: 8px;
+        background: Theme.hover;
+        border-width: 1px;
+        border-color: input.has-focus ? Theme.accent : transparent;
+        animate border-color { duration: Theme.fast; }
+
+        if root.text == "": Text {
+            x: 11px;
+            y: 8px;
+            text: root.placeholder;
+            color: Theme.muted;
+            font-size: Theme.body;
+        }
+        input := TextInput {
+            x: 11px;
+            y: 8px;
+            width: parent.width - 22px;
+            height: parent.height - 16px;
+            color: Theme.text;
+            font-size: Theme.body;
+            selection-background-color: Theme.selected;
+            selection-foreground-color: Theme.text;
+            single-line: !root.multiline;
+            wrap: root.multiline ? word-wrap : no-wrap;
+            edited => { root.edited(); }
+        }
+    }
+}
+
+/// An account: who it writes as, and what it may do.
+component AccountSettings inherits Rectangle {
+    in property <AccountItem> item;
+    callback edited(string, string, bool);
+    callback remove();
+
+    private property <bool> confirming;
+
+    function report() { root.edited(name.text, signature.text, notify.on); }
+
+    min-height: layout.min-height;
+    preferred-height: layout.preferred-height;
+
+    layout := VerticalLayout {
+        padding-top: 16px;
+        padding-bottom: 6px;
+        spacing: 10px;
+
+        HorizontalLayout {
+            spacing: 12px;
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 0;
+                Avatar {
+                    size: 28px;
+                    initials: root.item.initials;
+                    tone: root.item.tone;
+                    logo: root.item.logo;
+                }
+            }
+            Text {
+                text: root.item.email;
+                color: Theme.text;
+                font-size: Theme.body;
+                font-weight: 600;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            if root.item.status != "": Text {
+                text: root.item.status;
+                color: Theme.muted;
+                font-size: Theme.small;
+                vertical-alignment: center;
+                horizontal-stretch: 0;
+            }
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 0;
+                remove := BarAction {
+                    text: root.confirming ? "Click again to remove" : "Remove";
+                    clicked => {
+                        if (root.confirming) {
+                            root.remove();
+                        }
+                        root.confirming = true;
+                    }
+                    changed hovered => {
+                        if (!self.hovered) {
+                            root.confirming = false;
+                        }
+                    }
+                }
+            }
+        }
+        name := SettingsField {
+            label: "Name";
+            placeholder: "As in your sent mail";
+            text: root.item.name;
+            edited => { root.report(); }
+        }
+        signature := SettingsField {
+            label: "Signature";
+            placeholder: "Added to everything you write";
+            multiline: true;
+            text: root.item.signature;
+            edited => { root.report(); }
+        }
+        notify := Toggle {
+            title: "Notifications";
+            on: root.item.notify;
+            toggled => { root.report(); }
+        }
+    }
+}
+
+component SettingsTab inherits Rectangle {
+    in property <string> icon;
+    in property <string> text;
+    in property <bool> active;
+    callback clicked <=> touch.clicked;
+
+    private property <brush> ink: root.active ? Theme.on-marker : Theme.on-frame;
+
+    height: 36px;
+    border-radius: 9px;
+    background: root.active ? Theme.marker : touch.has-hover ? Theme.frame-hover : transparent;
+    animate background { duration: Theme.fast; }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        spacing: 11px;
+        Rectangle {
+            width: 18px;
+            horizontal-stretch: 0;
+            Icon {
+                y: (parent.height - self.height) / 2;
+                tint: root.ink;
+                commands: root.icon;
+            }
+        }
+        Text {
+            text: root.text;
+            color: root.ink;
+            font-size: Theme.body;
+            font-weight: root.active ? 600 : 500;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+    }
+
+    touch := Press { }
+}
+
+/// Everything the user can change, which takes effect as it changes.
+component SettingsScreen inherits Rectangle {
+    in-out property <int> page;
+    in property <[AccountItem]> accounts;
+    in property <string> version;
+    callback back();
+    callback add-account();
+    callback remove-account(int);
+    callback identity-edited(int, string, string, bool);
+
+    private property <[{ title: string, icon: string }]> pages: [
+        { title: "General", icon: root.sliders },
+        { title: "Mail", icon: "M3 6h18v13H3zM3 7l9 6.5L21 7" },
+        { title: "Notifications", icon: "M6 16v-5a6 6 0 1 1 12 0v5l2 2H4zM10 20.5a2 2 0 0 0 4 0" },
+        { title: "Accounts", icon: "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4.5 20a7.5 7.5 0 0 1 15 0" },
+    ];
+    private property <string> sliders: "M4 7h9M17 7h3M4 17h3M11 17h9M15 5v4M9 15v4";
+
+    changed page => { scroller.content-y = 0; }
+
+    background: Theme.frame;
+
+    // Nothing behind this should answer the pointer.
+    TouchArea { }
+
+    HorizontalLayout {
+        VerticalLayout {
+            width: 212px;
+            padding: 12px;
+            padding-top: 8px;
+            spacing: 2px;
+
+            HorizontalLayout {
+                alignment: start;
+                padding-bottom: 12px;
+                BackButton {
+                    clicked => { root.back(); }
+                }
+            }
+            for page[index] in root.pages: SettingsTab {
+                icon: page.icon;
+                text: page.title;
+                active: index == root.page;
+                clicked => { root.page = index; }
+            }
+            Rectangle { vertical-stretch: 1; }
+            Text {
+                x: 12px;
+                text: "mailfunction " + root.version;
+                color: Theme.on-frame-muted;
+                font-size: Theme.small;
+                horizontal-alignment: center;
+            }
+        }
+
+        Sheet {
+            clip: true;
+
+            scroller := Flickable {
+                content-height: content.preferred-height;
+
+                content := VerticalLayout {
+                    x: Theme.gutter;
+                    width: Math.min(620px, root.width - 212px - 2 * Theme.gutter);
+                    padding-top: 22px;
+                    padding-bottom: 28px;
+                    alignment: start;
+
+                    Text {
+                        text: root.pages[root.page].title;
+                        color: Theme.text;
+                        font-size: Theme.heading;
+                        font-weight: 600;
+                    }
+                    Rectangle { height: 12px; }
+
+                    if root.page == 0: VerticalLayout {
+                        Choosing {
+                            title: "Appearance";
+                            value <=> Theme.preferences.appearance;
+                            options: [{ label: "System", value: 0 }, { label: "Light", value: 1 }, { label: "Dark", value: 2 }];
+                        }
+                        Toggle {
+                            title: "Compact list";
+                            on <=> Theme.preferences.compact-list;
+                        }
+                        Toggle {
+                            title: "Start with Windows";
+                            hint: "Opens in the notification area";
+                            on <=> Theme.preferences.start-with-windows;
+                        }
+                        Toggle {
+                            title: "Keep running when closed";
+                            hint: "So that mail and notifications keep coming";
+                            on <=> Theme.preferences.keep-running;
+                        }
+                    }
+
+                    if root.page == 1: VerticalLayout {
+                        Toggle {
+                            title: "Show all images";
+                            hint: "Senders can tell you opened their mail. Spam stays blocked.";
+                            on <=> Theme.preferences.show-all-images;
+                        }
+                        Toggle {
+                            title: "Sender logos";
+                            hint: "Asks each sender's domain for its logo";
+                            on <=> Theme.preferences.sender-logos;
+                        }
+                        Choosing {
+                            title: "Text size";
+                            value <=> Theme.preferences.text-size;
+                            options: [{ label: "Small", value: 0 }, { label: "Medium", value: 1 }, { label: "Large", value: 2 }];
+                        }
+                        Choosing {
+                            title: "Mark as read";
+                            value <=> Theme.preferences.mark-read;
+                            options: [{ label: "On opening", value: 0 }, { label: "After 3 seconds", value: 1 }, { label: "Never", value: 2 }];
+                        }
+                        Toggle {
+                            title: "Open the next message";
+                            hint: "After archiving or deleting";
+                            on <=> Theme.preferences.open-next;
+                        }
+                        Choosing {
+                            title: "Undo send";
+                            value <=> Theme.preferences.undo-send;
+                            options: [{ label: "Off", value: 0 }, { label: "5 s", value: 5 }, { label: "10 s", value: 10 }, { label: "30 s", value: 30 }];
+                        }
+                        Choosing {
+                            title: "Messages kept offline";
+                            value <=> Theme.preferences.offline-messages;
+                            options: [{ label: "200", value: 200 }, { label: "1,000", value: 1000 }, { label: "5,000", value: 5000 }];
+                        }
+                    }
+
+                    if root.page == 2: VerticalLayout {
+                        Toggle {
+                            title: "New mail notifications";
+                            on <=> Theme.preferences.notifications;
+                        }
+                        Toggle {
+                            title: "Sound";
+                            enabled: Theme.preferences.notifications;
+                            on <=> Theme.preferences.notification-sound;
+                        }
+                        Toggle {
+                            title: "Show sender and subject";
+                            enabled: Theme.preferences.notifications;
+                            on <=> Theme.preferences.notification-preview;
+                        }
+                        Toggle {
+                            title: "Unread count on the taskbar";
+                            on <=> Theme.preferences.taskbar-count;
+                        }
+                    }
+
+                    if root.page == 3: VerticalLayout {
+                        for account[index] in root.accounts: AccountSettings {
+                            item: account;
+                            edited(name, signature, notify) => { root.identity-edited(index, name, signature, notify); }
+                            remove => { root.remove-account(index); }
+                        }
+                        Rectangle { height: 8px; }
+                        HorizontalLayout {
+                            alignment: start;
+                            BarAction {
+                                text: "Add account";
+                                clicked => { root.add-account(); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 export component App inherits Window {
     title: "mailfunction";
     preferred-width: 1280px;
@@ -1938,6 +2483,10 @@ export component App inherits Window {
     in-out property <int> pick-cursor;
     in-out property <bool> showing-keys;
 
+    in property <bool> settings-open;
+    in-out property <int> settings-page;
+    in property <string> version;
+
     in property <string> notice;
     in property <string> notice-action;
 
@@ -1953,6 +2502,8 @@ export component App inherits Window {
     out property <length> slot-h: slot.height;
 
     private property <bool> dark: Theme.dark;
+    private property <Preferences> preferences: Theme.preferences;
+    private property <int> appearance: Theme.preferences.appearance;
     // Set by a handler, not a binding: the rail's width feeds the window's size constraints.
     private property <bool> compact;
     private property <LabelItem> label: root.labels[root.active-label];
@@ -1992,8 +2543,18 @@ export component App inherits Window {
     callback notice-clicked();
     callback slot-changed();
     callback theme-changed();
+    callback open-settings();
+    callback close-settings();
+    callback preferences-changed();
+    callback identity-edited(int, string, string, bool);
+    callback start-with-windows-changed(bool);
 
     changed dark => { root.theme-changed(); }
+    changed preferences => { root.preferences-changed(); }
+    // The palette, rather than `Theme`, so that the scrollbars come along.
+    changed appearance => {
+        Palette.color-scheme = root.appearance == 2 ? ColorScheme.dark : root.appearance == 1 ? ColorScheme.light : ColorScheme.unknown;
+    }
     changed width => { self.compact = self.width < 1060px; }
 
     /// Scrolls the list so that `row` is visible.
@@ -2028,6 +2589,24 @@ export component App inherits Window {
 
     keys := FocusScope {
         key-pressed(event) => {
+            if (root.signed-in && !root.adding && event.modifiers.control && event.text == ",") {
+                if (root.settings-open) {
+                    root.close-settings();
+                } else {
+                    root.open-settings();
+                }
+                return accept;
+            }
+            if (root.settings-open && !root.adding) {
+                if (event.text == Key.DownArrow || event.text == "j") {
+                    root.settings-page = Math.min(root.settings-page + 1, 3);
+                } else if (event.text == Key.UpArrow || event.text == "k") {
+                    root.settings-page = Math.max(root.settings-page - 1, 0);
+                } else {
+                    return reject;
+                }
+                return accept;
+            }
             if (!root.signed-in || root.adding) {
                 if (event.text == Key.Return && root.can-sign-in) {
                     root.sign-in();
@@ -2119,7 +2698,9 @@ export component App inherits Window {
             if (event.text != Key.Escape) {
                 return reject;
             }
-            if (root.composing) {
+            if (root.settings-open) {
+                root.close-settings();
+            } else if (root.composing) {
                 root.close-draft();
             } else if (root.showing-keys) {
                 root.showing-keys = false;
@@ -2148,7 +2729,7 @@ export component App inherits Window {
         }
 
         HorizontalLayout {
-            visible: root.signed-in && !root.adding;
+            visible: root.signed-in && !root.adding && !root.settings-open;
 
             Rail {
                 labels: root.labels;
@@ -2171,6 +2752,10 @@ export component App inherits Window {
                 }
                 add-account => {
                     root.add-account();
+                    keys.focus();
+                }
+                open-settings => {
+                    root.open-settings();
                     keys.focus();
                 }
                 compose => { root.verb(Verb.compose); }
@@ -2606,6 +3191,22 @@ export component App inherits Window {
                     }
                 }
             }
+        }
+
+        if root.signed-in && !root.adding && root.settings-open: SettingsScreen {
+            page <=> root.settings-page;
+            accounts: root.accounts;
+            version: root.version;
+            back => { root.close-settings(); }
+            add-account => {
+                root.add-account();
+                keys.focus();
+            }
+            remove-account(index) => {
+                root.remove-account(index);
+                keys.focus();
+            }
+            identity-edited(index, name, signature, notify) => { root.identity-edited(index, name, signature, notify); }
         }
     }
 

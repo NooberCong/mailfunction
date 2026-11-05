@@ -145,6 +145,14 @@ pub fn attachments(raw: &[u8]) -> Vec<Attachment> {
         .collect()
 }
 
+/// Puts a signature under what is about to be written, above anything quoted.
+pub fn with_signature(body: &str, signature: &str) -> String {
+    match signature.trim_end() {
+        "" => body.to_string(),
+        signature => format!("\n\n-- \n{signature}{body}"),
+    }
+}
+
 /// A forward of a raw message. Its attachments come from [`attachments`].
 pub fn forward(raw: &[u8]) -> Option<Compose> {
     let parsed = MessageParser::default().parse(raw)?;
@@ -327,6 +335,13 @@ Date: Wed, 04 Nov 2026 10:00:00 +0700\r\nContent-Type: text/plain; charset=utf-8
     fn answering_your_own_mail_goes_to_its_recipients() {
         let raw = b"From: me@example.com\r\nTo: a@x.example\r\nSubject: s\r\n\r\nhi\r\n";
         assert_eq!(reply(raw, "ME@example.com", false).unwrap().to, "a@x.example");
+    }
+
+    #[test]
+    fn a_signature_sits_above_the_quote() {
+        assert_eq!(with_signature("", "Kong\n"), "\n\n-- \nKong");
+        assert_eq!(with_signature("\n\nOn Monday:\n> hi\n", "Kong"), "\n\n-- \nKong\n\nOn Monday:\n> hi\n");
+        assert_eq!(with_signature("\n\nOn Monday:\n", "  \n"), "\n\nOn Monday:\n");
     }
 
     #[test]

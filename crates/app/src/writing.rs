@@ -14,8 +14,6 @@ use crate::actions::Reversible;
 use crate::{Controller, FileItem, chrome, on_ui_thread};
 
 const AUTOSAVE_DELAY: Duration = Duration::from_millis(800);
-/// How long mail waits before it really goes, which is what makes it possible to call it back.
-const UNDO_SEND_SECONDS: i64 = 10;
 const NOTICE_TIME: Duration = Duration::from_secs(6);
 const SUGGESTIONS: usize = 5;
 /// Looking through everyone who ever wrote takes too long to do between two keys.
@@ -32,6 +30,8 @@ pub(crate) struct Writing {
     /// Its files changed, or it is new. Otherwise a draft that was only looked at stays exactly
     /// as it is on the server, which may be richer than anything this composer can write.
     pub touched: bool,
+    /// It started from nothing, so if it is back to how it began, nothing has been written.
+    pub new: bool,
 }
 
 /// Bytes as a person would say them.
@@ -66,7 +66,19 @@ fn last_address(field: &str) -> &str {
 
 impl Controller {
     pub(crate) fn compose_new(self: &Rc<Self>) {
-        self.open_composer(Compose::default(), None, None, &[]);
+        let fields = self.signed(Compose::default());
+        self.open_composer(fields, None, None, &[]);
+        if let Some(writing) = self.writing.borrow_mut().as_mut() {
+            writing.new = true;
+        }
+    }
+
+    /// A new message as the shown account signs it.
+    fn signed(&self, fields: Compose) -> Compose {
+        let accounts = self.accounts.borrow();
+        let shown = accounts.iter().find(|m| Some(m.account.id) == self.shown.get());
+        let signature = shown.map_or("", |m| m.identity.signature.as_str());
+        Compose { body: compose::with_signature(&fields.body, signature), ..fields }
     }
 
     pub(crate) fn reply(self: &Rc<Self>, all: bool) {
@@ -77,7 +89,7 @@ impl Controller {
         };
         let own = self.shown_email();
         if let Some(fields) = compose::reply(&raw, &own, all) {
-            self.open_composer(fields, None, Some(id), &[]);
+            self.open_composer(self.signed(fields), None, Some(id), &[]);
         }
     }
 
@@ -88,7 +100,7 @@ impl Controller {
             return;
         };
         if let Some(fields) = compose::forward(&raw) {
-            self.open_composer(fields, None, None, &compose::attachments(&raw));
+            self.open_composer(self.signed(fields), None, None, &compose::attachments(&raw));
         }
     }
 
@@ -144,7 +156,7 @@ impl Controller {
             draft = self.shown.get().and_then(|account| self.store.create_draft(account, &fields, reply_to, files).ok());
             touched = true;
         }
-        *self.writing.borrow_mut() = Some(Writing { draft, reply_to, initial: fields, touched });
+        *self.writing.borrow_mut() = Some(Writing { draft, reply_to, initial: fields, touched, new: false });
         self.publish_files();
         if needs_recipients {
             self.app.invoke_focus_recipients();
@@ -198,7 +210,9 @@ impl Controller {
         let Some(fields) = self.fields() else { return };
         let saved = self.save_draft();
         let changed = self.writing.borrow().as_ref().is_some_and(|w| w.touched || w.initial != fields);
-        let empty = saved.is_some_and(|id| fields.is_blank() && self.reader.draft_attachments(id).is_ok_and(|f| f.is_empty()));
+        // A signature alone is not something anyone wrote.
+        let blank = fields.is_blank() || self.writing.borrow().as_ref().is_some_and(|w| w.new && w.initial == fields);
+        let empty = saved.is_some_and(|id| blank && self.reader.draft_attachments(id).is_ok_and(|f| f.is_empty()));
         match saved {
             Some(id) if empty => drop(self.store.discard_draft(id)),
             Some(id) if changed => {
@@ -251,14 +265,18 @@ impl Controller {
             self.app.set_draft_error("This couldn't be saved, so it hasn't been sent".into());
             return;
         };
-        let send_at = chrono::Utc::now().timestamp() + UNDO_SEND_SECONDS;
-        if self.store.queue_send(id, send_at).is_err() {
+        let waits = i64::from(self.settings.get().undo_send_seconds);
+        if self.store.queue_send(id, chrono::Utc::now().timestamp() + waits).is_err() {
             self.app.set_draft_error("This couldn't be saved, so it hasn't been sent".into());
             return;
         }
-        *self.reversible.borrow_mut() = Some(Reversible::Send(id));
         self.close_composer();
-        self.show_notice("Sending", "Undo", Duration::from_secs(UNDO_SEND_SECONDS as u64));
+        if waits > 0 {
+            *self.reversible.borrow_mut() = Some(Reversible::Send(id));
+            self.show_notice("Sending", "Undo", Duration::from_secs(waits as u64));
+        } else {
+            self.show_notice("Sending", "", NOTICE_TIME);
+        }
     }
 
     pub(crate) fn sent(&self, id: i64) {

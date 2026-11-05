@@ -169,6 +169,14 @@ const MIGRATIONS: &[&str] = &["
     CREATE TRIGGER message_unindexed AFTER DELETE ON message BEGIN
         DELETE FROM fts WHERE rowid = old.id;
     END;
+", "
+    CREATE TABLE settings (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        json TEXT NOT NULL
+    );
+    ALTER TABLE account ADD COLUMN name TEXT NOT NULL DEFAULT '';
+    ALTER TABLE account ADD COLUMN signature TEXT NOT NULL DEFAULT '';
+    ALTER TABLE account ADD COLUMN notify INTEGER NOT NULL DEFAULT 1;
 "];
 
 /// The migration that added search. Bodies stored before it are indexed once, on opening.

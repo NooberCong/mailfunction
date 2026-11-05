@@ -14,6 +14,7 @@ pub mod ops;
 pub mod remote;
 pub mod render;
 pub mod secrets;
+pub mod settings;
 pub mod smtp;
 pub mod store;
 pub mod sync;

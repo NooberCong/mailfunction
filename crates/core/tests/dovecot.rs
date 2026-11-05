@@ -16,6 +16,7 @@ use mailfunction_core::engine::{Engine, Event};
 use mailfunction_core::imap::{Credential, Imap};
 use mailfunction_core::ops::Triage;
 use mailfunction_core::secrets;
+use mailfunction_core::settings::Settings;
 use mailfunction_core::store::{Account, AuthKind, Folder, LabelRow, MessageRow, Reader, Role, Security, Store};
 use mailfunction_core::sync::{folders_to_sync, label_of, sync_account, sync_folder};
 use tokio::net::TcpStream;
@@ -329,6 +330,37 @@ async fn the_engine_syncs_hears_new_mail_through_idle_and_fetches_bodies() {
 
     assert!(engine.fetch_body(h.account.id, 999_999));
     wait_for(&mut events, Event::BodyFailed(999_999)).await;
+
+    secrets::delete(&h.account.email).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs a local Dovecot: scripts/test-imap.ps1"]
+async fn the_setting_decides_how_much_mail_is_fetched_ahead() {
+    let mut h = harness("offline").await;
+    for (id, subject) in [("a", "One"), ("b", "Two"), ("c", "Three")] {
+        h.deliver("INBOX", id, subject).await;
+    }
+    h.store.save_settings(&Settings { offline_messages: 1, ..Settings::default() }).unwrap();
+    secrets::save(&h.account.email, PASSWORD).unwrap();
+
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let mut engine = Engine::start(h.dir.clone(), h.store.clone(), None, move |_, e| {
+        let _ = tx.send(e);
+    });
+    engine.add(h.account.clone());
+    wait_for(&mut events, Event::UpToDate).await;
+    let stored = |h: &Harness| h.rows("Inbox").iter().filter(|m| h.reader.has_body(m.id).unwrap()).count();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(stored(&h), 1);
+
+    // Raised, it takes effect with no restart, at the next mail.
+    h.store.save_settings(&Settings { offline_messages: 3, ..Settings::default() }).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    h.deliver("INBOX", "d", "Four").await;
+    wait_for(&mut events, Event::Changed).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(stored(&h), 3);
 
     secrets::delete(&h.account.email).unwrap();
 }

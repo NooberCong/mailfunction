@@ -48,16 +48,20 @@ fn email_of(tx: &Transaction, account_id: i64) -> Result<String> {
     Ok(tx.query_row("SELECT email FROM account WHERE id = ?1", [account_id], |r| r.get(0))?)
 }
 
-/// The account's name in its own sent mail, since nothing else knows it.
+/// The name the user gave the account, or else the one in its own sent mail.
 fn sender(tx: &Transaction, account_id: i64) -> Result<Mailbox> {
     let email = email_of(tx, account_id)?;
-    let name: Option<String> = tx
-        .query_row(
+    let chosen: String = tx.query_row("SELECT name FROM account WHERE id = ?1", [account_id], |r| r.get(0))?;
+    let name: Option<String> = if chosen.trim().is_empty() {
+        tx.query_row(
             "SELECT from_name FROM message WHERE account_id = ?1 AND from_addr = ?2 AND from_name <> '' LIMIT 1",
             params![account_id, email],
             |r| r.get(0),
         )
-        .optional()?;
+        .optional()?
+    } else {
+        Some(chosen)
+    };
     let address = email.parse().map_err(|_| Error::Protocol(format!("{email} is not an address")))?;
     Ok(Mailbox::new(name, address))
 }

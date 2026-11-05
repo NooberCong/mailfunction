@@ -58,6 +58,8 @@ pub struct Notice {
     pub account: Option<String>,
     /// A PNG of the sender.
     pub picture: Option<Vec<u8>>,
+    /// It appears without a sound.
+    pub silent: bool,
     pub opens: Opens,
 }
 
@@ -77,8 +79,9 @@ fn toast_xml(notice: &Notice, picture: Option<&Path>) -> String {
     let account = notice.account.as_deref().map_or_else(String::new, |account| {
         format!(r#"<text placement="attribution">{}</text>"#, escape(account))
     });
+    let audio = if notice.silent { r#"silent="true""# } else { r#"src="ms-winsoundevent:Notification.Mail""# };
     format!(
-        r#"<toast launch="{}"><visual><binding template="ToastGeneric"><text>{}</text><text>{}</text>{image}{account}</binding></visual><audio src="ms-winsoundevent:Notification.Mail"/></toast>"#,
+        r#"<toast launch="{}"><visual><binding template="ToastGeneric"><text>{}</text><text>{}</text>{image}{account}</binding></visual><audio {audio}/></toast>"#,
         notice.opens.to_launch(),
         escape(&notice.title),
         escape(&notice.text),
@@ -121,7 +124,7 @@ impl IClassFactory_Impl for Activator_Impl {
     }
 }
 
-fn set_registry(key: &str, name: Option<&str>, value: &str) -> Option<()> {
+pub(crate) fn set_registry(key: &str, name: Option<&str>, value: &str) -> Option<()> {
     let value: Vec<u16> = value.encode_utf16().chain([0]).collect();
     let name = name.map(HSTRING::from).unwrap_or_default();
     let size = (value.len() * size_of::<u16>()) as u32;
@@ -198,6 +201,7 @@ mod tests {
             text: "<b>Lunch?</b> \"today\"".into(),
             account: None,
             picture: None,
+            silent: false,
             opens: Opens { account: 2, message: Some(9) },
         }
     }
@@ -218,6 +222,13 @@ mod tests {
         assert!(xml.contains("&lt;b&gt;Lunch?&lt;/b&gt; &quot;today&quot;"), "{xml}");
         let document = XmlDocument::new().unwrap();
         document.LoadXml(&HSTRING::from(xml)).expect("well-formed");
+    }
+
+    #[test]
+    fn a_silent_notice_has_no_sound_to_play() {
+        assert!(toast_xml(&notice(), None).contains("Notification.Mail"));
+        let xml = toast_xml(&Notice { silent: true, ..notice() }, None);
+        assert!(xml.contains(r#"<audio silent="true"/>"#) && !xml.contains("Notification.Mail"), "{xml}");
     }
 
     #[test]

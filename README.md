@@ -36,6 +36,11 @@ domains like gmail.com and anything in Spam are never looked up as senders.
 Closing the window leaves the app running in the notification area, so new mail still shows a
 notification. Quit from the icon's menu. Starting the app again brings its window back.
 
+Settings are in the sidebar, or `Ctrl+,`, and apply as they change. The app's own are one JSON
+document in the store, so a new one needs no migration. Each account's name, signature and
+notifications live on the account. Show all images loads every remote image without asking,
+except in Spam.
+
 ## Run it
 
 1. In Google Cloud, create a project, enable the Gmail API, set the OAuth app to External and
@@ -74,4 +79,6 @@ No test injects real mouse or keyboard input. The UI and motion tests drive an o
 and the live test opens a real window but works through the controller. To check the cursor it
 posts pointer messages to its own window, which moves nothing on the desktop. It also records the
 window's pixels while moving between messages, and fails if the old message outlives the click.
-The tray test starts the real executable and sends it the messages Windows would send.
+The tray test starts the real executable and sends it the messages Windows would send. The
+settings test works each setting from its control to what it changes, and the live and tray tests
+cover the ones that need a real page, real SMTP or Windows itself.

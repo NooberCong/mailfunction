@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use mailfunction::notify::Toasts;
 use mailfunction::webview::Webview;
-use mailfunction::{App, Controller, Theme, chrome, instance, on_ui_thread};
+use mailfunction::{App, Controller, Theme, chrome, instance, on_ui_thread, startup};
 use mailfunction_core::oauth;
 use mailfunction_core::remote::Web;
 use slint::ComponentHandle;
@@ -38,13 +38,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let controller = Controller::new(app.clone_strong(), &data, client, Box::new(pane), toasts, Arc::new(Web::default()))?;
     controller.load_accounts()?;
     controller.start_engine();
-    app.show()?;
-    chrome::paint_title_bar(&app);
+    app.on_start_with_windows_changed(startup::set);
+    if controller.settings().start_with_windows {
+        startup::set(true);
+    }
+    // Unshown, the native window still comes to exist as the loop starts, with nothing on screen.
+    if !std::env::args().any(|argument| argument == startup::BACKGROUND) {
+        app.show()?;
+    }
     // Slint applies the window's own (empty) icon as the loop starts, so this has to come after.
     let window = app.as_weak();
     slint::invoke_from_event_loop(move || {
         if let Some(app) = window.upgrade() {
             chrome::set_icon(&app);
+            chrome::paint_title_bar(&app);
             chrome::watch_taskbar(&app);
         }
         on_ui_thread(|this| this.refresh_badge());
@@ -57,6 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         EventResult::Propagate
     });
-    slint::run_event_loop()?;
+    // Until the app says so, as there may well be no window showing.
+    slint::run_event_loop_until_quit()?;
     Ok(())
 }

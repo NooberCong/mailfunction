@@ -31,8 +31,6 @@ use crate::{Error, Result, secrets};
 const IDLE_LIMIT: Duration = Duration::from_secs(5 * 60);
 const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const PREFETCH_MAX_SIZE: u32 = 2 * 1024 * 1024;
-/// Bodies load on demand; only this many of the newest Inbox messages are fetched ahead.
-const PREFETCH_NEWEST: usize = 200;
 const PREFETCH_RETRY: Duration = Duration::from_secs(30);
 /// How long a profile picture is kept before asking whether it has changed.
 const PICTURE_RECHECK_SECONDS: i64 = 7 * 24 * 3600;
@@ -389,7 +387,9 @@ async fn body_task(
         let next_prefetch = if prefetch_paused {
             None
         } else {
-            let missing = reader.missing_bodies(credentials.account.id, PREFETCH_MAX_SIZE, PREFETCH_NEWEST);
+            // Bodies load on demand, and only the newest Inbox messages are fetched ahead.
+            let newest = reader.settings().offline_messages as usize;
+            let missing = reader.missing_bodies(credentials.account.id, PREFETCH_MAX_SIZE, newest);
             missing.unwrap_or_default().into_iter().find(|id| !prefetch_failed.contains(id))
         };
         let request = match next_prefetch {

@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
 
+use mailfunction::startup;
 use mailfunction::tray::{CALLBACK, ICON_ID, NIN_SELECT};
+use mailfunction_core::settings::Settings;
 use mailfunction_core::store::{Account, AuthKind, LabelSpec, NewMessage, Role, Security, Store};
 use windows::Win32::Foundation::{FILETIME, HANDLE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
@@ -15,7 +17,7 @@ use windows::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QU
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::Shell::{NIM_DELETE, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect, Shell_NotifyIconW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, PostMessageW,
+    EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW,
     RegisterWindowMessageW, WM_CLOSE, WM_CONTEXTMENU, WM_KEYDOWN,
 };
 use windows::core::{BOOL, w};
@@ -141,8 +143,84 @@ fn capture(hwnd: HWND, name: &str) {
     encoder.write_header().unwrap().write_image_data(&bgra).unwrap();
 }
 
+const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+
 fn start(dir: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_mailfunction")).env("MAILFUNCTION_DATA_DIR", dir).spawn().unwrap()
+}
+
+/// A second process for a scenario, which goes with it however the scenario ends. Left behind, it
+/// would answer for the app in whatever runs next.
+struct Running(Child);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// What Windows would start at login, as the app wrote it.
+fn run_entry() -> Option<String> {
+    let output = Command::new("reg").args(["query", RUN_KEY, "/v", "mailfunction"]).output().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    output.status.success().then(|| text.split("REG_SZ").nth(1).unwrap().trim().to_string())
+}
+
+fn set_run_entry(value: Option<&str>) {
+    let mut command = Command::new("reg");
+    match value {
+        Some(value) => command.args(["add", RUN_KEY, "/v", "mailfunction", "/d", value, "/f"]),
+        None => command.args(["delete", RUN_KEY, "/v", "mailfunction", "/f"]),
+    };
+    let _ = command.output();
+}
+
+/// Started the way Windows starts it at login, the window must never reach the screen. It would
+/// be there for a moment at most, so this watches as closely as it can.
+fn in_the_background(dir: &Path) {
+    println!("starting in the background");
+    let app = Command::new(env!("CARGO_BIN_EXE_mailfunction")).arg("--background").env("MAILFUNCTION_DATA_DIR", dir).spawn().unwrap();
+    let app = Running(app);
+    let pid = app.0.id();
+    let (started, mut found, mut seen) = (Instant::now(), None, false);
+    while started.elapsed() < Duration::from_secs(4) {
+        found = main_window(pid).or(found);
+        seen |= found.is_some_and(|hwnd| showing(hwnd) && !unsafe { IsIconic(hwnd) }.as_bool());
+    }
+    let window = found.expect("a window to own the icon");
+    assert!(!seen, "the window reached the screen");
+    assert!(!showing(window));
+    assert!(has_icon(window), "no icon to find the app by");
+
+    println!("  and coming up from there");
+    start_again(dir);
+    until("window", || showing(window));
+    assert!(!unsafe { IsIconic(window) }.as_bool(), "it came back minimised");
+    std::thread::sleep(Duration::from_millis(600));
+    capture(window, "background-revealed");
+}
+
+/// The settings that only mean something to Windows.
+fn with_settings(dir: &Path) {
+    println!("settings: quitting when closed, and starting with Windows");
+    let saved = run_entry();
+    set_run_entry(None);
+    let store = Store::open(dir).unwrap();
+    store.save_settings(&Settings { keep_running: false, start_with_windows: true, ..Settings::default() }).unwrap();
+    drop(store);
+    let mut app = Running(start(dir));
+    let pid = app.0.id();
+    until("window", || main_window(pid).is_some_and(showing));
+    let exe = std::path::absolute(env!("CARGO_BIN_EXE_mailfunction")).unwrap();
+    let entry = run_entry();
+    startup::set(false);
+    let turned_off = run_entry();
+    set_run_entry(saved.as_deref());
+    assert_eq!(entry, Some(format!(r#""{}" --background"#, exe.display())));
+    assert_eq!(turned_off, None);
+    post(main_window(pid).unwrap(), WM_CLOSE, 0, 0);
+    assert!(exits(&mut app.0).success(), "closing the window should have ended the app");
 }
 
 fn exits(child: &mut Child) -> ExitStatus {
@@ -299,7 +377,11 @@ fn main() {
     let dir: PathBuf = std::env::temp_dir().join(format!("mailfunction-tray-{}", std::process::id()));
     seed(&dir);
     let mut app = start(&dir);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scenario(&dir, &mut app)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        scenario(&dir, &mut app);
+        in_the_background(&dir);
+        with_settings(&dir);
+    }));
     let _ = app.kill();
     let _ = app.wait();
     let _ = std::fs::remove_dir_all(&dir);

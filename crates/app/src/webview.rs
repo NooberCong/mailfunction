@@ -37,6 +37,8 @@ const VK_ESCAPE: u32 = 0x1B;
 const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,PaintHolding \
     --proxy-server=http://127.0.0.1:9 --proxy-bypass-list=<-loopback> \
     --host-resolver-rules=\"MAP * ~NOTFOUND\"";
+/// The reading size mail is laid out for. Other sizes zoom the page to match.
+const READING: f32 = 14.0;
 /// How long the browser processes stay alive with no HTML message on screen.
 const IDLE_CLOSE: Duration = Duration::from_secs(120);
 /// How long a page out of sight waits for a successor before it is emptied, so that nothing
@@ -274,7 +276,11 @@ impl HtmlPane for Rc<Webview> {
         let sheet = app.global::<Theme>().get_sheet().color();
         self.backdrop.set((sheet.red(), sheet.green(), sheet.blue()));
         *self.app.borrow_mut() = app.as_weak();
-        self.load(app.window(), slot(app), html).is_ok()
+        let loaded = self.load(app.window(), slot(app), html).is_ok();
+        if let Some(open) = self.open.borrow().as_ref() {
+            let _ = open.view.zoom(f64::from(app.global::<Theme>().get_reading() / READING));
+        }
+        loaded
     }
 
     fn hide(&self) {
