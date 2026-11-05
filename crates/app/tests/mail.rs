@@ -9,11 +9,11 @@ use std::sync::Arc;
 use common::{RecordingEditor, RecordingNotifier, RecordingPane, click, fresh_dir, linger, offscreen, press, settle, shot, typed, with_control};
 use mailfunction::editor::EditorEvent;
 use mailfunction::notify::Opens;
-use mailfunction::{App, Controller, Pane, Theme, Tip, Verb};
+use mailfunction::{App, Controller, FileItem, Pane, Theme, Tip, Verb};
 use mailfunction_core::engine::Event;
 use mailfunction_core::remote::Offline;
 use mailfunction_core::store::{Account, AuthKind, LabelSpec, NewMessage, Reader, Role, Security, Store};
-use slint::{ComponentHandle, Model, PhysicalSize};
+use slint::{ComponentHandle, Model, ModelRc, PhysicalSize, VecModel};
 
 const NOW: i64 = 1_793_000_000;
 const ESCAPE: &str = "\u{1b}";
@@ -293,6 +293,20 @@ fn a_day_of_mail() {
     // Attachments can be seen, and saved, but never opened.
     s.open_subject("Design review notes");
     assert_eq!(app.get_message().attachments.row_data(0).unwrap().name, "notes.pdf");
+    assert_eq!(app.get_message().attachments.row_data(0).unwrap().extension, "PDF");
+    // The page starts right below, and would cover a tip that went down.
+    assert_eq!(hover(app, 680.0, 173.0), "notes.pdf");
+    assert!(app.global::<Tip>().get_above());
+    shot(app, "22-attachment");
+    let long = "20261104_실시간 스페셜 프로모션 운영 현황 및 수동등록 대상 목록 최종본 (수정 3차, 재무팀 검토 완료, 대표이사 결재본, 배포용 사본, 절대 외부 유출 금지).xlsx";
+    let mut view = app.get_message();
+    let file = FileItem { name: long.into(), size: "136 KB".into(), extension: "XLSX".into(), tone: 3 };
+    view.attachments = ModelRc::new(VecModel::from(vec![file]));
+    app.set_message(view);
+    settle();
+    assert_eq!(hover(app, 700.0, 173.0), long);
+    shot(app, "22-attachment-long-name");
+    hover(app, 800.0, 500.0);
 
     // The keyboard has its own list.
     press(app, "?");
@@ -559,6 +573,11 @@ fn writing(s: &Scene) {
     assert_eq!(app.get_draft_files().row_data(1).unwrap().size, "10 B");
     settle();
     shot(app, "34-attachments");
+    // A draft's files can't be opened, but their names can still be read, except on the cross.
+    let name = file.file_name().unwrap().to_string_lossy();
+    assert_eq!(hover(app, 870.0, 117.0), name);
+    assert_eq!(hover(app, 990.0, 117.0), "");
+    hover(app, 800.0, 500.0);
     app.invoke_remove_draft_file(0);
     assert_eq!(app.get_draft_files().row_count(), 1);
     let large = file.with_extension("bin");

@@ -8,7 +8,7 @@ use std::time::Duration;
 use mailfunction_core::settings::{Appearance, MarkRead, Settings, TextSize};
 use slint::{ComponentHandle, TimerMode};
 
-use crate::{Controller, Preferences, Theme};
+use crate::{Controller, Preferences, Theme, chrome};
 
 /// A pause in typing long enough to be worth saving.
 const SAVE_DELAY: Duration = Duration::from_millis(600);
@@ -135,6 +135,32 @@ impl Controller {
                 this.save_identities();
             }
         });
+    }
+
+    /// Puts the window back where it was left. Call this before showing it.
+    pub fn place_window(&self) {
+        self.placement.set(chrome::place(&self.app, self.reader.placement()));
+    }
+
+    /// Dragging moves the window many times a second, so this waits for it to come to rest. The
+    /// window can't be asked on the way out, as Windows may end the app without closing it.
+    pub(crate) fn window_changed(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.placement_save.start(TimerMode::SingleShot, SAVE_DELAY, move || {
+            if let Some(this) = weak.upgrade() {
+                this.save_placement();
+            }
+        });
+    }
+
+    pub(crate) fn save_placement(&self) {
+        self.placement_save.stop();
+        let Some(last) = self.placement.get() else { return };
+        let Some(now) = chrome::placement(&self.app, last) else { return };
+        if now != last {
+            self.placement.set(Some(now));
+            let _ = self.store.save_placement(&now);
+        }
     }
 
     pub(crate) fn save_identities(&self) {

@@ -132,10 +132,13 @@ export enum ImageBar { hidden, blocked, failed, allowed }
 /// What the user can ask of the open thread, or of the app, from a button or a key.
 export enum Verb { archive, inbox, trash, spam, star, unread, read-all, reply, reply-all, forward, compose, undo }
 
-/// A file on a message: its name, and its size for reading.
+/// A file on a message: its name, its size for reading, and its extension in capitals with the
+/// tone of its kind of file. An extension too long for the badge, or none at all, is left empty.
 export struct FileItem {
     name: string,
     size: string,
+    extension: string,
+    tone: int,
 }
 
 export struct MessageView {
@@ -188,23 +191,26 @@ component Press inherits TouchArea {
 /// The tooltip showing now, with the edges of its button. There is one, drawn over everything
 /// else, because a button's own child would be covered by whatever comes after the button. The
 /// webview is a window of its own and covers even this, which is why tips go under the toolbar,
-/// onto the message's heading.
+/// onto the message's heading, and why what sits right above the webview has its tip go up.
 export global Tip {
     in-out property <string> text;
     in-out property <length> centre;
     in-out property <length> top;
     in-out property <length> bottom;
+    in-out property <bool> above;
 }
 
 /// A button that says what it does when the pointer rests on it.
 component TipPress inherits Press {
     in property <string> tip;
+    in property <bool> tip-above;
 
     changed has-hover => {
         if (self.has-hover) {
             Tip.centre = self.absolute-position.x + self.width / 2;
             Tip.top = self.absolute-position.y;
             Tip.bottom = self.absolute-position.y + self.height;
+            Tip.above = self.tip-above;
             Tip.text = self.tip;
         } else if (Tip.text == self.tip) {
             // The next button may already have spoken.
@@ -1359,16 +1365,39 @@ component FileChip inherits Rectangle {
     background: touch.has-hover ? Theme.faint : Theme.hover;
     animate background { duration: Theme.fast; }
 
-    touch := Press {
-        enabled: !root.removable;
-        clicked => { root.clicked(); }
+    // A draft's files have only their cross to press, but the name still shows on resting here.
+    touch := TipPress {
+        tip: root.file.name;
+        tip-above: true;
+        mouse-cursor: root.removable ? MouseCursor.default : MouseCursor.pointer;
+        clicked => {
+            if (!root.removable) {
+                root.clicked();
+            }
+        }
     }
 
     layout := HorizontalLayout {
-        padding-left: 9px;
+        padding-left: root.file.extension != "" ? 5px : 9px;
         padding-right: root.removable ? 4px : 11px;
         spacing: 7px;
-        Rectangle {
+        if root.file.extension != "": Rectangle {
+            horizontal-stretch: 0;
+            width: Math.max(badge.preferred-width + 8px, 26px);
+            Rectangle {
+                y: (parent.height - self.height) / 2;
+                height: 20px;
+                border-radius: 5px;
+                background: Theme.tones[root.file.tone].back;
+                badge := Text {
+                    text: root.file.extension;
+                    color: Theme.tones[root.file.tone].ink;
+                    font-size: 9.5px;
+                    font-weight: 700;
+                }
+            }
+        }
+        if root.file.extension == "": Rectangle {
             width: 14px;
             horizontal-stretch: 0;
             Icon {
@@ -3374,9 +3403,10 @@ export component App inherits Window {
         private property <length> below: Tip.bottom + 6px;
 
         x: Math.clamp(Tip.centre - self.width / 2, 6px, root.width - self.width - 6px);
-        y: self.below + self.height > root.height ? Tip.top - self.height - 6px : self.below;
-        width: tip-text.preferred-width + 16px;
-        height: 26px;
+        y: Tip.above || self.below + self.height > root.height ? Tip.top - self.height - 6px : self.below;
+        // A file's name can run on, and reads better wrapped than stretched across the window.
+        width: Math.min(tip-text.preferred-width + 16px, 440px);
+        height: Math.max(tip-text.preferred-height + 10px, 26px);
         border-radius: 6px;
         background: Theme.text;
         opacity: 0;
@@ -3389,10 +3419,13 @@ export component App inherits Window {
         ]
 
         tip-text := Text {
+            width: parent.width - 16px;
             text: Tip.text;
             color: Theme.sheet;
             font-size: Theme.small;
             font-weight: 500;
+            wrap: word-wrap;
+            horizontal-alignment: center;
         }
 
         // As Windows does, and it clears a tip whose button went away under the pointer.

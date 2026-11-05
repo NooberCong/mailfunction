@@ -43,6 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if controller.settings().start_with_windows {
         startup::set(true);
     }
+    controller.place_window();
     // Unshown, the native window still comes to exist as the loop starts, with nothing on screen.
     if !std::env::args().any(|argument| argument == startup::BACKGROUND) {
         app.show()?;

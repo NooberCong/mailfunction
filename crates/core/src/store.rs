@@ -182,6 +182,11 @@ const MIGRATIONS: &[&str] = &["
     ALTER TABLE draft ADD COLUMN html TEXT NOT NULL DEFAULT '';
     -- Set for a picture in the text of a draft, which `cid:` in its HTML points to.
     ALTER TABLE bodies.attachment ADD COLUMN content_id TEXT;
+", "
+    CREATE TABLE window_placement (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        json TEXT NOT NULL
+    );
 "];
 
 /// The migration that added search. Bodies stored before it are indexed once, on opening.

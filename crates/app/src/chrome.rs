@@ -8,19 +8,25 @@ use raw_window_handle::{
 };
 use slint::winit_030::winit::event::{ElementState, WindowEvent};
 use slint::winit_030::{EventResult, WinitWindowAccessor};
-use slint::{Color, ComponentHandle};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, WPARAM};
+use mailfunction_core::settings::Placement;
+use slint::{Color, ComponentHandle, PhysicalPosition, PhysicalSize};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
     DWMWINDOWATTRIBUTE,
 };
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
+    MonitorFromRect,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, HICON, ICON_BIG, ICON_SMALL, IMAGE_ICON, IsIconic, IsWindowVisible, LR_DEFAULTCOLOR, LoadImageW,
-    SM_CXICON, SM_CXSMICON, SPI_GETCLIENTAREAANIMATION, SW_HIDE, SW_RESTORE, SW_SHOW,
+    GetSystemMetrics, GetWindowRect, HICON, ICON_BIG, ICON_SMALL, IMAGE_ICON, IsIconic, IsWindowVisible, IsZoomed,
+    LR_DEFAULTCOLOR, LoadImageW, SM_CXICON, SM_CXSMICON, SPI_GETCLIENTAREAANIMATION, SW_HIDE, SW_RESTORE, SW_SHOW,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetForegroundWindow, ShowWindow, SystemParametersInfoW,
-    WM_SETICON,
+    WM_SETICON, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{BOOL, PCWSTR};
 
@@ -87,6 +93,91 @@ impl HasDisplayHandle for DialogParent {
     }
 }
 
+/// How much of the screen the window takes the first time it opens.
+const FIRST_SHARE: f32 = 0.8;
+
+/// The first window on a monitor: centred, with room around it.
+fn first_placement(work: &RECT) -> Placement {
+    let (width, height) = (work.right - work.left, work.bottom - work.top);
+    let (own_width, own_height) = ((width as f32 * FIRST_SHARE) as i32, (height as f32 * FIRST_SHARE) as i32);
+    Placement {
+        left: work.left + (width - own_width) / 2,
+        top: work.top + (height - own_height) / 2,
+        width: own_width,
+        height: own_height,
+        maximized: false,
+    }
+}
+
+/// Moves a window onto a monitor's free space, shrinking it only if it can't fit. Monitors and
+/// the taskbar change between runs, so where it was left may no longer all be on screen.
+fn fit(placement: Placement, work: &RECT) -> Placement {
+    let width = placement.width.min(work.right - work.left);
+    let height = placement.height.min(work.bottom - work.top);
+    Placement {
+        left: placement.left.clamp(work.left, work.right - width),
+        top: placement.top.clamp(work.top, work.bottom - height),
+        width,
+        height,
+        ..placement
+    }
+}
+
+fn work_area(monitor: HMONITOR) -> Option<RECT> {
+    let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+    unsafe { GetMonitorInfoW(monitor, &raw mut info) }.as_bool().then_some(info.rcWork)
+}
+
+/// What the frame adds to the inside of a window, across and down, on a monitor.
+fn frame_size(monitor: HMONITOR) -> Option<(i32, i32)> {
+    let (mut dpi, mut unused) = (0, 0);
+    unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &raw mut dpi, &raw mut unused) }.ok()?;
+    let mut frame = RECT::default();
+    unsafe { AdjustWindowRectExForDpi(&raw mut frame, WS_OVERLAPPEDWINDOW, false, Default::default(), dpi) }.ok()?;
+    Some((frame.right - frame.left, frame.bottom - frame.top))
+}
+
+/// Sets where the window opens, from where it was left if that is known, and says where that is.
+/// It has to come before the window shows, which is what keeps it from appearing and then jumping.
+pub fn place(app: &App, saved: Option<Placement>) -> Option<Placement> {
+    let monitor = match &saved {
+        Some(s) => {
+            let rect = RECT { left: s.left, top: s.top, right: s.left + s.width, bottom: s.top + s.height };
+            unsafe { MonitorFromRect(&raw const rect, MONITOR_DEFAULTTONEAREST) }
+        }
+        None => unsafe { MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY) },
+    };
+    let work = work_area(monitor)?;
+    let (frame_width, frame_height) = frame_size(monitor)?;
+    let placement = fit(saved.unwrap_or_else(|| first_placement(&work)), &work);
+    let window = app.window();
+    window.set_position(PhysicalPosition::new(placement.left, placement.top));
+    window.set_size(PhysicalSize::new((placement.width - frame_width) as u32, (placement.height - frame_height) as u32));
+    window.set_maximized(placement.maximized);
+    Some(placement)
+}
+
+/// Where the window is now, given where it was. Maximized, its size to come back to stays as it
+/// was, and minimized there is nothing to learn: nobody wants a mail app to open that way.
+pub(crate) fn placement(app: &App, last: Placement) -> Option<Placement> {
+    let hwnd = hwnd(app)?;
+    if unsafe { IsIconic(hwnd) }.as_bool() {
+        return None;
+    }
+    if unsafe { IsZoomed(hwnd) }.as_bool() {
+        return Some(Placement { maximized: true, ..last });
+    }
+    let mut frame = RECT::default();
+    unsafe { GetWindowRect(hwnd, &raw mut frame) }.ok()?;
+    Some(Placement {
+        left: frame.left,
+        top: frame.top,
+        width: frame.right - frame.left,
+        height: frame.bottom - frame.top,
+        maximized: false,
+    })
+}
+
 /// Takes the window off the screen and the taskbar. Slint's own hide would destroy the native
 /// window, and everything that hangs from it: the webview, the tray icon and their listeners.
 pub(crate) fn hide(app: &App) {
@@ -126,6 +217,7 @@ pub fn watch_window(app: &App) {
                     let _ = unsafe { SetFocus(Some(hwnd)) };
                 }
             }
+            WindowEvent::Moved(_) | WindowEvent::Resized(_) => on_ui_thread(|this| this.window_changed()),
             // A file dropped on the window goes on the message being written.
             WindowEvent::DroppedFile(path) => {
                 let path = path.clone();
@@ -167,4 +259,37 @@ pub fn animations_enabled() -> bool {
         )
     };
     read.is_err() || enabled.as_bool()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WORK: RECT = RECT { left: 0, top: 0, right: 2560, bottom: 1392 };
+
+    fn at(left: i32, top: i32, width: i32, height: i32) -> Placement {
+        Placement { left, top, width, height, maximized: false }
+    }
+
+    #[test]
+    fn a_window_on_screen_stays_exactly_where_it_was() {
+        assert_eq!(fit(at(100, 50, 1600, 900), &WORK), at(100, 50, 1600, 900));
+    }
+
+    #[test]
+    fn a_window_past_an_edge_comes_back_whole() {
+        assert_eq!(fit(at(100, 800, 1600, 900), &WORK), at(100, 492, 1600, 900));
+        assert_eq!(fit(at(-3000, -40, 1600, 900), &WORK), at(0, 0, 1600, 900));
+    }
+
+    #[test]
+    fn a_window_too_big_for_the_monitor_shrinks_to_it() {
+        assert_eq!(fit(at(500, 500, 3840, 2100), &WORK), at(0, 0, 2560, 1392));
+    }
+
+    #[test]
+    fn the_first_window_is_centred_on_a_monitor_wherever_it_sits() {
+        let work = RECT { left: 2560, top: 100, right: 3560, bottom: 1100 };
+        assert_eq!(first_placement(&work), at(2660, 200, 800, 800));
+    }
 }

@@ -11,6 +11,7 @@ use base64::engine::general_purpose::STANDARD;
 use mailfunction_core::compose::{self, Attachment, Compose};
 use mailfunction_core::draft::MAX_ATTACHMENTS;
 use mailfunction_core::store::Store;
+use rfd::FileDialog;
 use slint::{ModelRc, SharedString, TimerMode, VecModel};
 
 use crate::actions::Reversible;
@@ -78,6 +79,51 @@ fn mime_type(name: &str) -> &'static str {
         "csv" => "text/csv",
         "zip" => "application/zip",
         _ => "application/octet-stream",
+    }
+}
+
+/// The most letters that read at a glance on a file's badge.
+const LONGEST_BADGE: usize = 4;
+
+/// The part of a file's name after its last dot, if that is what an extension looks like.
+fn extension(name: &str) -> Option<&str> {
+    let (stem, extension) = name.rsplit_once('.')?;
+    (!stem.is_empty() && !extension.is_empty() && extension.chars().all(|c| c.is_ascii_alphanumeric())).then_some(extension)
+}
+
+/// Which of the theme's tones a kind of file wears: the colours people already know them by.
+fn file_tone(extension: &str) -> i32 {
+    match extension {
+        "pdf" => 0,
+        "ppt" | "pptx" | "key" | "odp" => 1,
+        "zip" | "rar" | "7z" | "gz" | "tar" => 2,
+        "xls" | "xlsx" | "xlsm" | "csv" | "ods" | "cell" => 3,
+        "mp3" | "wav" | "m4a" | "flac" | "mp4" | "mov" | "avi" | "mkv" | "webm" => 4,
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "bmp" | "svg" | "tiff" => 6,
+        _ => 5,
+    }
+}
+
+/// A file as the chips show it.
+pub(crate) fn file_item(name: String, size: usize) -> FileItem {
+    let badge = extension(&name).filter(|extension| extension.len() <= LONGEST_BADGE);
+    FileItem {
+        size: human_size(size).into(),
+        extension: badge.map_or_else(String::new, str::to_ascii_uppercase).into(),
+        tone: badge.map_or(0, |badge| file_tone(&badge.to_ascii_lowercase())),
+        name: name.into(),
+    }
+}
+
+/// Asks where to save a file. Given a type, the dialog puts the extension back on a new name that
+/// leaves it out, which it does not do by itself, and Windows may be hiding extensions anyway.
+pub fn save_dialog(name: &str) -> FileDialog {
+    let dialog = FileDialog::new().set_file_name(name);
+    match extension(name) {
+        Some(extension) => {
+            dialog.add_filter(format!("{} file", extension.to_ascii_uppercase()), &[extension]).add_filter("All files", &["*"])
+        }
+        None => dialog,
     }
 }
 
@@ -470,7 +516,7 @@ impl Controller {
         let files = draft.and_then(|id| self.reader.draft_attachments(id).ok()).unwrap_or_default();
         let items: Vec<_> = files
             .into_iter()
-            .map(|file| FileItem { name: file.name.into(), size: human_size(file.size).into() })
+            .map(|file| file_item(file.name, file.size))
             .collect();
         self.app.set_draft_files(ModelRc::new(VecModel::from(items)));
     }
@@ -479,7 +525,7 @@ impl Controller {
     pub(crate) fn pick_files(&self) {
         let parent = chrome::dialog_parent(&self.app);
         std::thread::spawn(move || {
-            let picked = rfd::FileDialog::new().set_parent(&parent).pick_files().unwrap_or_default();
+            let picked = FileDialog::new().set_parent(&parent).pick_files().unwrap_or_default();
             on_ui_thread(move |this| this.attach_paths(&picked));
         });
     }
@@ -602,7 +648,7 @@ impl Controller {
         let Some(file) = compose::attachments(&raw).into_iter().nth(index) else { return };
         let parent = chrome::dialog_parent(&self.app);
         std::thread::spawn(move || {
-            let chosen = rfd::FileDialog::new().set_parent(&parent).set_file_name(&file.name).save_file();
+            let chosen = save_dialog(&file.name).set_parent(&parent).save_file();
             let Some(path) = chosen else { return };
             let saved = std::fs::write(&path, &file.data).is_ok();
             on_ui_thread(move |this| {
@@ -622,6 +668,24 @@ mod tests {
         assert_eq!(human_size(900), "900 B");
         assert_eq!(human_size(2048), "2 KB");
         assert_eq!(human_size(3 * 1024 * 1024 / 2), "1.5 MB");
+    }
+
+    #[test]
+    fn only_what_looks_like_an_extension_counts_as_one() {
+        assert_eq!(extension("보고서 v2.XLSX"), Some("XLSX"));
+        assert_eq!(extension("archive.tar.gz"), Some("gz"));
+        assert_eq!(extension("Attachment"), None);
+        assert_eq!(extension(".profile"), None);
+        assert_eq!(extension("trailing."), None);
+        assert_eq!(extension("Mr. Smith's notes"), None);
+    }
+
+    #[test]
+    fn a_file_wears_its_extension_while_it_fits() {
+        let sheet = file_item("보고서.XLSX".into(), 2048);
+        assert_eq!((sheet.extension.as_str(), sheet.tone, sheet.size.as_str()), ("XLSX", 3, "2 KB"));
+        assert_eq!(file_item("Attachment".into(), 1).extension, "");
+        assert_eq!(file_item("seeds.torrent".into(), 1).extension, "");
     }
 
     #[test]

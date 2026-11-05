@@ -16,6 +16,8 @@ pub mod tray;
 pub mod webview;
 mod writing;
 
+pub use writing::save_dialog;
+
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
@@ -30,7 +32,7 @@ use mailfunction_core::remote::Network;
 use mailfunction_core::{logo, oauth, secrets};
 use mailfunction_core::compose;
 use mailfunction_core::render::{self, Body, Rendered};
-use mailfunction_core::settings::{Identity, MarkRead, Settings};
+use mailfunction_core::settings::{Identity, MarkRead, Placement, Settings};
 use mailfunction_core::store::{Account, AuthKind, MessageRow, Reader, Role, Security, SidebarLabel, Store, ThreadKey};
 use notify::{Notice, Notifier, Opens};
 use slint::{CloseRequestResponse, Color, ComponentHandle, Image, Model, ModelRc, Timer, TimerMode, VecModel};
@@ -209,6 +211,9 @@ pub struct Controller {
     /// The thread to go back to when the settings close.
     returning_to: Cell<Option<ThreadKey>>,
     identity_save: Timer,
+    /// Where the window was left, once it has been put anywhere.
+    placement: Cell<Option<Placement>>,
+    placement_save: Timer,
 }
 
 impl Controller {
@@ -284,6 +289,8 @@ impl Controller {
             settings: Cell::new(settings),
             returning_to: Cell::new(None),
             identity_save: Timer::default(),
+            placement: Cell::default(),
+            placement_save: Timer::default(),
         });
         CONTROLLER.with(|c| *c.borrow_mut() = Rc::downgrade(&this));
         this.connect_callbacks();
@@ -742,6 +749,7 @@ impl Controller {
     /// and nobody is looking at it.
     fn close_window(&self) {
         self.save_identities();
+        self.save_placement();
         chrome::hide(&self.app);
         self.hide_page();
         self.editor.hide();
@@ -1241,7 +1249,7 @@ impl Controller {
         view.recipients = rendered.recipients.into();
         let files: Vec<FileItem> = compose::attachments(raw)
             .into_iter()
-            .map(|file| FileItem { size: writing::human_size(file.data.len()).into(), name: file.name.into() })
+            .map(|file| writing::file_item(file.name, file.data.len()))
             .collect();
         view.attachments = ModelRc::new(VecModel::from(files));
         match rendered.body {

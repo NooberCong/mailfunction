@@ -94,6 +94,18 @@ impl Default for Settings {
     }
 }
 
+/// Where the window was left. Not a preference: nobody chooses it on the settings screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Placement {
+    /// The frame's left and top edges on the desktop, in pixels.
+    pub left: i32,
+    pub top: i32,
+    /// With its frame, and as it comes back from being maximized.
+    pub width: i32,
+    pub height: i32,
+    pub maximized: bool,
+}
+
 /// Who an account is to the people it writes to, and whether it may interrupt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
@@ -118,6 +130,14 @@ impl Store {
         })
     }
 
+    pub fn save_placement(&self, placement: &Placement) -> Result<()> {
+        let json = serde_json::to_string(placement).expect("a placement is plain data");
+        self.with_tx(|tx| {
+            tx.execute("INSERT OR REPLACE INTO window_placement (id, json) VALUES (1, ?1)", [json])?;
+            Ok(())
+        })
+    }
+
     pub fn save_identity(&self, account_id: i64, identity: &Identity) -> Result<()> {
         self.with_tx(|tx| {
             tx.execute(
@@ -135,6 +155,12 @@ impl Reader {
         let json: Option<String> =
             self.conn().query_row("SELECT json FROM settings WHERE id = 1", [], |r| r.get(0)).optional().unwrap_or_default();
         json.and_then(|json| serde_json::from_str(&json).ok()).unwrap_or_default()
+    }
+
+    pub fn placement(&self) -> Option<Placement> {
+        let json: Option<String> =
+            self.conn().query_row("SELECT json FROM window_placement WHERE id = 1", [], |r| r.get(0)).optional().unwrap_or_default();
+        json.and_then(|json| serde_json::from_str(&json).ok())
     }
 
     pub fn identity(&self, account_id: i64) -> Result<Identity> {
@@ -176,6 +202,11 @@ mod tests {
         store.save_settings(&settings).unwrap();
         store.save_settings(&Settings { compact_list: true, ..settings }).unwrap();
         assert_eq!(reader.settings(), Settings { compact_list: true, ..settings });
+        assert_eq!(reader.placement(), None);
+        let placement = Placement { left: -8, top: 40, width: 1600, height: 900, maximized: true };
+        store.save_placement(&placement).unwrap();
+        store.save_placement(&placement).unwrap();
+        assert_eq!(reader.placement(), Some(placement));
         drop((store, reader));
         let _ = std::fs::remove_dir_all(&dir);
     }
