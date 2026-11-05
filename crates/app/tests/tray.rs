@@ -11,9 +11,9 @@ use mailfunction::startup;
 use mailfunction::tray::{CALLBACK, ICON_ID, NIN_SELECT};
 use mailfunction_core::settings::Settings;
 use mailfunction_core::store::{Account, AuthKind, LabelSpec, NewMessage, Role, Security, Store};
-use windows::Win32::Foundation::{FILETIME, HANDLE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::Shell::{NIM_DELETE, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect, Shell_NotifyIconW};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -90,14 +90,19 @@ fn has_icon(hwnd: HWND) -> bool {
     unsafe { Shell_NotifyIconGetRect(&raw const icon) }.is_ok()
 }
 
-fn cpu_time(pid: u32) -> Duration {
-    let ticks = |time: FILETIME| u64::from(time.dwHighDateTime) << 32 | u64::from(time.dwLowDateTime);
-    let (mut start, mut end, mut kernel, mut user) = Default::default();
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn QueryProcessCycleTime(process: HANDLE, cycles: *mut u64) -> i32;
+}
+
+fn cycles(pid: u32) -> u64 {
+    let mut cycles = 0;
     unsafe {
         let process: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).unwrap();
-        GetProcessTimes(process, &raw mut start, &raw mut end, &raw mut kernel, &raw mut user).unwrap();
+        assert_ne!(QueryProcessCycleTime(process, &raw mut cycles), 0);
+        CloseHandle(process).unwrap();
     }
-    Duration::from_nanos((ticks(kernel) + ticks(user)) * 100)
+    cycles
 }
 
 /// Saves the pixels of a window on screen, and only those: the rest of the desktop is private.
@@ -293,11 +298,14 @@ fn scenario(dir: &Path, app: &mut Child) {
     assert!(app.try_wait().unwrap().is_none(), "closing the window ended the app");
     assert!(has_icon(window), "the icon went with the window");
 
-    let before = cpu_time(pid);
-    std::thread::sleep(Duration::from_secs(5));
-    let spent = cpu_time(pid) - before;
-    println!("  {} ms of CPU in 5 s with the window closed", spent.as_millis());
-    assert!(spent < Duration::from_millis(250), "the closed app keeps working: {spent:?}");
+    // The account here cannot connect, so its status keeps changing behind the closed window. A
+    // thread asking for redraws spends 15 million cycles a second, and one that is idle next to
+    // none. Counted in cycles because Windows samples CPU time, and can miss this much altogether.
+    let before = cycles(pid);
+    std::thread::sleep(Duration::from_secs(10));
+    let spent = (cycles(pid) - before) / 1_000_000;
+    println!("  {spent} million cycles in 10 s with the window closed");
+    assert!(spent < 30, "the closed app keeps working: {spent} million cycles");
 
     println!("starting it with the window closed");
     start_again(dir);

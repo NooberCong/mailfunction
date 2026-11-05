@@ -2,6 +2,7 @@
 //! one piece while Snap Layouts, resizing and the caption buttons stay native.
 
 use std::num::NonZeroIsize;
+use std::time::Duration;
 
 use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle,
@@ -93,6 +94,9 @@ impl HasDisplayHandle for DialogParent {
     }
 }
 
+/// Long enough after the last frame for Slint's clock to have moved on from it.
+const LAST_FRAME_GONE: Duration = Duration::from_millis(50);
+
 /// How much of the screen the window takes the first time it opens.
 const FIRST_SHARE: f32 = 0.8;
 
@@ -178,12 +182,26 @@ pub(crate) fn placement(app: &App, last: Placement) -> Option<Placement> {
     })
 }
 
-/// Takes the window off the screen and the taskbar. Slint's own hide would destroy the native
-/// window, and everything that hangs from it: the webview, the tray icon and their listeners.
+/// Takes the window off the screen and the taskbar, at once, and then tells Slint.
+///
+/// Windows sends a hidden window no paint message, so a redraw Slint asks for there is never
+/// served, and it would keep asking at the display's refresh rate until the window came back. Its
+/// own hide cancels a request, but not one made after it: a frame still animating asks again as
+/// the loop goes idle, and so does the next change of anything on screen. So Slint hears of this
+/// only once no frame has been drawn for a while, which ends the animations, and the change made
+/// here is the one it asks about. It asks only once between frames, so nothing can ask again.
 pub(crate) fn hide(app: &App) {
-    if let Some(hwnd) = hwnd(app) {
-        let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
-    }
+    let Some(window) = hwnd(app) else { return };
+    let _ = unsafe { ShowWindow(window, SW_HIDE) };
+    let app = app.as_weak();
+    slint::Timer::single_shot(LAST_FRAME_GONE, move || {
+        let Some(app) = app.upgrade() else { return };
+        // It may be back already, which leaves Slint with nothing to hear.
+        if hwnd(&app).is_some_and(|window| !unsafe { IsWindowVisible(window) }.as_bool()) {
+            app.invoke_repaint();
+            let _ = app.hide();
+        }
+    });
 }
 
 /// Brings the window to the front, from wherever it was. Returns whether it had been hidden.
@@ -195,6 +213,8 @@ pub(crate) fn raise(app: &App) -> bool {
         let _ = app.show();
         if hidden {
             let _ = ShowWindow(hwnd, SW_SHOW);
+            // Windows dropped what the window showed, which Slint knows only if it heard of the hide.
+            app.invoke_repaint();
         }
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);

@@ -59,6 +59,12 @@ name = "editor"
 harness = false
 test = false
 
+# Opens a window.
+[[test]]
+name = "closed"
+harness = false
+test = false
+
 # Opens a window, and needs the real executable.
 [[test]]
 name = "tray"
