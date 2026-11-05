@@ -6,9 +6,10 @@ mod common;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use common::{RecordingNotifier, RecordingPane, click, fresh_dir, linger, offscreen, press, settle, shot, typed, with_control};
+use common::{RecordingEditor, RecordingNotifier, RecordingPane, click, fresh_dir, linger, offscreen, press, settle, shot, typed, with_control};
+use mailfunction::editor::EditorEvent;
 use mailfunction::notify::Opens;
-use mailfunction::{App, Controller, Pane, Theme, Tip};
+use mailfunction::{App, Controller, Pane, Theme, Tip, Verb};
 use mailfunction_core::engine::Event;
 use mailfunction_core::remote::Offline;
 use mailfunction_core::store::{Account, AuthKind, LabelSpec, NewMessage, Reader, Role, Security, Store};
@@ -66,6 +67,7 @@ struct Scene {
     store: Arc<Store>,
     reader: Reader,
     controller: Rc<Controller>,
+    editor: RecordingEditor,
     account: i64,
 }
 
@@ -86,6 +88,13 @@ impl Scene {
     fn open_subject(&self, subject: &str) {
         let row = self.subjects().iter().position(|s| s == subject).unwrap_or_else(|| panic!("no {subject}"));
         self.controller.select_row(row);
+        settle();
+    }
+
+    /// What the page would report on being written in.
+    fn write(&self, text: &str) {
+        let html = format!("<div>{text}</div>");
+        self.controller.editor_event(EditorEvent::Changed { html, text: text.into() });
         settle();
     }
 
@@ -150,12 +159,13 @@ fn scene() -> (Scene, std::path::PathBuf) {
 
     let app = App::new().unwrap();
     window.set_size(PhysicalSize::new(1280, 760));
-    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(RecordingPane::default()), Box::new(RecordingNotifier::default()), Arc::new(Offline)).unwrap();
+    let editor = RecordingEditor::default();
+    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(RecordingPane::default()), Box::new(editor.clone()), Box::new(RecordingNotifier::default()), Arc::new(Offline)).unwrap();
     app.show().unwrap();
     window.dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
     controller.load_accounts().unwrap();
     settle();
-    (Scene { dir: dir.clone(), app, store, reader, controller, account }, dir)
+    (Scene { dir: dir.clone(), app, store, reader, controller, editor, account }, dir)
 }
 
 fn rusqlite_id(dir: &std::path::Path, uid: u32) -> i64 {
@@ -307,6 +317,7 @@ fn a_day_of_mail() {
     writing(&s);
     searching(&s);
     across_accounts(&s);
+    all_accounts(&s);
 
     drop(s);
     let _ = std::fs::remove_dir_all(&dir);
@@ -315,12 +326,12 @@ fn a_day_of_mail() {
 impl Scene {
     fn controller_label_count(&self, name: &str) -> usize {
         let label = self.reader.labels(self.account).unwrap().into_iter().find(|l| l.name == name).unwrap();
-        self.reader.message_count(label.id).unwrap()
+        self.reader.message_count(&[label.id]).unwrap()
     }
 
     fn drafts(&self) -> Vec<String> {
         let label = self.reader.labels(self.account).unwrap().into_iter().find(|l| l.role == Role::Drafts).unwrap();
-        self.reader.messages(label.id, 0, 10).unwrap().into_iter().map(|m| m.subject).collect()
+        self.reader.messages(&[label.id], 0, 10).unwrap().into_iter().map(|m| m.subject).collect()
     }
 }
 
@@ -465,7 +476,8 @@ fn writing(s: &Scene) {
     assert!(app.get_draft_error().contains("Bin"), "{}", app.get_draft_error());
     settle();
     shot(app, "30-compose-error");
-    click(app, 1240.0, 738.0);
+    s.controller.editor_event(EditorEvent::Discard);
+    settle();
     assert!(!app.get_composing(), "the delete button");
     assert!(s.drafts().is_empty());
 
@@ -483,7 +495,7 @@ fn writing(s: &Scene) {
     press(app, TAB);
     assert_eq!(app.get_draft_to(), "Nguyễn Thị Minh Anh <minhanh@example.vn>, Trần Đức Huy <huy.tran@example.vn>, ", "the caret went to the end");
     app.set_draft_subject("Hello".into());
-    app.set_draft_body("Text".into());
+    s.write("Text");
 
     // Sending waits a moment, in which it can be called back as it was.
     with_control(app, ENTER);
@@ -497,7 +509,8 @@ fn writing(s: &Scene) {
     assert_eq!(s.drafts(), ["Hello"]);
     // A long list of people stays in its field, with the rest of the composer where it was.
     shot(app, "33-long-recipients");
-    click(app, 1240.0, 738.0);
+    s.controller.editor_event(EditorEvent::Discard);
+    settle();
     assert!(s.drafts().is_empty());
 
     // A reply is addressed, quoted and in the thread, with the cursor ready above the quote.
@@ -506,13 +519,15 @@ fn writing(s: &Scene) {
     assert!(app.get_composing());
     assert_eq!(app.get_draft_to(), "Nguyễn Thị Minh Anh <minhanh@example.vn>");
     assert_eq!(app.get_draft_cc(), "");
-    assert!(app.get_draft_body().contains("> Em đã đặt phòng."), "{}", app.get_draft_body());
+    assert!(s.controller.draft_text().contains("> Em đã đặt phòng."), "{}", s.controller.draft_text());
+    assert!(s.editor.opened.borrow().last().unwrap().contains("<blockquote><div>Em đã đặt phòng.</div>"), "the editor quotes it as a quote");
     assert_eq!(app.get_draft_subject(), "Re: Lịch họp tuần sau");
-    typed(app, "Đồng ý");
-    assert!(app.get_draft_body().starts_with("Đồng ý"), "{}", app.get_draft_body());
+    s.write("Đồng ý");
+    assert!(s.controller.draft_text().starts_with("Đồng ý"), "{}", s.controller.draft_text());
     settle();
     shot(app, "33-reply");
-    click(app, 1240.0, 738.0);
+    s.controller.editor_event(EditorEvent::Discard);
+    settle();
 
     // Left untouched, a reply was never worth keeping.
     press(app, "r");
@@ -553,7 +568,8 @@ fn writing(s: &Scene) {
     assert!(app.get_draft_error().contains("too large"), "{}", app.get_draft_error());
     let _ = std::fs::remove_file(&file);
     let _ = std::fs::remove_file(&large);
-    click(app, 1240.0, 738.0);
+    s.controller.editor_event(EditorEvent::Discard);
+    settle();
 
     // Opening another message from the list saves what was being written.
     press(app, "c");
@@ -561,7 +577,7 @@ fn writing(s: &Scene) {
     click(app, 400.0, 170.0);
     assert!(!app.get_composing());
     assert_eq!(s.drafts().len(), 1);
-    let draft = s.reader.messages(s.reader.labels(s.account).unwrap().into_iter().find(|l| l.role == Role::Drafts).unwrap().id, 0, 1).unwrap()[0].id;
+    let draft = s.reader.messages(&[s.reader.labels(s.account).unwrap().into_iter().find(|l| l.role == Role::Drafts).unwrap().id], 0, 1).unwrap()[0].id;
     s.store.discard_draft(draft).unwrap();
 
     // A search finds mail waiting to go, and opening it takes it back rather than edit it live.
@@ -581,7 +597,8 @@ fn writing(s: &Scene) {
     assert_eq!(s.drafts(), ["Waiting"], "back from the outbox");
     assert!(s.store.queue_send(waiting.id, 0).is_ok(), "and an ordinary draft again");
     s.store.cancel_send(waiting.id).unwrap();
-    click(app, 1240.0, 738.0);
+    s.controller.editor_event(EditorEvent::Discard);
+    settle();
     press(app, ESCAPE);
 
     // The outcome of a send arrives as a notice, whichever way it went.
@@ -614,7 +631,7 @@ fn across_accounts(s: &Scene) {
     assert_eq!(app.get_thread().row_count(), 3);
     assert_eq!(s.drafts().len(), 1);
     let drafts = s.reader.labels(s.account).unwrap().into_iter().find(|l| l.role == Role::Drafts).unwrap();
-    s.store.discard_draft(s.reader.messages(drafts.id, 0, 1).unwrap()[0].id).unwrap();
+    s.store.discard_draft(s.reader.messages(&[drafts.id], 0, 1).unwrap()[0].id).unwrap();
     let work = Account { email: "work@example.com".into(), ..s.reader.accounts().unwrap()[0].clone() };
     let work_id = s.store.add_account(&work).unwrap();
     s.store.ensure_label(work_id, &LabelSpec::system(Role::Inbox)).unwrap();
@@ -644,7 +661,7 @@ fn across_accounts(s: &Scene) {
     assert!(!app.get_composing());
     assert_eq!(s.drafts().len(), 1);
     let work_drafts = s.reader.labels(work_id).unwrap().into_iter().find(|l| l.role == Role::Drafts).unwrap();
-    assert_eq!(s.reader.message_count(work_drafts.id).unwrap(), 0);
+    assert_eq!(s.reader.message_count(&[work_drafts.id]).unwrap(), 0);
     s.controller.select_account(0);
     settle();
 
@@ -655,6 +672,143 @@ fn across_accounts(s: &Scene) {
     click(app, 90.0, 112.0);
     assert!(!app.get_searching(), "the sidebar leaves the search");
     assert_eq!(app.get_active_label(), 1);
+}
+
+/// Every account in one list, where whatever is done goes by the account the mail is in.
+fn all_accounts(s: &Scene) {
+    let app = &s.app;
+    let work = s.reader.accounts().unwrap()[1].id;
+    let inbox = s.store.folder(work, "INBOX", &LabelSpec::system(Role::Inbox)).unwrap();
+    let mail = |uid: u32, thread: u64, subject: &str, hours_ago: i64| NewMessage {
+        uid,
+        remote_id: format!("work:{uid}"),
+        gm_thread_id: Some(thread),
+        mid: Some(format!("work{uid}@x")),
+        references: vec![],
+        subject: subject.into(),
+        from_name: "Priya Shah".into(),
+        from_addr: "priya@work.example".into(),
+        date: NOW - hours_ago * 3600,
+        size: 1000,
+        seen: false,
+        flagged: false,
+        labels: vec![],
+    };
+    // Thread 1 is also the first account's, and it must stay a different conversation.
+    s.store.save_messages(&inbox, &[mail(1, 1, "Quarterly numbers", 1), mail(2, 2, "Offsite plan", 4)]).unwrap();
+    let ids: Vec<i64> = s.reader.messages(&[inbox.label_id], 0, 10).unwrap().iter().map(|m| m.id).collect();
+    for (id, subject) in ids.iter().zip(["Quarterly numbers", "Offsite plan"]) {
+        s.store.save_body(*id, &body(subject, "Priya Shah <priya@work.example>", "See attached.")).unwrap();
+    }
+    s.controller.select_label(0);
+    let on_first = s.subjects().len();
+
+    with_control(app, "0");
+    assert_eq!(app.get_active_account(), -1);
+    assert_eq!(s.subjects().len(), on_first + 2);
+    assert_eq!(s.subjects()[0], "Quarterly numbers", "newest first across accounts");
+    let rows: Vec<_> = app.get_rows().iter().collect();
+    assert!(rows.iter().all(|r| (r.account == 1) == (r.sender == "Priya Shah")), "each row says whose it is");
+    let names: Vec<String> = app.get_labels().iter().map(|l| l.name.to_string()).collect();
+    assert!(names.contains(&"Inbox".to_string()) && !names.contains(&"Hóa đơn".to_string()), "{names:?}");
+    let total: i64 = app.get_accounts().iter().map(|a| a.unread.parse::<i64>().unwrap_or(0)).sum();
+    assert_eq!(app.get_all_unread(), total.to_string());
+    assert_eq!(s.unread(), total.to_string());
+    shot(app, "27-all-accounts");
+
+    // Opening and changing mail reaches its own account, and the same thread id means nothing.
+    let pending = s.store.pending_count(s.account).unwrap();
+    s.open_subject("Quarterly numbers");
+    assert_eq!(app.get_pane(), Pane::Text);
+    assert_eq!(app.get_thread().row_count(), 1, "the first account's thread 1 stays out of it");
+    linger();
+    assert_eq!(s.store.pending_count(work).unwrap(), 1, "read, in its own account");
+    assert_eq!(s.store.pending_count(s.account).unwrap(), pending);
+    press(app, "s");
+    assert_eq!(s.store.pending_count(work).unwrap(), 2);
+    assert_eq!(app.get_selected_row(), 0, "the open thread keeps its place");
+
+    // A reply goes from the account the mail came to.
+    press(app, "r");
+    assert!(app.get_composing());
+    assert_eq!(app.get_draft_from(), 1);
+    shot(app, "28-from");
+    s.write("Thanks");
+    let first_drafts = s.drafts().len();
+    press(app, ESCAPE);
+    assert_eq!(s.drafts().len(), first_drafts);
+    let drafts = s.reader.labels(work).unwrap().into_iter().find(|l| l.role == Role::Drafts).unwrap();
+    assert_eq!(s.reader.message_count(&[drafts.id]).unwrap(), 1);
+    assert_eq!(s.reader.thread(work, 1, false).unwrap().len(), 1, "a draft is no part of the conversation yet");
+
+    // All of it read, in every account, and all of it back.
+    s.open_subject("3 issues assigned to you");
+    linger();
+    press(app, "u");
+    let queued = (s.store.pending_count(s.account).unwrap(), s.store.pending_count(work).unwrap());
+    app.invoke_verb(Verb::ReadAll);
+    settle();
+    assert_eq!(app.get_all_unread(), "");
+    assert!(s.store.pending_count(s.account).unwrap() > queued.0 && s.store.pending_count(work).unwrap() > queued.1);
+    press(app, "z");
+    assert!(app.get_all_unread() != "");
+    assert_eq!(s.unread(), app.get_all_unread().to_string());
+
+    // A search covers every account, and a server's late answer finishes only its own part.
+    press(app, "/");
+    typed(app, "plan");
+    linger();
+    assert_eq!(s.subjects(), ["Offsite plan"]);
+    s.controller.run_search();
+    press(app, ESCAPE);
+    press(app, "/");
+    typed(app, "n");
+    linger();
+    let found = s.subjects();
+    assert!(found.iter().any(|t| t.contains("Quarterly numbers")), "{found:?}");
+    assert!(found.iter().any(|t| t.contains("Hóa đơn") || t.contains("Lịch")), "{found:?}");
+    press(app, ESCAPE);
+    assert_eq!(s.subjects().len(), on_first + 2);
+
+    // New mail starts from the first account, and can go from any, signature and all.
+    app.invoke_identity_edited(0, "".into(), "Kong".into(), true);
+    app.invoke_identity_edited(1, "".into(), "Kong at Work".into(), true);
+    press(app, "c");
+    assert_eq!(app.get_draft_from(), 0);
+    assert_eq!(s.controller.draft_text(), "\n\n-- \nKong");
+    assert!(s.editor.opened.borrow().last().unwrap().contains(r#"<div class="signature">-- <br>Kong</div>"#));
+    click(app, 700.0, 30.0);
+    assert!(app.get_choosing_sender(), "the From line offers the accounts");
+    shot(app, "29-from-accounts");
+    press(app, ESCAPE);
+    assert!(!app.get_choosing_sender() && app.get_composing(), "Esc closes only the list");
+    typed(app, "a@example.com");
+    with_control(app, "2");
+    assert_eq!(app.get_draft_from(), 1);
+    assert_eq!(s.editor.signed.borrow().last().unwrap(), r#"<div class="signature">-- <br>Kong at Work</div>"#);
+    press(app, ESCAPE);
+    assert_eq!(s.reader.message_count(&[drafts.id]).unwrap(), 2, "saved where it now belongs");
+
+    // A notification opens its message here, without leaving the list of everything.
+    s.controller.open(Opens { account: work, message: Some(ids[1]) });
+    settle();
+    assert_eq!(app.get_active_account(), -1);
+    assert_eq!(s.subjects()[app.get_selected_row() as usize], "Offsite plan");
+
+    // Mail for any account reaches this list.
+    s.store.save_messages(&inbox, &[mail(3, 3, "Just in", 0)]).unwrap();
+    s.controller.on_event(work, Event::Changed);
+    linger();
+    assert_eq!(s.subjects()[0], "Just in");
+
+    // One account left has nothing to bring together.
+    s.controller.remove_account(1);
+    settle();
+    assert_eq!(app.get_active_account(), 0);
+    assert_eq!(s.subjects().len(), on_first);
+    assert!(app.get_rows().iter().all(|r| r.account == -1), "and no rows need telling apart");
+    with_control(app, "0");
+    assert_eq!(app.get_active_account(), 0);
 }
 
 fn searching(s: &Scene) {

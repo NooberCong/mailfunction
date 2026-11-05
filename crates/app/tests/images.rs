@@ -2,6 +2,8 @@
 //! web that takes its time. Opens a window but injects no input, and needs no servers.
 //! Run with `cargo test -p mailfunction --test images`.
 
+mod common;
+
 use std::cell::{Cell, RefCell};
 use std::future::poll_fn;
 use std::rc::Rc;
@@ -11,7 +13,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
-use mailfunction::notify::{Notice, Notifier};
 use mailfunction::webview::Webview;
 use mailfunction::{App, Controller, ImageBar, Pane, Theme};
 use mailfunction_core::remote::{Logo, Network};
@@ -57,12 +58,6 @@ impl Network for SlowWeb {
     fn logo(&self, _: &str) -> Logo {
         Logo::Unknown
     }
-}
-
-struct Silent;
-
-impl Notifier for Silent {
-    fn show(&self, _: &Notice) {}
 }
 
 fn sleep(ms: u64) -> impl Future<Output = ()> {
@@ -295,7 +290,7 @@ fn main() {
     let messages: Vec<NewMessage> = bodies.iter().zip(1..).map(|((subject, _), uid)| mail(uid, subject)).collect();
     store.save_messages(&inbox, &messages).unwrap();
     let reader = Reader::open(&dir).unwrap();
-    for row in reader.messages(inbox.label_id, 0, 10).unwrap() {
+    for row in reader.messages(&[inbox.label_id], 0, 10).unwrap() {
         let (_, raw) = bodies.iter().find(|(subject, _)| *subject == row.subject).unwrap();
         store.save_body(row.id, raw).unwrap();
     }
@@ -303,8 +298,9 @@ fn main() {
     let app = App::new().unwrap();
     let web = Arc::new(SlowWeb::default());
     let view = Rc::new(Webview::new(dir.join("webview")));
-    let controller =
-        Controller::new(app.clone_strong(), &dir, None, Box::new(view.clone()), Box::new(Silent), web.clone()).unwrap();
+    let editor = Box::new(common::RecordingEditor::default());
+    let notifier = Box::new(common::RecordingNotifier::default());
+    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(view.clone()), editor, notifier, web.clone()).unwrap();
     controller.load_accounts().unwrap();
     let theme = app.global::<Theme>();
     let mut settings = Settings::from(theme.get_preferences());

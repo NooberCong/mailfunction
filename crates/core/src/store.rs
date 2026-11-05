@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 
 use mail_parser::MessageParser;
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, params_from_iter};
 
 use crate::Result;
 use crate::draft::finished_elsewhere;
@@ -177,6 +177,11 @@ const MIGRATIONS: &[&str] = &["
     ALTER TABLE account ADD COLUMN name TEXT NOT NULL DEFAULT '';
     ALTER TABLE account ADD COLUMN signature TEXT NOT NULL DEFAULT '';
     ALTER TABLE account ADD COLUMN notify INTEGER NOT NULL DEFAULT 1;
+", "
+    -- Empty for a draft written before there was formatting: `body` is all of it.
+    ALTER TABLE draft ADD COLUMN html TEXT NOT NULL DEFAULT '';
+    -- Set for a picture in the text of a draft, which `cid:` in its HTML points to.
+    ALTER TABLE bodies.attachment ADD COLUMN content_id TEXT;
 "];
 
 /// The migration that added search. Bodies stored before it are indexed once, on opening.
@@ -256,6 +261,23 @@ impl Role {
             "trash" => Role::Trash,
             _ => Role::None,
         }
+    }
+
+    /// Where a role comes in the sidebar.
+    fn rank(self) -> usize {
+        const ORDER: [Role; 10] = [
+            Role::Inbox,
+            Role::Starred,
+            Role::Sent,
+            Role::Drafts,
+            Role::Outbox,
+            Role::All,
+            Role::Archive,
+            Role::Spam,
+            Role::Trash,
+            Role::None,
+        ];
+        ORDER.iter().position(|role| *role == self).unwrap_or(ORDER.len())
     }
 
     /// Display name, which is also the stored name for a system label.
@@ -351,6 +373,27 @@ pub struct LabelRow {
     pub unread: i64,
 }
 
+/// A thread, which only means something in its own account: (account id, thread id). Gmail's
+/// thread ids come from each mailbox, so two accounts can hold the same number.
+pub type ThreadKey = (i64, i64);
+
+/// A line of the sidebar: one label, or with several accounts on screen, the same system label
+/// of each of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarLabel {
+    /// Each label behind this line, as (account id, label id).
+    pub held: Vec<(i64, i64)>,
+    pub name: String,
+    pub role: Role,
+    pub unread: i64,
+}
+
+impl SidebarLabel {
+    pub fn ids(&self) -> Vec<i64> {
+        self.held.iter().map(|(_, label)| *label).collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageRow {
     pub id: i64,
@@ -365,6 +408,13 @@ pub struct MessageRow {
     pub flagged: bool,
     /// Messages in the thread, as [`Reader::thread`] would list them.
     pub count: i64,
+    pub account_id: i64,
+}
+
+impl MessageRow {
+    pub fn thread_key(&self) -> ThreadKey {
+        (self.account_id, self.thread_id)
+    }
 }
 
 fn configure(conn: &Connection, dir: &Path, cache_kib: i64) -> Result<()> {
@@ -959,7 +1009,8 @@ static THREAD_COLUMNS: LazyLock<String> = LazyLock::new(|| {
         "m.id, m.thread_id, m.from_name, m.from_addr, m.subject, m.date,
          coalesce((SELECT min(t.seen) {peers}), m.seen),
          coalesce((SELECT max(t.flagged) {peers}), m.flagged),
-         (SELECT count(*) {peers})"
+         (SELECT count(*) {peers}),
+         m.account_id"
     )
 });
 
@@ -974,7 +1025,13 @@ fn thread_row(r: &Row) -> rusqlite::Result<MessageRow> {
         seen: r.get(6)?,
         flagged: r.get(7)?,
         count: r.get(8)?,
+        account_id: r.get(9)?,
     })
+}
+
+/// `count` numbered SQL parameters, from `?first` on.
+fn placeholders(first: usize, count: usize) -> String {
+    (first..first + count).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ")
 }
 
 /// Someone mail can be addressed to.
@@ -1053,7 +1110,7 @@ impl Reader {
     /// Those of `ids` that are unread in the Inbox, newest first.
     pub fn unread_in_inbox(&self, ids: &[i64]) -> Result<Vec<MessageRow>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT m.id, m.thread_id, m.from_name, m.from_addr, m.subject, m.date, m.seen, m.flagged, 1 FROM message m
+            "SELECT m.id, m.thread_id, m.from_name, m.from_addr, m.subject, m.date, m.seen, m.flagged, 1, m.account_id FROM message m
              WHERE m.id = ?1 AND m.seen = 0 AND EXISTS (
                  SELECT 1 FROM message_label ml JOIN label l ON l.id = ml.label_id
                  WHERE ml.message_id = m.id AND l.role = 'inbox')",
@@ -1100,59 +1157,105 @@ impl Reader {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        const ORDER: [Role; 10] = [
-            Role::Inbox,
-            Role::Starred,
-            Role::Sent,
-            Role::Drafts,
-            Role::Outbox,
-            Role::All,
-            Role::Archive,
-            Role::Spam,
-            Role::Trash,
-            Role::None,
-        ];
         // Mail in its few seconds of undo is not stuck, and is not worth a line in the sidebar.
         let mut stuck = self.conn.prepare_cached(
             "SELECT 1 FROM draft d JOIN message m ON m.id = d.message_id WHERE m.account_id = ?1 AND d.state = 'retrying'",
         )?;
         let stuck = stuck.exists([account_id])?;
         labels.retain(|l| l.role != Role::Outbox || stuck);
-        labels.sort_by_cached_key(|l| (ORDER.iter().position(|r| *r == l.role), l.name.to_lowercase()));
+        labels.sort_by_cached_key(|l| (l.role.rank(), l.name.to_lowercase()));
         Ok(labels)
     }
 
-    /// Threads in a label.
-    pub fn message_count(&self, label_id: i64) -> Result<usize> {
-        let mut stmt = self.conn.prepare_cached("SELECT count(*) FROM message_label WHERE label_id = ?1 AND head = 1")?;
-        let count: i64 = stmt.query_row([label_id], |r| r.get(0))?;
+    /// The sidebar for these accounts. Several accounts share their system labels, one line for
+    /// each role. User labels mean something only in their own account, so they stay there.
+    pub fn sidebar(&self, accounts: &[i64]) -> Result<Vec<SidebarLabel>> {
+        let mut lines: Vec<SidebarLabel> = Vec::new();
+        for &account in accounts {
+            for label in self.labels(account)? {
+                match lines.iter_mut().find(|line| line.role == label.role && label.role != Role::None) {
+                    Some(line) => {
+                        line.held.push((account, label.id));
+                        line.unread += label.unread;
+                    }
+                    None if label.role != Role::None || accounts.len() == 1 => lines.push(SidebarLabel {
+                        held: vec![(account, label.id)],
+                        name: label.name,
+                        role: label.role,
+                        unread: label.unread,
+                    }),
+                    None => {}
+                }
+            }
+        }
+        // A role only a later account has joins the lines out of order. The sort is stable, so
+        // user labels keep the order they came in.
+        lines.sort_by_key(|line| line.role.rank());
+        Ok(lines)
+    }
+
+    /// Whether the account has a label with this role.
+    pub fn has_role(&self, account_id: i64, role: Role) -> Result<bool> {
+        let mut stmt = self.conn.prepare_cached("SELECT 1 FROM label WHERE account_id = ?1 AND role = ?2")?;
+        Ok(stmt.exists(params![account_id, role.as_str()])?)
+    }
+
+    /// The account a message is in.
+    pub fn account_of(&self, message_id: i64) -> Result<Option<i64>> {
+        let mut stmt = self.conn.prepare_cached("SELECT account_id FROM message WHERE id = ?1")?;
+        Ok(stmt.query_row([message_id], |r| r.get(0)).optional()?)
+    }
+
+    /// Threads in these labels. No labels, as for an account yet to sync, is no mail.
+    pub fn message_count(&self, labels: &[i64]) -> Result<usize> {
+        if labels.is_empty() {
+            return Ok(0);
+        }
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT count(*) FROM message_label WHERE label_id IN ({}) AND head = 1",
+            placeholders(1, labels.len())
+        ))?;
+        let count: i64 = stmt.query_row(params_from_iter(labels), |r| r.get(0))?;
         Ok(count as usize)
     }
 
-    /// Where a thread sits in a label's list, or `None` if it is not there.
-    pub fn position(&self, label_id: i64, thread_id: i64) -> Result<Option<usize>> {
-        let mut stmt = self.conn.prepare_cached(
+    /// Where a thread sits in the list of these labels, or `None` if it is not there.
+    pub fn position(&self, labels: &[i64], (account_id, thread_id): ThreadKey) -> Result<Option<usize>> {
+        if labels.is_empty() {
+            return Ok(None);
+        }
+        let held = placeholders(3, labels.len());
+        let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT (SELECT count(*) FROM message_label b
-                     WHERE b.label_id = a.label_id AND b.head = 1 AND (b.date, b.message_id) > (a.date, a.message_id))
+                     WHERE b.label_id IN ({held}) AND b.head = 1 AND (b.date, b.message_id) > (a.date, a.message_id))
              FROM message_label a JOIN message m ON m.id = a.message_id
-             WHERE a.label_id = ?1 AND a.head = 1 AND m.thread_id = ?2
-               AND m.account_id = (SELECT account_id FROM label WHERE id = ?1)",
-        )?;
-        let position: Option<i64> = stmt.query_row(params![label_id, thread_id], |r| r.get(0)).optional()?;
+             WHERE a.label_id IN ({held}) AND a.head = 1 AND m.account_id = ?1 AND m.thread_id = ?2"
+        ))?;
+        let values = [account_id, thread_id].into_iter().chain(labels.iter().copied());
+        let position: Option<i64> = stmt.query_row(params_from_iter(values), |r| r.get(0)).optional()?;
         Ok(position.map(|p| p as usize))
     }
 
-    /// One window of a label's threads, newest first. Never load a whole mailbox.
-    pub fn messages(&self, label_id: i64, offset: usize, limit: usize) -> Result<Vec<MessageRow>> {
+    /// One window of these labels' threads, newest first. Never load a whole mailbox. Each label
+    /// is its own arm of the union because SQLite merges arms that are already in order, walking
+    /// the indexes side by side, where `label_id IN` would sort all of them for every page.
+    pub fn messages(&self, labels: &[i64], offset: usize, limit: usize) -> Result<Vec<MessageRow>> {
+        if labels.is_empty() {
+            return Ok(Vec::new());
+        }
+        let arms: Vec<String> = (0..labels.len())
+            .map(|i| format!("SELECT date, message_id FROM message_label WHERE label_id = ?{} AND head = 1", i + 3))
+            .collect();
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {}
-             FROM message_label ml JOIN message m ON m.id = ml.message_id
-             WHERE ml.label_id = ?1 AND ml.head = 1
-             ORDER BY ml.date DESC, ml.message_id DESC
-             LIMIT ?2 OFFSET ?3",
-            *THREAD_COLUMNS
+             FROM ({} ORDER BY 1 DESC, 2 DESC LIMIT ?1 OFFSET ?2) page
+             JOIN message m ON m.id = page.message_id
+             ORDER BY page.date DESC, page.message_id DESC",
+            *THREAD_COLUMNS,
+            arms.join(" UNION ALL ")
         ))?;
-        let rows = stmt.query_map(params![label_id, limit as i64, offset as i64], thread_row)?;
+        let values = [limit as i64, offset as i64].into_iter().chain(labels.iter().copied());
+        let rows = stmt.query_map(params_from_iter(values), thread_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -1160,7 +1263,7 @@ impl Reader {
     /// Trash or Spam instead of the rest, because a thread can be split between the two.
     pub fn thread(&self, account_id: i64, thread_id: i64, binned: bool) -> Result<Vec<MessageRow>> {
         let mut stmt = self.conn.prepare_cached(&format!(
-            "SELECT t.id, t.thread_id, t.from_name, t.from_addr, t.subject, t.date, t.seen, t.flagged, 1
+            "SELECT t.id, t.thread_id, t.from_name, t.from_addr, t.subject, t.date, t.seen, t.flagged, 1, t.account_id
              FROM message t INDEXED BY message_thread
              WHERE t.account_id = ?1 AND t.thread_id = ?2 AND {READABLE} AND {IN_BIN} = ?3
              ORDER BY t.date, t.id"
@@ -1377,12 +1480,66 @@ mod tests {
         let batch: Vec<_> = (1..=5).map(|i| message(i, &format!("m{i}"), i as i64)).collect();
         f.store.save_messages(&f.inbox, &batch).unwrap();
         let label = f.inbox.label_id;
-        assert_eq!(f.reader.message_count(label).unwrap(), 5);
-        let page: Vec<_> = f.reader.messages(label, 1, 2).unwrap();
+        assert_eq!(f.reader.message_count(&[label]).unwrap(), 5);
+        let page: Vec<_> = f.reader.messages(&[label], 1, 2).unwrap();
         assert_eq!(page.iter().map(|m| m.date).collect::<Vec<_>>(), [4, 3]);
-        assert_eq!(f.reader.position(label, page[0].thread_id).unwrap(), Some(1));
-        assert_eq!(f.reader.position(label, page[1].thread_id).unwrap(), Some(2));
-        assert_eq!(f.reader.position(label, -1).unwrap(), None);
+        assert_eq!(f.reader.position(&[label], page[0].thread_key()).unwrap(), Some(1));
+        assert_eq!(f.reader.position(&[label], page[1].thread_key()).unwrap(), Some(2));
+        assert_eq!(f.reader.position(&[label], (f.account, -1)).unwrap(), None);
+    }
+
+    /// A second account, with an Inbox of its own.
+    fn other_account(f: &Fixture) -> (i64, Folder) {
+        let email = "other@example.com".to_string();
+        let other = f.store.add_account(&Account { email, ..f.reader.accounts().unwrap()[0].clone() }).unwrap();
+        (other, f.store.folder(other, "INBOX", &LabelSpec::system(Role::Inbox)).unwrap())
+    }
+
+    #[test]
+    fn accounts_share_a_list_and_keep_their_threads_to_themselves() {
+        let f = fixture();
+        let (other, theirs) = other_account(&f);
+        // Gmail's thread ids come from each mailbox, so these two are strangers.
+        let threaded = |uid, id, date| NewMessage { gm_thread_id: Some(7), ..message(uid, id, date) };
+        f.store.save_messages(&f.inbox, &[threaded(1, "a", 10), threaded(2, "b", 30)]).unwrap();
+        f.store.save_messages(&theirs, &[threaded(1, "c", 20), message(2, "d", 40)]).unwrap();
+        let labels = [f.inbox.label_id, theirs.label_id];
+
+        assert_eq!(f.reader.message_count(&labels).unwrap(), 3);
+        let rows = f.reader.messages(&labels, 0, 10).unwrap();
+        assert_eq!(rows.iter().map(|m| m.date).collect::<Vec<_>>(), [40, 30, 20], "newest first, whoever it is for");
+        assert_eq!(rows.iter().map(|m| m.account_id).collect::<Vec<_>>(), [other, f.account, other]);
+        assert_eq!(rows.iter().map(|m| m.count).collect::<Vec<_>>(), [1, 2, 1], "no thread reaches across");
+        assert_eq!(f.reader.messages(&labels, 1, 1).unwrap()[0].date, 30, "pages run through the merged list");
+        for (position, row) in rows.iter().enumerate() {
+            assert_eq!(f.reader.position(&labels, row.thread_key()).unwrap(), Some(position));
+        }
+
+        assert_eq!(f.reader.message_count(&[]).unwrap(), 0, "an account yet to sync has no labels");
+        assert!(f.reader.messages(&[], 0, 10).unwrap().is_empty());
+        assert_eq!(f.reader.position(&[], rows[0].thread_key()).unwrap(), None);
+    }
+
+    #[test]
+    fn the_sidebar_shares_system_labels_and_leaves_user_labels_at_home() {
+        let f = fixture();
+        let (other, theirs) = other_account(&f);
+        let work = f.store.folder(f.account, "Work", &LabelSpec::user("Work")).unwrap();
+        f.store.folder(f.account, "Trash", &LabelSpec::system(Role::Trash)).unwrap();
+        f.store.folder(other, "Sent", &LabelSpec::system(Role::Sent)).unwrap();
+        f.store.save_messages(&f.inbox, &[message(1, "a", 1)]).unwrap();
+        f.store.save_messages(&work, &[message(2, "b", 2)]).unwrap();
+        f.store.save_messages(&theirs, &[message(1, "c", 3), message(2, "d", 4)]).unwrap();
+
+        let roles = |lines: &[SidebarLabel]| lines.iter().map(|l| l.role).collect::<Vec<_>>();
+        let one = f.reader.sidebar(&[f.account]).unwrap();
+        assert_eq!(roles(&one), [Role::Inbox, Role::Starred, Role::Trash, Role::None]);
+        assert_eq!(one[3].name, "Work");
+
+        let both = f.reader.sidebar(&[f.account, other]).unwrap();
+        assert_eq!(roles(&both), [Role::Inbox, Role::Starred, Role::Sent, Role::Trash], "in sidebar order, wherever each came from");
+        assert_eq!(both[0].held, [(f.account, f.inbox.label_id), (other, theirs.label_id)]);
+        assert_eq!(both[0].unread, 3);
     }
 
     #[test]
@@ -1391,24 +1548,24 @@ mod tests {
         let work = f.store.folder(f.account, "Work", &LabelSpec::user("Work")).unwrap();
         f.store.save_messages(&f.inbox, &[message(1, "same", 1)]).unwrap();
         f.store.save_messages(&work, &[message(9, "same", 1)]).unwrap();
-        let id = f.reader.messages(f.inbox.label_id, 0, 1).unwrap()[0].id;
-        assert_eq!(f.reader.messages(work.label_id, 0, 1).unwrap()[0].id, id);
+        let id = f.reader.messages(&[f.inbox.label_id], 0, 1).unwrap()[0].id;
+        assert_eq!(f.reader.messages(&[work.label_id], 0, 1).unwrap()[0].id, id);
 
         f.store.remove_uids(&f.inbox, &[1]).unwrap();
-        assert_eq!(f.reader.message_count(f.inbox.label_id).unwrap(), 0);
-        assert_eq!(f.reader.messages(work.label_id, 0, 1).unwrap()[0].id, id);
+        assert_eq!(f.reader.message_count(&[f.inbox.label_id]).unwrap(), 0);
+        assert_eq!(f.reader.messages(&[work.label_id], 0, 1).unwrap()[0].id, id);
     }
 
     #[test]
     fn removing_the_last_location_deletes_message_and_body() {
         let f = fixture();
         f.store.save_messages(&f.inbox, &[message(1, "m", 1)]).unwrap();
-        let id = f.reader.messages(f.inbox.label_id, 0, 1).unwrap()[0].id;
+        let id = f.reader.messages(&[f.inbox.label_id], 0, 1).unwrap()[0].id;
         f.store.save_body(id, b"raw").unwrap();
         assert_eq!(f.reader.body(id).unwrap().as_deref(), Some(&b"raw"[..]));
 
         f.store.remove_uids(&f.inbox, &[1]).unwrap();
-        assert_eq!(f.reader.message_count(f.inbox.label_id).unwrap(), 0, "hidden at once");
+        assert_eq!(f.reader.message_count(&[f.inbox.label_id]).unwrap(), 0, "hidden at once");
         assert!(f.reader.body(id).unwrap().is_some(), "kept in case it moved to a later folder");
 
         f.store.purge_orphans(f.account).unwrap();
@@ -1420,14 +1577,14 @@ mod tests {
         let f = fixture();
         let work = f.store.folder(f.account, "Work", &LabelSpec::user("Work")).unwrap();
         f.store.save_messages(&f.inbox, &[message(1, "m", 1)]).unwrap();
-        let id = f.reader.messages(f.inbox.label_id, 0, 1).unwrap()[0].id;
+        let id = f.reader.messages(&[f.inbox.label_id], 0, 1).unwrap()[0].id;
         f.store.save_body(id, b"raw").unwrap();
 
         f.store.remove_uids(&f.inbox, &[1]).unwrap();
         f.store.save_messages(&work, &[message(5, "m", 1)]).unwrap();
         f.store.purge_orphans(f.account).unwrap();
 
-        assert_eq!(f.reader.messages(work.label_id, 0, 1).unwrap()[0].id, id);
+        assert_eq!(f.reader.messages(&[work.label_id], 0, 1).unwrap()[0].id, id);
         assert!(f.reader.body(id).unwrap().is_some());
     }
 
@@ -1435,17 +1592,17 @@ mod tests {
     fn a_uid_rescan_keeps_message_and_body_and_drops_only_what_is_gone() {
         let f = fixture();
         f.store.save_messages(&f.inbox, &[message(1, "kept", 1), message(2, "gone", 2)]).unwrap();
-        let kept = f.reader.messages(f.inbox.label_id, 1, 1).unwrap()[0].id;
+        let kept = f.reader.messages(&[f.inbox.label_id], 1, 1).unwrap()[0].id;
         f.store.save_body(kept, b"raw").unwrap();
 
         f.store.forget_uids(&f.inbox).unwrap();
-        assert_eq!(f.reader.message_count(f.inbox.label_id).unwrap(), 2, "still visible during the rescan");
+        assert_eq!(f.reader.message_count(&[f.inbox.label_id]).unwrap(), 2, "still visible during the rescan");
 
         f.store.save_messages(&f.inbox, &[message(70, "kept", 1)]).unwrap();
         f.store.remove_unmatched(&f.inbox).unwrap();
         f.store.purge_orphans(f.account).unwrap();
 
-        let rows = f.reader.messages(f.inbox.label_id, 0, 10).unwrap();
+        let rows = f.reader.messages(&[f.inbox.label_id], 0, 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, kept);
         assert_eq!(f.reader.body(kept).unwrap().as_deref(), Some(&b"raw"[..]));
@@ -1465,14 +1622,14 @@ mod tests {
                 ],
             )
             .unwrap();
-        let row = &f.reader.messages(f.inbox.label_id, 0, 1).unwrap()[0];
+        let row = &f.reader.messages(&[f.inbox.label_id], 0, 1).unwrap()[0];
         assert!(row.seen && row.flagged);
         let starred = f.reader.labels(f.account).unwrap().into_iter().find(|l| l.role == Role::Starred).unwrap();
-        assert_eq!(f.reader.message_count(starred.id).unwrap(), 1);
+        assert_eq!(f.reader.message_count(&[starred.id]).unwrap(), 1);
 
         f.store.apply_changes(&f.inbox, &[Change { uid: 1, seen: true, flagged: false, labels: None }]).unwrap();
-        assert_eq!(f.reader.message_count(starred.id).unwrap(), 0);
-        assert_eq!(f.reader.message_count(f.inbox.label_id).unwrap(), 1, "the folder label survives");
+        assert_eq!(f.reader.message_count(&[starred.id]).unwrap(), 0);
+        assert_eq!(f.reader.message_count(&[f.inbox.label_id]).unwrap(), 1, "the folder label survives");
     }
 
     #[test]
@@ -1490,7 +1647,7 @@ mod tests {
         f.store.apply_changes(&f.inbox, &[change]).unwrap();
         let labels = f.reader.labels(f.account).unwrap();
         let receipts = labels.iter().find(|l| l.name == "Receipts").unwrap();
-        assert_eq!(f.reader.message_count(receipts.id).unwrap(), 0);
+        assert_eq!(f.reader.message_count(&[receipts.id]).unwrap(), 0);
         assert_eq!(receipts.unread, 0);
     }
 
@@ -1500,7 +1657,7 @@ mod tests {
         let mut huge = message(3, "huge", 3);
         huge.size = 10_000_000;
         f.store.save_messages(&f.inbox, &[message(1, "old", 1), message(2, "new", 2), huge]).unwrap();
-        let rows = f.reader.messages(f.inbox.label_id, 0, 3).unwrap();
+        let rows = f.reader.messages(&[f.inbox.label_id], 0, 3).unwrap();
         let (new, old) = (rows[1].id, rows[2].id);
 
         assert_eq!(f.reader.missing_bodies(f.account, 1000, 10).unwrap(), [new, old]);
@@ -1530,8 +1687,8 @@ mod tests {
         // The same Message-ID in both accounts must stay two messages.
         f.store.save_messages(&f.inbox, &[message(1, "same", 1), message(2, "mine", 2)]).unwrap();
         f.store.save_messages(&other_inbox, &[message(1, "same", 1)]).unwrap();
-        let mine = f.reader.messages(f.inbox.label_id, 0, 1).unwrap()[0].id;
-        let theirs = f.reader.messages(other_inbox.label_id, 0, 1).unwrap()[0].id;
+        let mine = f.reader.messages(&[f.inbox.label_id], 0, 1).unwrap()[0].id;
+        let theirs = f.reader.messages(&[other_inbox.label_id], 0, 1).unwrap()[0].id;
         f.store.save_body(mine, b"mine").unwrap();
         f.store.save_body(theirs, b"theirs").unwrap();
         assert_eq!(f.reader.inbox_unread().unwrap(), HashMap::from([(f.account, 2), (other, 1)]));

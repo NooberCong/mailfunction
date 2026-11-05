@@ -107,7 +107,7 @@ impl Harness {
     }
 
     fn rows(&self, name: &str) -> Vec<MessageRow> {
-        self.reader.messages(self.label(name).id, 0, 10_000).unwrap()
+        self.reader.messages(&[self.label(name).id], 0, 10_000).unwrap()
     }
 
     fn subjects(&self, name: &str) -> Vec<String> {
@@ -532,7 +532,7 @@ async fn accounts_sync_side_by_side_and_stop_one_at_a_time() {
 
     // Each account's mail stays in that account, even with one Inbox name between them.
     let inbox = |id| h.reader.labels(id).unwrap().into_iter().find(|l| l.name == "Inbox").unwrap().id;
-    let rows = |id| h.reader.messages(inbox(id), 0, 10).unwrap();
+    let rows = |id| h.reader.messages(&[inbox(id)], 0, 10).unwrap();
     assert_eq!(rows(h.account.id)[0].subject, "For the first");
     assert_eq!(rows(second.id)[0].subject, "For the second");
 
@@ -851,6 +851,37 @@ async fn a_draft_is_one_copy_on_the_server_however_often_it_is_saved() {
 
 #[tokio::test]
 #[ignore = "needs a local Dovecot: scripts/test-imap.ps1"]
+async fn a_draft_sent_from_another_account_leaves_one_server_for_the_other() {
+    let mut h = mailbox("move-from").await;
+    let mut other = mailbox("move-to").await;
+    let id = h.store.add_account(&other.account).unwrap();
+    let second = Account { id, ..other.account.clone() };
+    let store = h.store.clone();
+    let sync_second = async || {
+        let mut imap = Imap::connect(&second, &Credential::Password(PASSWORD.into())).await.unwrap();
+        sync_account(&mut imap, &store, second.id, |_| {}).await.unwrap();
+    };
+    sync_second().await;
+
+    let compose = Compose { to: "a@example.com".into(), subject: "Which address".into(), body: "Text".into(), ..Compose::default() };
+    let draft = h.store.create_draft(h.account_id(), &compose, None, &[]).unwrap();
+    h.store.upload_draft(draft).unwrap();
+    h.sync().await;
+    assert_eq!(h.server_subjects("Drafts").await, ["Which address"]);
+
+    let moved = h.store.move_draft(draft, second.id).unwrap();
+    h.store.upload_draft(moved).unwrap();
+    h.sync().await;
+    sync_second().await;
+    assert!(h.server_subjects("Drafts").await.is_empty(), "the first server lets it go");
+    assert_eq!(other.server_subjects("Drafts").await, ["Which address"]);
+    assert_eq!(h.store.pending_count(h.account_id()).unwrap(), 0);
+    assert_eq!(h.store.pending_count(second.id).unwrap(), 0);
+    assert_eq!(h.reader.account_of(moved).unwrap(), Some(second.id));
+}
+
+#[tokio::test]
+#[ignore = "needs a local Dovecot: scripts/test-imap.ps1"]
 async fn a_draft_from_another_client_is_replaced_not_copied() {
     let mut h = mailbox("foreign").await;
     let raw = "From: me@example.com\r\nTo: a@example.com\r\nSubject: From the web\r\nMessage-ID: <web@example.com>\r\n\r\nStarted there\r\n";
@@ -932,7 +963,7 @@ async fn a_reply_goes_out_once_and_files_itself_in_its_thread() {
     let mut reply = reply(&raw, &h.account.email, false).unwrap();
     reply.bcc = "hidden@example.com".into();
     reply.body = format!("the answer{}", reply.body);
-    let file = Attachment { name: "ghi-chú.txt".into(), mime: "text/plain".into(), data: "nội dung".as_bytes().to_vec() };
+    let file = Attachment { content_id: None, name: "ghi-chú.txt".into(), mime: "text/plain".into(), data: "nội dung".as_bytes().to_vec() };
     let id = h.store.create_draft(h.account_id(), &reply, Some(original), std::slice::from_ref(&file)).unwrap();
     h.store.queue_send(id, now()).unwrap();
     engine.flush(h.account_id());

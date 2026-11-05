@@ -107,6 +107,8 @@ export struct RowItem {
     logo: image,
     /// Messages in the thread, if there is more than one.
     count: string,
+    /// Where its account is in the sidebar, when the list has mail from several, or else -1.
+    account: int,
 }
 
 export struct AccountItem {
@@ -114,6 +116,8 @@ export struct AccountItem {
     initials: string,
     tone: int,
     logo: image,
+    /// Its own picture and nothing else: a provider's logo says nothing about which account.
+    picture: image,
     unread: string,
     status: string,
     name: string,
@@ -450,6 +454,67 @@ component AccountRow inherits Rectangle {
 }
 
 /// A quiet line at the foot of the sidebar.
+/// All the mail in one list. It stays out of the way until there are two accounts to bring together.
+component AllAccountsRow inherits Rectangle {
+    in property <string> unread;
+    in property <bool> active;
+    in property <bool> compact;
+    callback clicked <=> touch.clicked;
+
+    height: 44px;
+    border-radius: 9px;
+    background: active ? Theme.frame-chip : touch.has-hover ? Theme.frame-hover : transparent;
+    animate background { duration: Theme.fast; }
+
+    HorizontalLayout {
+        padding-left: root.compact ? 0 : 8px;
+        padding-right: root.compact ? 0 : 8px;
+        spacing: 10px;
+        alignment: root.compact ? center : stretch;
+
+        Rectangle {
+            width: 28px;
+            horizontal-stretch: 0;
+            Icon {
+                y: (parent.height - self.height) / 2;
+                x: (parent.width - self.width) / 2;
+                tint: Theme.on-frame;
+                commands: "M12 3.5L3 8l9 4.5L21 8zM3 12.5l9 4.5 9-4.5M3 17l9 4.5 9-4.5";
+            }
+        }
+
+        if !root.compact: Text {
+            text: "All accounts";
+            color: root.active ? Theme.on-frame : Theme.on-frame-muted;
+            font-size: Theme.small;
+            font-weight: root.active ? 500 : 400;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+
+        if !root.compact && root.unread != "": Text {
+            text: root.unread;
+            color: Theme.on-frame;
+            font-size: Theme.small;
+            font-weight: 600;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+        }
+    }
+
+    if root.compact && root.unread != "": Rectangle {
+        x: parent.width / 2 + 8px;
+        y: 8px;
+        width: 7px;
+        height: 7px;
+        border-radius: 3.5px;
+        background: Theme.on-frame;
+    }
+
+    touch := Press { }
+}
+
 component RailAction inherits Rectangle {
     in property <bool> compact;
     in property <string> icon;
@@ -532,14 +597,18 @@ component Rail inherits Rectangle {
     in property <bool> compact;
     in property <[AccountItem]> accounts;
     in property <int> active-account;
+    in property <string> all-unread;
     callback select(int);
     callback select-account(int);
+    callback select-all-accounts();
     callback remove-account(int);
     callback add-account();
     callback open-settings();
     callback compose();
 
     private property <length> account-step: 46px;
+    // The row that brings them together comes first, once there are accounts to bring together.
+    private property <int> first-account: root.accounts.length > 1 ? 1 : 0;
 
     function offset(index: int) -> length {
         index * Theme.rail-step + (index >= root.first-custom ? Theme.rail-gap : 0px)
@@ -592,13 +661,23 @@ component Rail inherits Rectangle {
 
         // Every account stays in view, so switching is one click. Past four, this part scrolls.
         Flickable {
-            height: Math.min(root.accounts.length, 4) * root.account-step;
+            height: Math.min(root.accounts.length + root.first-account, 5) * root.account-step;
             vertical-stretch: 0;
-            content-height: root.accounts.length * root.account-step;
+            content-height: (root.accounts.length + root.first-account) * root.account-step;
+
+            if root.first-account > 0: AllAccountsRow {
+                x: 12px;
+                y: 0;
+                width: parent.width - 24px;
+                unread: root.all-unread;
+                active: root.active-account < 0;
+                compact: root.compact;
+                clicked => { root.select-all-accounts(); }
+            }
 
             for account[index] in root.accounts: AccountRow {
                 x: 12px;
-                y: index * root.account-step;
+                y: (index + root.first-account) * root.account-step;
                 width: parent.width - 24px;
                 item: account;
                 active: index == root.active-account;
@@ -634,6 +713,8 @@ component Rail inherits Rectangle {
 
 component MessageRow inherits Rectangle {
     in property <RowItem> item;
+    /// The account it is in, when that needs saying.
+    in property <AccountItem> owner;
     in property <bool> active;
     callback clicked <=> touch.clicked;
 
@@ -658,10 +739,30 @@ component MessageRow inherits Rectangle {
         VerticalLayout {
             alignment: center;
             horizontal-stretch: 0;
-            Avatar {
-                initials: root.item.initials;
-                tone: root.item.tone;
-                logo: root.item.logo;
+            Rectangle {
+                width: 38px;
+                height: 38px;
+
+                Avatar {
+                    initials: root.item.initials;
+                    tone: root.item.tone;
+                    logo: root.item.logo;
+                }
+
+                if root.item.account >= 0: Rectangle {
+                    x: 23px;
+                    y: 23px;
+                    width: 18px;
+                    height: 18px;
+                    border-radius: 9px;
+                    background: Theme.sheet;
+                    Avatar {
+                        size: 16px;
+                        initials: root.owner.initials;
+                        tone: root.owner.tone;
+                        logo: root.owner.picture;
+                    }
+                }
             }
         }
 
@@ -1419,22 +1520,36 @@ component Composer inherits Rectangle {
     in-out property <string> cc;
     in-out property <string> bcc;
     in-out property <string> subject;
-    in-out property <string> body;
     in property <bool> copies;
     in property <string> error;
     in property <[FileItem]> files;
     in property <[string]> suggestions;
     /// Which field the suggestions are for: 0 To, 1 Cc, 2 Bcc, or -1 for none.
     in property <int> suggesting: -1;
+    /// Who it can go from, and who it goes from. One account leaves nothing to choose or to say.
+    in property <[AccountItem]> accounts;
+    in property <int> from;
+    in-out property <bool> choosing-sender;
+    callback choose-sender(int);
     callback edited();
     callback address-edited(int, string);
     callback accept-suggestion(int);
     callback show-copies();
-    callback send();
-    callback attach();
     callback remove-file(int);
-    callback discard();
-    callback close();
+    callback focus-editor();
+    callback editor-moved();
+
+    // A webview covers whatever is under it, so anything opening over the editor moves it down.
+    private property <length> fields-bottom: 10px + root.from-height + (root.copies ? 4 : 2) * 42px;
+    private property <length> suggestions-bottom: root.suggesting >= 0 && root.suggestions.length > 0
+        ? 10px + root.from-height + (root.suggesting + 1) * 42px + root.suggestions.length * 34px + 8px : 0;
+    private property <length> senders-bottom: root.choosing-sender ? 10px + root.from-height + root.accounts.length * 34px + 8px : 0;
+    private property <length> reserved: Math.max(0, Math.max(root.suggestions-bottom, root.senders-bottom) - root.fields-bottom);
+
+    out property <length> editor-x: editor.absolute-position.x;
+    out property <length> editor-y: editor.absolute-position.y;
+    out property <length> editor-w: editor.width;
+    out property <length> editor-h: editor.height;
 
     public function focus-recipients() { to-field.focus-input(); }
     public function end-of-address(field: int) {
@@ -1446,10 +1561,7 @@ component Composer inherits Rectangle {
             bcc-field.caret-to-end();
         }
     }
-    public function focus-body() {
-        text.focus();
-        text.set-selection-offsets(0, 0);
-    }
+    public function focus-subject() { subject-field.focus-input(); }
 
     function offer-suggestion() -> bool {
         if (root.suggestions.length == 0) {
@@ -1464,8 +1576,58 @@ component Composer inherits Rectangle {
     // Nothing behind this should answer the pointer.
     TouchArea { }
 
+    private property <length> from-height: root.accounts.length > 1 ? 42px : 0;
+
     VerticalLayout {
         Rectangle { height: 10px; }
+
+        if root.accounts.length > 1: Rectangle {
+            height: root.from-height;
+
+            HorizontalLayout {
+                padding-left: Theme.gutter;
+                padding-right: Theme.gutter;
+                spacing: 10px;
+                Text {
+                    text: "From";
+                    width: 54px;
+                    color: Theme.muted;
+                    font-size: Theme.body;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: root.accounts[root.from].email;
+                    color: Theme.text;
+                    font-size: Theme.body;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                Rectangle {
+                    width: 14px;
+                    horizontal-stretch: 0;
+                    Icon {
+                        y: (parent.height - self.height) / 2;
+                        width: 14px;
+                        height: 14px;
+                        tint: Theme.muted;
+                        commands: "M6 9l6 6 6-6";
+                    }
+                }
+            }
+
+            Rectangle {
+                x: Theme.gutter;
+                y: parent.height - 1px;
+                width: parent.width - 2 * Theme.gutter;
+                height: 1px;
+                background: Theme.line;
+            }
+
+            Press {
+                clicked => { root.choosing-sender = !root.choosing-sender; }
+            }
+        }
 
         to-field := Field {
             label: "To";
@@ -1494,44 +1656,25 @@ component Composer inherits Rectangle {
             edited => { root.address-edited(2, self.text); }
             tab-pressed => { root.offer-suggestion() }
         }
-        Field {
+        subject-field := Field {
             label: "Subject";
             text <=> root.subject;
             edited => { root.edited(); }
-            tab-pressed => { false }
+            tab-pressed => {
+                root.focus-editor();
+                true
+            }
         }
 
-        Rectangle {
-            vertical-stretch: 1;
-            clip: true;
-
-            scroller := Flickable {
-                x: Theme.gutter;
-                y: 14px;
-                width: parent.width - 2 * Theme.gutter;
-                height: parent.height - 14px;
-                content-height: Math.max(text.preferred-height + 24px, self.height);
-
-                text := TextInput {
-                    width: parent.width;
-                    height: Math.max(self.preferred-height, scroller.height);
-                    text <=> root.body;
-                    single-line: false;
-                    wrap: word-wrap;
-                    color: Theme.text;
-                    selection-background-color: Theme.selected;
-                    selection-foreground-color: Theme.text;
-                    font-size: Theme.reading;
-                    edited => { root.edited(); }
-                    // Keeps the caret in view as the text grows past the pane.
-                    cursor-position-changed(position) => {
-                        if (position.y + scroller.content-y < 0) {
-                            scroller.content-y = -position.y;
-                        } else if (position.y + 24px + scroller.content-y > scroller.height) {
-                            scroller.content-y = scroller.height - position.y - 24px;
-                        }
-                    }
-                }
+        if root.error != "": HorizontalLayout {
+            padding-left: Theme.gutter;
+            padding-right: Theme.gutter;
+            padding-top: 8px;
+            Text {
+                text: root.error;
+                color: Theme.accent;
+                font-size: Theme.small;
+                overflow: elide;
             }
         }
 
@@ -1546,57 +1689,14 @@ component Composer inherits Rectangle {
             }
         }
 
-        HorizontalLayout {
-            padding-left: Theme.gutter;
-            padding-right: Theme.gutter - 8px;
-            padding-top: 12px;
-            padding-bottom: 14px;
-            spacing: 8px;
+        Rectangle { height: root.reserved; }
 
-            Rectangle {
-                width: 92px;
-                height: 34px;
-                horizontal-stretch: 0;
-                border-radius: 9px;
-                background: Theme.accent;
-                opacity: send.has-hover ? 0.88 : 1;
-                animate opacity { duration: Theme.fast; }
-                Text {
-                    text: "Send";
-                    color: Theme.sheet;
-                    font-size: Theme.body;
-                    font-weight: 600;
-                }
-                send := Press {
-                    clicked => { root.send(); }
-                }
-            }
-            VerticalLayout {
-                alignment: center;
-                horizontal-stretch: 0;
-                Tool {
-                    hint: "Attach files";
-                    icon: "M16.5 7.5v9a4.5 4.5 0 0 1-9 0V6a3 3 0 0 1 6 0v9.5a1.5 1.5 0 0 1-3 0V8";
-                    clicked => { root.attach(); }
-                }
-            }
-            Text {
-                text: root.error;
-                color: Theme.accent;
-                font-size: Theme.small;
-                vertical-alignment: center;
-                overflow: elide;
-                horizontal-stretch: 1;
-            }
-            VerticalLayout {
-                alignment: center;
-                horizontal-stretch: 0;
-                Tool {
-                    hint: "Discard draft";
-                    icon: "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v5M14 11v5";
-                    clicked => { root.discard(); }
-                }
-            }
+        // The editor is a child window placed over this, with Send and the formatting in it.
+        editor := Rectangle {
+            vertical-stretch: 1;
+            changed width => { root.editor-moved(); }
+            changed height => { root.editor-moved(); }
+            changed absolute-position => { root.editor-moved(); }
         }
     }
 
@@ -1604,7 +1704,7 @@ component Composer inherits Rectangle {
     // the way while composing, so an ordinary overlay will do.
     if root.suggesting >= 0 && root.suggestions.length > 0: Rectangle {
         x: Theme.gutter + 64px;
-        y: 10px + (root.suggesting + 1) * 42px;
+        y: 10px + root.from-height + (root.suggesting + 1) * 42px;
         width: Math.min(parent.width - 2 * Theme.gutter - 64px, 380px);
         height: root.suggestions.length * 34px + 8px;
         border-radius: 10px;
@@ -1631,6 +1731,43 @@ component Composer inherits Rectangle {
             }
             pick := Press {
                 clicked => { root.accept-suggestion(index); }
+            }
+        }
+    }
+
+    if root.choosing-sender: TouchArea {
+        clicked => { root.choosing-sender = false; }
+    }
+
+    if root.choosing-sender: Rectangle {
+        x: Theme.gutter + 64px;
+        y: 10px + root.from-height;
+        width: Math.min(parent.width - 2 * Theme.gutter - 64px, 380px);
+        height: root.accounts.length * 34px + 8px;
+        border-radius: 10px;
+        background: Theme.sheet;
+        border-width: 1px;
+        border-color: Theme.faint;
+
+        for account[index] in root.accounts: Rectangle {
+            x: 4px;
+            y: 4px + index * 34px;
+            width: parent.width - 8px;
+            height: 34px;
+            border-radius: 7px;
+            background: sender.has-hover || index == root.from ? Theme.hover : transparent;
+            Text {
+                x: 10px;
+                width: parent.width - 20px;
+                text: account.email;
+                color: Theme.text;
+                font-size: Theme.small;
+                overflow: elide;
+                vertical-alignment: center;
+                height: parent.height;
+            }
+            sender := Press {
+                clicked => { root.choose-sender(index); }
             }
         }
     }
@@ -1792,6 +1929,7 @@ component KeysHelp inherits Panel {
             { key: "g d", what: "Go to Drafts" },
             { key: "g a", what: "Go to All Mail" },
             { key: "Ctrl 1-9", what: "Switch account" },
+            { key: "Ctrl 0", what: "All accounts" },
             { key: "Ctrl Enter", what: "Send" },
             { key: "Ctrl ,", what: "Settings" },
             { key: "Esc", what: "Close or go back" },
@@ -2435,7 +2573,9 @@ export component App inherits Window {
     /// Signing in to one more account, over the mail of those already here.
     in property <bool> adding;
     in property <[AccountItem]> accounts;
+    /// Which account is on screen, or -1 when they all are.
     in property <int> active-account;
+    in property <string> all-unread;
     in property <bool> syncing;
     in property <bool> needs-sign-in;
     in property <[LabelItem]> labels;
@@ -2461,8 +2601,9 @@ export component App inherits Window {
     in-out property <string> draft-cc;
     in-out property <string> draft-bcc;
     in-out property <string> draft-subject;
-    in-out property <string> draft-body;
     in property <bool> draft-copies;
+    in property <int> draft-from;
+    in-out property <bool> choosing-sender;
     in property <string> draft-error;
     in property <[FileItem]> draft-files;
     in property <[string]> suggestions;
@@ -2494,6 +2635,10 @@ export component App inherits Window {
     out property <length> slot-y: slot.absolute-position.y;
     out property <length> slot-w: slot.width;
     out property <length> slot-h: slot.height;
+    out property <length> editor-x: composer.editor-x;
+    out property <length> editor-y: composer.editor-y;
+    out property <length> editor-w: composer.editor-w;
+    out property <length> editor-h: composer.editor-h;
 
     private property <bool> dark: Theme.dark;
     private property <Preferences> preferences: Theme.preferences;
@@ -2513,6 +2658,7 @@ export component App inherits Window {
     callback always-load-images();
     callback stop-loading-images();
     callback select-account(int);
+    callback select-all-accounts();
     callback remove-account(int);
     callback select-label(int);
     callback select-row(int);
@@ -2528,11 +2674,12 @@ export component App inherits Window {
     callback draft-edited();
     callback address-edited(int, string);
     callback accept-suggestion(int);
+    callback choose-sender(int);
     callback show-copies();
     callback send-draft();
-    callback attach-files();
     callback remove-draft-file(int);
-    callback discard-draft();
+    callback focus-editor();
+    callback editor-moved();
     callback close-draft();
     callback notice-clicked();
     callback slot-changed();
@@ -2567,7 +2714,7 @@ export component App inherits Window {
 
     public function focus-recipients() { composer.focus-recipients(); }
 
-    public function focus-draft-body() { composer.focus-body(); }
+    public function focus-subject() { composer.focus-subject(); }
 
     public function end-of-address(field: int) { composer.end-of-address(field); }
 
@@ -2615,7 +2762,15 @@ export component App inherits Window {
             if (event.modifiers.control && event.text.is-float()) {
                 let index = event.text.to-float() - 1;
                 if (index >= 0 && index < root.accounts.length) {
-                    root.select-account(index);
+                    if (root.composing) {
+                        root.choose-sender(index);
+                    } else {
+                        root.select-account(index);
+                    }
+                    return accept;
+                }
+                if (index == -1 && !root.composing) {
+                    root.select-all-accounts();
                     return accept;
                 }
             }
@@ -2692,6 +2847,10 @@ export component App inherits Window {
             if (event.text != Key.Escape) {
                 return reject;
             }
+            if (root.choosing-sender) {
+                root.choosing-sender = false;
+                return accept;
+            }
             if (root.settings-open) {
                 root.close-settings();
             } else if (root.composing) {
@@ -2732,12 +2891,17 @@ export component App inherits Window {
                 compact: root.compact;
                 accounts: root.accounts;
                 active-account: root.active-account;
+                all-unread: root.all-unread;
                 select(index) => {
                     root.select-label(index);
                     keys.focus();
                 }
                 select-account(index) => {
                     root.select-account(index);
+                    keys.focus();
+                }
+                select-all-accounts => {
+                    root.select-all-accounts();
                     keys.focus();
                 }
                 remove-account(index) => {
@@ -2910,6 +3074,7 @@ export component App inherits Window {
                                     list := ListView {
                                         for row[index] in root.rows: MessageRow {
                                             item: row;
+                                            owner: root.accounts[row.account];
                                             active: index == root.selected-row;
                                             clicked => {
                                                 root.select-row(index);
@@ -3150,27 +3315,22 @@ export component App inherits Window {
                         cc <=> root.draft-cc;
                         bcc <=> root.draft-bcc;
                         subject <=> root.draft-subject;
-                        body <=> root.draft-body;
                         copies: root.draft-copies;
                         error: root.draft-error;
                         files: root.draft-files;
                         suggestions: root.suggestions;
                         suggesting: root.suggesting;
+                        accounts: root.accounts;
+                        from: root.draft-from;
+                        choosing-sender <=> root.choosing-sender;
+                        choose-sender(index) => { root.choose-sender(index); }
                         edited => { root.draft-edited(); }
                         address-edited(field, text) => { root.address-edited(field, text); }
                         accept-suggestion(index) => { root.accept-suggestion(index); }
                         show-copies => { root.show-copies(); }
-                        send => { root.send-draft(); }
-                        attach => { root.attach-files(); }
                         remove-file(index) => { root.remove-draft-file(index); }
-                        discard => {
-                            root.discard-draft();
-                            keys.focus();
-                        }
-                        close => {
-                            root.close-draft();
-                            keys.focus();
-                        }
+                        focus-editor => { root.focus-editor(); }
+                        editor-moved => { root.editor-moved(); }
                     }
                     }
                 }

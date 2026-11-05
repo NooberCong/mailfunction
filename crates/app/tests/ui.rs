@@ -130,7 +130,7 @@ fn the_whole_window() {
     let answered = pane.images.clone();
     let notifier = RecordingNotifier::default();
     let notices = notifier.shown.clone();
-    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(pane), Box::new(notifier), Arc::new(Offline)).unwrap();
+    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(pane), Box::new(common::RecordingEditor::default()), Box::new(notifier), Arc::new(Offline)).unwrap();
     app.show().unwrap();
     window.dispatch_event(WindowEvent::WindowActiveChanged(true));
 
@@ -150,7 +150,7 @@ fn the_whole_window() {
     store.folder(account, "Trash", &LabelSpec::system(Role::Trash)).unwrap();
     seed(&store, &inbox);
     let reader = Reader::open(&dir).unwrap();
-    let inbox_rows = reader.messages(inbox.label_id, 0, 20).unwrap();
+    let inbox_rows = reader.messages(&[inbox.label_id], 0, 20).unwrap();
     store.save_body(inbox_rows[0].id, &plain_body()).unwrap();
     store.save_body(inbox_rows[1].id, HTML_BODY).unwrap();
     // Logos are looked up by the brand's domain, and checked far enough ahead never to go stale.
@@ -215,7 +215,7 @@ fn the_whole_window() {
     assert_eq!(account_colour(), slint::Rgb8Pixel::new(20, 160, 90));
 
     // Remote images stay out until asked for, and nothing is fetched by opening the message.
-    let sender = reader.messages(inbox.label_id, 0, 20).unwrap()[1].from_addr.clone();
+    let sender = reader.messages(&[inbox.label_id], 0, 20).unwrap()[1].from_addr.clone();
     let page_image = "https://message.invalid/image/0";
     assert_eq!(app.get_image_bar(), ImageBar::Blocked);
     assert!(!html_shown.borrow().last().unwrap().contains(page_image));

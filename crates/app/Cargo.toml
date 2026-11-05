@@ -5,6 +5,9 @@ edition = "2024"
 publish = false
 
 [dependencies]
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 ab_glyph = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 mailfunction-core = { path = "../core" }
@@ -17,6 +20,7 @@ windows = { version = "0.62", features = ["Data_Xml_Dom", "UI_Notifications", "W
 wry = "0.57"
 
 [dev-dependencies]
+mail-parser = "=1.0.1"
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
 png = "0.18"
 rusqlite = "0.41"
@@ -33,6 +37,12 @@ test = false
 # Opens a window.
 [[test]]
 name = "images"
+harness = false
+test = false
+
+# Needs Dovecot and mailpit and opens a window, but leaves notifications alone.
+[[test]]
+name = "editor"
 harness = false
 test = false
 

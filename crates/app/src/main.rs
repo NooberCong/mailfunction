@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use mailfunction::editor::EditorView;
 use mailfunction::notify::Toasts;
 use mailfunction::webview::Webview;
 use mailfunction::{App, Controller, Theme, chrome, instance, on_ui_thread, startup};
@@ -34,8 +35,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.set_sign_in_message(format!("Google client file not found:\n{}", client_file.display()).into());
     }
     let pane = Rc::new(Webview::new(data.join("webview")));
+    let editor = Rc::new(EditorView::new(data.join("webview")));
     let toasts = Box::new(Toasts::new(&data));
-    let controller = Controller::new(app.clone_strong(), &data, client, Box::new(pane), toasts, Arc::new(Web::default()))?;
+    let controller = Controller::new(app.clone_strong(), &data, client, Box::new(pane), Box::new(editor), toasts, Arc::new(Web::default()))?;
     controller.load_accounts()?;
     controller.start_engine();
     app.on_start_with_windows_changed(startup::set);

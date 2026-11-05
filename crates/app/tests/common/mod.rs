@@ -3,13 +3,15 @@
 
 #![allow(dead_code)]
 
+pub mod server;
+
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use mailfunction::notify::{Notice, Notifier};
-use mailfunction::{App, HtmlPane, Pane};
+use mailfunction::{App, ComposePane, HtmlPane, Pane};
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
 use slint::platform::{Platform, PlatformError, PointerEventButton, WindowAdapter, WindowEvent};
 use slint::{ComponentHandle, LogicalPosition};
@@ -53,6 +55,27 @@ impl HtmlPane for RecordingPane {
     }
     fn image_ready(&self, ticket: u64, image: Option<Vec<u8>>) {
         self.images.borrow_mut().push((ticket, image));
+    }
+    fn hide(&self) {}
+    fn bounds_changed(&self, _: &App) {}
+}
+
+/// Keeps what the composer was given, and answers as nothing but a page could.
+#[derive(Default, Clone)]
+pub struct RecordingEditor {
+    pub opened: Rc<RefCell<Vec<String>>>,
+    pub signed: Rc<RefCell<Vec<String>>>,
+}
+
+impl ComposePane for RecordingEditor {
+    fn open(&self, _: &App, html: &str, _: bool) -> bool {
+        self.opened.borrow_mut().push(html.to_string());
+        true
+    }
+    fn focus(&self) {}
+    fn release_focus(&self) {}
+    fn sign(&self, html: &str) {
+        self.signed.borrow_mut().push(html.to_string());
     }
     fn hide(&self) {}
     fn bounds_changed(&self, _: &App) {}

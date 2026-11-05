@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use chrono::{DateTime, Datelike, Local, TimeZone};
 use mailfunction_core::logo;
-use mailfunction_core::store::{MessageRow, Reader};
+use mailfunction_core::store::{MessageRow, Reader, ThreadKey};
 use slint::{Image, Model, ModelNotify, ModelTracker};
 
 use crate::RowItem;
@@ -20,7 +20,7 @@ const AVATAR: f32 = 38.0;
 
 pub struct MessageList {
     reader: Rc<Reader>,
-    label: Cell<i64>,
+    labels: RefCell<Vec<i64>>,
     count: Cell<usize>,
     pages: RefCell<HashMap<usize, Rc<Vec<MessageRow>>>>,
     logos: Rc<Logos>,
@@ -29,6 +29,9 @@ pub struct MessageList {
     show_logos: Cell<bool>,
     /// What a search found, which is shown instead of the label while there is a search.
     results: RefCell<Option<Vec<MessageRow>>>,
+    /// With mail from several accounts in one list, those accounts: a row is marked with its
+    /// account's place here, which is its place in the sidebar too.
+    marked: RefCell<Vec<i64>>,
     notify: ModelNotify,
 }
 
@@ -36,23 +39,36 @@ impl MessageList {
     pub fn new(reader: Rc<Reader>, logos: Rc<Logos>) -> Self {
         Self {
             reader,
-            label: Cell::new(0),
+            labels: RefCell::default(),
             count: Cell::new(0),
             pages: RefCell::default(),
             logos,
             show_logos: Cell::new(true),
             results: RefCell::default(),
+            marked: RefCell::default(),
             notify: ModelNotify::default(),
         }
     }
 
-    pub fn show_label(&self, label: i64, show_logos: bool) {
-        self.label.set(label);
+    /// Shows the threads in these labels, which may belong to several accounts.
+    pub fn show_labels(&self, labels: Vec<i64>, show_logos: bool) {
         self.show_logos.set(show_logos);
         self.results.borrow_mut().take();
         self.pages.borrow_mut().clear();
-        self.count.set(self.reader.message_count(label).unwrap_or(0));
+        self.count.set(self.reader.message_count(&labels).unwrap_or(0));
+        *self.labels.borrow_mut() = labels;
         self.notify.reset();
+    }
+
+    /// Takes in labels joining the list on show, as when an account reports its first. The next
+    /// refresh picks up their mail.
+    pub fn set_labels(&self, labels: Vec<i64>) {
+        *self.labels.borrow_mut() = labels;
+    }
+
+    /// Says which accounts rows should be told apart by. None, for a list from one account.
+    pub fn mark_accounts(&self, accounts: Vec<i64>) {
+        *self.marked.borrow_mut() = accounts;
     }
 
     pub fn show_results(&self, rows: Vec<MessageRow>) {
@@ -68,7 +84,7 @@ impl MessageList {
         let Some(results) = results.as_mut() else { return };
         let before = results.len();
         for row in rows {
-            if !results.iter().any(|r| r.thread_id == row.thread_id) {
+            if !results.iter().any(|r| r.thread_key() == row.thread_key()) {
                 results.push(row);
             }
         }
@@ -80,17 +96,17 @@ impl MessageList {
     }
 
     /// Takes a thread out of the results. A list of a label sees this for itself.
-    pub fn drop_thread(&self, thread: Option<i64>) {
+    pub fn drop_thread(&self, thread: Option<ThreadKey>) {
         let mut results = self.results.borrow_mut();
         if let Some(results) = results.as_mut() {
-            results.retain(|r| Some(r.thread_id) != thread);
+            results.retain(|r| Some(r.thread_key()) != thread);
             self.count.set(results.len());
             self.notify.reset();
         }
     }
 
-    pub fn result_position(&self, thread: i64) -> Option<usize> {
-        self.results.borrow().as_ref()?.iter().position(|r| r.thread_id == thread)
+    pub fn result_position(&self, thread: ThreadKey) -> Option<usize> {
+        self.results.borrow().as_ref()?.iter().position(|r| r.thread_key() == thread)
     }
 
     /// The logo of a message's sender, for an avatar of `size` logical pixels.
@@ -130,7 +146,7 @@ impl MessageList {
         }
         let shown: Vec<usize> = self.pages.borrow().keys().copied().collect();
         self.pages.borrow_mut().clear();
-        let count = self.reader.message_count(self.label.get()).unwrap_or(0);
+        let count = self.reader.message_count(&self.labels.borrow()).unwrap_or(0);
         if self.count.replace(count) != count {
             self.notify.reset();
             return;
@@ -144,7 +160,7 @@ impl MessageList {
         if let Some(page) = self.pages.borrow().get(&index) {
             return page.clone();
         }
-        let rows = self.reader.messages(self.label.get(), index * PAGE, PAGE).unwrap_or_default();
+        let rows = self.reader.messages(&self.labels.borrow(), index * PAGE, PAGE).unwrap_or_default();
         let page = Rc::new(rows);
         let mut pages = self.pages.borrow_mut();
         if pages.len() >= MAX_PAGES {
@@ -181,6 +197,7 @@ impl Model for MessageList {
             tone: tone(&m.from_addr),
             logo: self.logo(&m.from_addr, AVATAR),
             count: if m.count > 1 { m.count.to_string().into() } else { "".into() },
+            account: self.marked.borrow().iter().position(|a| *a == m.account_id).map_or(-1, |i| i as i32),
         })
     }
 

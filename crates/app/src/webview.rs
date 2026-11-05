@@ -35,7 +35,7 @@ const VK_ESCAPE: u32 = 0x1B;
 /// and failing DNS leave it no route out. The first flag repeats wry's defaults, which setting
 /// these arguments replaces, and adds PaintHolding, which would keep the last message's frame
 /// up until the next one has painted.
-const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,PaintHolding \
+pub(crate) const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,PaintHolding \
     --proxy-server=http://127.0.0.1:9 --proxy-bypass-list=<-loopback> \
     --host-resolver-rules=\"MAP * ~NOTFOUND\"";
 /// The reading size mail is laid out for. Other sizes zoom the page to match.
@@ -47,9 +47,9 @@ const IDLE_CLOSE: Duration = Duration::from_secs(120);
 const EMPTY_AFTER: Duration = Duration::from_millis(500);
 
 /// A rectangle of the window, in physical pixels: left, top, width and height.
-type Bounds = (f32, f32, f32, f32);
+pub(crate) type Bounds = (f32, f32, f32, f32);
 
-fn rect((x, y, w, h): Bounds) -> Rect {
+pub(crate) fn rect((x, y, w, h): Bounds) -> Rect {
     Rect {
         position: PhysicalPosition::new(x as i32, y as i32).into(),
         size: PhysicalSize::new(w as u32, h as u32).into(),
@@ -57,7 +57,7 @@ fn rect((x, y, w, h): Bounds) -> Rect {
 }
 
 /// Clipped away by the window, so nothing shows, while the browser still counts as visible.
-fn out_of_sight((_, y, w, h): Bounds) -> Rect {
+pub(crate) fn out_of_sight((_, y, w, h): Bounds) -> Rect {
     rect((-w - 64.0, y, w, h))
 }
 

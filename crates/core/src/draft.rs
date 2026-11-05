@@ -72,7 +72,7 @@ fn is_gmail(tx: &Transaction, account_id: i64) -> Result<bool> {
 
 fn read_fields(conn: &Connection, message_id: i64) -> Result<Option<Compose>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT d.recipients, d.cc, d.bcc, m.subject, d.body, d.in_reply_to, d.refs
+        "SELECT d.recipients, d.cc, d.bcc, m.subject, d.body, d.html, d.in_reply_to, d.refs
          FROM draft d JOIN message m ON m.id = d.message_id WHERE d.message_id = ?1",
     )?;
     let fields = stmt.query_row([message_id], |r| {
@@ -82,25 +82,29 @@ fn read_fields(conn: &Connection, message_id: i64) -> Result<Option<Compose>> {
             bcc: r.get(2)?,
             subject: r.get(3)?,
             body: r.get(4)?,
-            in_reply_to: r.get(5)?,
-            references: r.get(6)?,
+            html: r.get(5)?,
+            in_reply_to: r.get(6)?,
+            references: r.get(7)?,
         })
     });
     Ok(fields.optional()?)
 }
 
-fn read_attachments(tx: &Transaction, message_id: i64) -> Result<Vec<Attachment>> {
-    let mut stmt = tx.prepare_cached("SELECT name, mime, data FROM bodies.attachment WHERE message_id = ?1 ORDER BY position")?;
-    let files = stmt.query_map([message_id], |r| Ok(Attachment { name: r.get(0)?, mime: r.get(1)?, data: r.get(2)? }))?;
+fn read_attachments(conn: &Connection, message_id: i64) -> Result<Vec<Attachment>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT name, mime, data, content_id FROM bodies.attachment WHERE message_id = ?1 ORDER BY position")?;
+    let files = stmt.query_map([message_id], |r| {
+        Ok(Attachment { name: r.get(0)?, mime: r.get(1)?, data: r.get(2)?, content_id: r.get(3)? })
+    })?;
     Ok(files.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Fails for anything no longer being edited: mail that is going, or has gone, cannot change.
 fn write_fields(tx: &Transaction, id: i64, c: &Compose) -> Result<()> {
     let changed = tx.execute(
-        "UPDATE draft SET recipients = ?2, cc = ?3, bcc = ?4, body = ?5, in_reply_to = ?6, refs = ?7
+        "UPDATE draft SET recipients = ?2, cc = ?3, bcc = ?4, body = ?5, html = ?6, in_reply_to = ?7, refs = ?8
          WHERE message_id = ?1 AND state = 'editing'",
-        params![id, c.to, c.cc, c.bcc, c.body, c.in_reply_to, c.references],
+        params![id, c.to, c.cc, c.bcc, c.body, c.html, c.in_reply_to, c.references],
     )?;
     if changed == 0 {
         return Err(Error::Refused("this message can no longer be changed".into()));
@@ -109,30 +113,69 @@ fn write_fields(tx: &Transaction, id: i64, c: &Compose) -> Result<()> {
     index_message(tx, id, &c.body)
 }
 
+fn insert_draft(
+    tx: &Transaction,
+    local: &str,
+    account_id: i64,
+    compose: &Compose,
+    reply_to: Option<i64>,
+    files: &[Attachment],
+) -> Result<i64> {
+    let from = sender(tx, account_id)?;
+    let thread: Option<i64> = reply_to.map(|id| thread_of(tx, id)).transpose()?;
+    let now = chrono::Utc::now().timestamp();
+    tx.execute(
+        "INSERT INTO message
+           (account_id, remote_id, thread_id, subject, from_name, from_addr, date, size, seen, flagged)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 1, 0)",
+        params![account_id, local, thread, compose.subject, from.name.unwrap_or_default(), from.email.to_string(), now],
+    )?;
+    let id = tx.last_insert_rowid();
+    let references: Vec<String> = compose.references.split_whitespace().map(String::from).collect();
+    place_in_thread(tx, account_id, id, thread, None, &references)?;
+    tx.execute("INSERT INTO draft (message_id) VALUES (?1)", [id])?;
+    write_fields(tx, id, compose)?;
+    for file in files {
+        insert_attachment(tx, id, file)?;
+    }
+    set_only_label(tx, account_id, id, Role::Drafts)?;
+    Ok(id)
+}
+
+fn remove_draft(tx: &Transaction, message_id: i64) -> Result<()> {
+    let found: Option<(i64, Option<String>, i64)> = tx
+        .query_row(
+            "SELECT m.account_id, d.old_mid, m.thread_id FROM draft d JOIN message m ON m.id = d.message_id
+             WHERE d.message_id = ?1",
+            [message_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((account, old_mid, thread)) = found else { return Ok(()) };
+    forget_message(tx, message_id)?;
+    refresh_heads(tx, account, [thread])?;
+    if let Some(mid) = old_mid {
+        enqueue(tx, account, message_id, &Action::DiscardDraft { mid }, None)?;
+    }
+    Ok(())
+}
+
 impl Store {
     /// Starts a draft, in the thread of the message it answers if there is one.
     pub fn create_draft(&self, account_id: i64, compose: &Compose, reply_to: Option<i64>, files: &[Attachment]) -> Result<i64> {
         let local = format!("local:{}", random_hex()?);
-        let now = chrono::Utc::now().timestamp();
+        self.with_tx(|tx| insert_draft(tx, &local, account_id, compose, reply_to, files))
+    }
+
+    /// Hands a draft to another account, to send from there. Accounts keep their mail apart, so
+    /// it starts again as a new draft there and leaves the old account's Drafts, all at once.
+    pub fn move_draft(&self, message_id: i64, account_id: i64) -> Result<i64> {
+        let local = format!("local:{}", random_hex()?);
         self.with_tx(|tx| {
-            let from = sender(tx, account_id)?;
-            let thread: Option<i64> = reply_to.map(|id| thread_of(tx, id)).transpose()?;
-            tx.execute(
-                "INSERT INTO message
-                   (account_id, remote_id, thread_id, subject, from_name, from_addr, date, size, seen, flagged)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 1, 0)",
-                params![account_id, local, thread, compose.subject, from.name.unwrap_or_default(), from.email.to_string(), now],
-            )?;
-            let id = tx.last_insert_rowid();
-            let references: Vec<String> = compose.references.split_whitespace().map(String::from).collect();
-            place_in_thread(tx, account_id, id, thread, None, &references)?;
-            tx.execute("INSERT INTO draft (message_id) VALUES (?1)", [id])?;
-            write_fields(tx, id, compose)?;
-            for file in files {
-                insert_attachment(tx, id, file)?;
-            }
-            set_only_label(tx, account_id, id, Role::Drafts)?;
-            Ok(id)
+            let compose = read_fields(tx, message_id)?.ok_or_else(|| Error::Refused("this draft has gone".into()))?;
+            let moved = insert_draft(tx, &local, account_id, &compose, None, &read_attachments(tx, message_id)?)?;
+            remove_draft(tx, message_id)?;
+            Ok(moved)
         })
     }
 
@@ -187,7 +230,8 @@ impl Store {
         self.with_tx(|tx| {
             tx.execute(
                 "DELETE FROM bodies.attachment WHERE message_id = ?1 AND position =
-                 (SELECT position FROM bodies.attachment WHERE message_id = ?1 ORDER BY position LIMIT 1 OFFSET ?2)",
+                 (SELECT position FROM bodies.attachment WHERE message_id = ?1 AND content_id IS NULL
+                  ORDER BY position LIMIT 1 OFFSET ?2)",
                 params![message_id, index as i64],
             )?;
             Ok(())
@@ -222,23 +266,7 @@ impl Store {
 
     /// Throws a draft away, here and on the server.
     pub fn discard_draft(&self, message_id: i64) -> Result<()> {
-        self.with_tx(|tx| {
-            let found: Option<(i64, Option<String>, i64)> = tx
-                .query_row(
-                    "SELECT m.account_id, d.old_mid, m.thread_id FROM draft d JOIN message m ON m.id = d.message_id
-                     WHERE d.message_id = ?1",
-                    [message_id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()?;
-            let Some((account, old_mid, thread)) = found else { return Ok(()) };
-            forget_message(tx, message_id)?;
-            refresh_heads(tx, account, [thread])?;
-            if let Some(mid) = old_mid {
-                enqueue(tx, account, message_id, &Action::DiscardDraft { mid }, None)?;
-            }
-            Ok(())
-        })
+        self.with_tx(|tx| remove_draft(tx, message_id))
     }
 
     /// Hands a finished draft to the outbox, to go at `send_at` (Unix seconds). Until then it can
@@ -473,9 +501,9 @@ pub(crate) fn finished_elsewhere(tx: &Transaction, account_id: i64, message_id: 
 
 fn insert_attachment(tx: &Transaction, message_id: i64, file: &Attachment) -> Result<()> {
     tx.execute(
-        "INSERT INTO bodies.attachment (message_id, position, name, mime, data)
-         SELECT ?1, coalesce(max(position), -1) + 1, ?2, ?3, ?4 FROM bodies.attachment WHERE message_id = ?1",
-        params![message_id, file.name, file.mime, file.data],
+        "INSERT INTO bodies.attachment (message_id, position, name, mime, data, content_id)
+         SELECT ?1, coalesce(max(position), -1) + 1, ?2, ?3, ?4, ?5 FROM bodies.attachment WHERE message_id = ?1",
+        params![message_id, file.name, file.mime, file.data, file.content_id],
     )?;
     Ok(())
 }
@@ -494,10 +522,16 @@ impl Reader {
         read_fields(self.conn(), message_id)
     }
 
+    /// Everything stored with a draft, whole: its files and the pictures in its text.
+    pub fn draft_files(&self, message_id: i64) -> Result<Vec<Attachment>> {
+        read_attachments(self.conn(), message_id)
+    }
+
+    /// A draft's files, leaving out the pictures that are part of its text.
     pub fn draft_attachments(&self, message_id: i64) -> Result<Vec<AttachmentInfo>> {
         let mut stmt = self
             .conn()
-            .prepare_cached("SELECT name, length(data) FROM bodies.attachment WHERE message_id = ?1 ORDER BY position")?;
+            .prepare_cached("SELECT name, length(data) FROM bodies.attachment WHERE message_id = ?1 AND content_id IS NULL ORDER BY position")?;
         let files = stmt.query_map([message_id], |r| Ok(AttachmentInfo { name: r.get(0)?, size: r.get::<_, i64>(1)? as usize }))?;
         Ok(files.collect::<rusqlite::Result<_>>()?)
     }

@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use mailfunction_core::ops::{Triage, Undo};
-use mailfunction_core::store::{MessageRow, Role};
+use mailfunction_core::store::{MessageRow, Role, SidebarLabel};
 use slint::{ComponentHandle, Model, TimerMode};
 
 use crate::{Controller, LabelKind, PickItem, Verb};
@@ -22,8 +22,8 @@ const SEARCH_RESULTS: usize = 200;
 
 /// What `z` and a notice's button take back.
 pub(crate) enum Reversible {
-    /// For the account it was done in, which may no longer be the one on screen.
-    Action(i64, Undo),
+    /// For each account it was done in, which may no longer be on screen.
+    Action(Vec<(i64, Undo)>),
     /// Mail still waiting in the outbox.
     Send(i64),
 }
@@ -50,14 +50,8 @@ impl Controller {
         self.thread.borrow().iter().map(|m| m.id).collect()
     }
 
-    /// Tells the shown account's tasks there is work, and catches the sidebar up.
-    pub(crate) fn queued(&self) {
-        if let Some(account) = self.shown.get() {
-            self.queued_for(account);
-        }
-    }
-
-    fn queued_for(&self, account: i64) {
+    /// Tells an account's tasks there is work, and catches the sidebar up.
+    pub(crate) fn queued(&self, account: i64) {
         if let Some(engine) = self.engine.borrow().as_ref() {
             engine.flush(account);
         }
@@ -67,14 +61,13 @@ impl Controller {
 
     /// Does something to the open thread, then moves on to the next if it left the list.
     fn triage(self: &Rc<Self>, triage: Triage, done: &str) {
-        let ids = self.thread_ids();
-        let Some(account) = self.shown.get().filter(|_| !ids.is_empty()) else { return };
-        let Ok(undo) = self.store.act(account, &ids, triage) else { return };
+        let Some(account) = self.open_account() else { return };
+        let Ok(undo) = self.store.act(account, &self.thread_ids(), triage) else { return };
         if undo.is_empty() {
             return;
         }
-        self.queued();
-        *self.reversible.borrow_mut() = Some(Reversible::Action(account, undo));
+        self.queued(account);
+        *self.reversible.borrow_mut() = Some(Reversible::Action(vec![(account, undo)]));
         self.show_notice(done, "Undo", NOTICE_TIME);
         if self.app.get_searching() && matches!(triage, Triage::Trash | Triage::Spam) {
             self.list.drop_thread(self.open_thread.get());
@@ -106,7 +99,7 @@ impl Controller {
     }
 
     fn toggle_star(&self) {
-        let Some(account) = self.shown.get() else { return };
+        let Some(account) = self.open_account() else { return };
         let thread = self.thread.borrow().clone();
         let Some(newest) = thread.last() else { return };
         let starred: Vec<i64> = thread.iter().filter(|m| m.flagged).map(|m| m.id).collect();
@@ -116,7 +109,7 @@ impl Controller {
             self.store.act(account, &starred, Triage::Starred(false))
         };
         if result.is_ok() {
-            self.queued();
+            self.queued(account);
             self.list.refresh();
             self.reload_thread();
         }
@@ -125,37 +118,41 @@ impl Controller {
     /// Unread if any of it was read, so the same key can also finish the job. It stays open but
     /// keeps its new state until it is opened again.
     fn toggle_unread(&self) {
-        let Some(account) = self.shown.get() else { return };
+        let Some(account) = self.open_account() else { return };
         let ids = self.thread_ids();
         let unread = self.thread.borrow().iter().any(|m| m.seen);
         self.read_timer.stop();
         if self.store.act(account, &ids, Triage::Seen(!unread)).is_ok() {
-            self.queued();
+            self.queued(account);
             self.list.refresh();
             self.reload_thread();
         }
     }
 
-    /// Marks everything under the current label read, however much of it is in the list.
+    /// Marks everything on the current sidebar line read, however much of it is in the list.
     fn mark_all_read(self: &Rc<Self>) {
-        let (Some(account), Some(label)) = (self.shown.get(), self.current_label()) else { return };
-        let unread = self.reader.unread_in_label(label).unwrap_or_default();
-        let Ok(undo) = self.store.act(account, &unread, Triage::Seen(true)) else { return };
-        if undo.is_empty() {
+        let mut done = Vec::new();
+        for (account, label) in self.current_held() {
+            let unread = self.reader.unread_in_label(label).unwrap_or_default();
+            if let Some(undo) = self.store.act(account, &unread, Triage::Seen(true)).ok().filter(|undo| !undo.is_empty()) {
+                self.queued(account);
+                done.push((account, undo));
+            }
+        }
+        if done.is_empty() {
             return;
         }
-        self.queued();
-        *self.reversible.borrow_mut() = Some(Reversible::Action(account, undo));
+        *self.reversible.borrow_mut() = Some(Reversible::Action(done));
         self.show_notice("Marked as read", "Undo", NOTICE_TIME);
         self.after_list_change();
     }
 
     /// Marks the open thread read, once it has been open long enough to mean it.
     pub(crate) fn mark_read(&self) {
-        let Some(account) = self.shown.get() else { return };
+        let Some(account) = self.open_account() else { return };
         let unseen: Vec<i64> = self.thread.borrow().iter().filter(|m| !m.seen).map(|m| m.id).collect();
         if !unseen.is_empty() && self.store.act(account, &unseen, Triage::Seen(true)).is_ok() {
-            self.queued();
+            self.queued(account);
             self.list.refresh();
             self.reload_thread();
         }
@@ -165,9 +162,10 @@ impl Controller {
         let Some(reversible) = self.reversible.borrow_mut().take() else { return };
         self.hide_notice();
         match reversible {
-            Reversible::Action(account, undo) => {
-                if self.store.undo(account, &undo).is_ok() {
-                    self.queued_for(account);
+            Reversible::Action(done) => {
+                let undone: Vec<i64> = done.iter().filter(|(account, undo)| self.store.undo(*account, undo).is_ok()).map(|d| d.0).collect();
+                undone.iter().for_each(|account| self.queued(*account));
+                if !undone.is_empty() {
                     if self.app.get_searching() {
                         self.run_search();
                     } else {
@@ -176,8 +174,9 @@ impl Controller {
                 }
             }
             Reversible::Send(message) => {
-                if self.store.cancel_send(message).unwrap_or(false) {
-                    self.queued();
+                let account = self.reader.account_of(message).ok().flatten();
+                if let Some(account) = account.filter(|_| self.store.cancel_send(message).unwrap_or(false)) {
+                    self.queued(account);
                     self.list.refresh();
                     self.open_draft(message);
                 } else {
@@ -211,9 +210,10 @@ impl Controller {
 
     /// Whether any message of the open thread is in the Inbox.
     pub(crate) fn thread_in_inbox(&self) -> bool {
-        let inbox = self.labels.borrow().iter().find(|l| l.role == Role::Inbox).map(|l| l.id);
-        let Some(inbox) = inbox else { return false };
-        self.thread.borrow().iter().any(|m| self.reader.message_labels(m.id).is_ok_and(|l| l.contains(&inbox)))
+        let inboxes = self.labels.borrow().iter().find(|l| l.role == Role::Inbox).map(SidebarLabel::ids);
+        let Some(inboxes) = inboxes else { return false };
+        let in_inbox = |m: &MessageRow| self.reader.message_labels(m.id).is_ok_and(|l| l.iter().any(|id| inboxes.contains(id)));
+        self.thread.borrow().iter().any(in_inbox)
     }
 
     pub(crate) fn pick_labels(&self) {
@@ -226,9 +226,11 @@ impl Controller {
     }
 
     fn publish_picks(&self) {
+        let Some(account) = self.open_account() else { return };
         let thread = self.thread.borrow();
         let held: Vec<i64> = thread.iter().flat_map(|m| self.reader.message_labels(m.id).unwrap_or_default()).collect();
-        let labels: Vec<_> = self.labels.borrow().iter().filter(|l| l.role == Role::None).cloned().collect();
+        let mut labels = self.reader.labels(account).unwrap_or_default();
+        labels.retain(|l| l.role == Role::None);
         let items = labels.iter().map(|l| PickItem { name: l.name.as_str().into(), on: held.contains(&l.id) }).collect();
         *self.pick_ids.borrow_mut() = labels.iter().map(|l| l.id).collect();
         crate::update_rows(&self.pick_items, items);
@@ -237,9 +239,9 @@ impl Controller {
     pub(crate) fn toggle_label(&self, index: usize) {
         let label = self.pick_ids.borrow().get(index).copied();
         let on = self.pick_items.row_data(index).is_some_and(|item| !item.on);
-        let (Some(account), Some(label)) = (self.shown.get(), label) else { return };
+        let (Some(account), Some(label)) = (self.open_account(), label) else { return };
         if self.store.act(account, &self.thread_ids(), Triage::Label { label, on }).is_ok() {
-            self.queued();
+            self.queued(account);
             self.publish_picks();
             self.list.refresh();
         }
@@ -269,15 +271,22 @@ impl Controller {
 
     /// Shows what is stored here at once, and asks the server for what is not.
     pub fn run_search(&self) {
-        let Some(account) = self.shown.get() else { return };
+        let accounts = self.accounts_on_screen();
         let query = self.app.get_query().to_string();
         let key = self.search_key.get() + 1;
         self.search_key.set(key);
-        self.list.show_results(self.reader.search(account, &query, SEARCH_RESULTS).unwrap_or_default());
+        let mut rows: Vec<MessageRow> =
+            accounts.iter().flat_map(|account| self.reader.search(*account, &query, SEARCH_RESULTS).unwrap_or_default()).collect();
+        rows.sort_by_key(|row| std::cmp::Reverse(row.date));
+        rows.truncate(SEARCH_RESULTS);
+        self.list.show_results(rows);
         self.clear_message();
-        let asked = !query.trim().is_empty()
-            && self.engine.borrow().as_ref().is_some_and(|engine| engine.search(account, key, query));
-        self.app.set_search_busy(asked);
+        let engine = self.engine.borrow();
+        let asked = engine.as_ref().filter(|_| !query.trim().is_empty()).map_or(0, |engine| {
+            accounts.iter().filter(|account| engine.search(**account, key, query.clone())).count()
+        });
+        self.searches_out.set(asked);
+        self.app.set_search_busy(asked > 0);
     }
 
     /// Adds what only the server knew about. Late answers to old searches are ignored.
@@ -285,7 +294,8 @@ impl Controller {
         if key != self.search_key.get() {
             return;
         }
-        self.app.set_search_busy(false);
+        self.searches_out.set(self.searches_out.get().saturating_sub(1));
+        self.app.set_search_busy(self.searches_out.get() > 0);
         let rows: Vec<MessageRow> = self.reader.rows(ids).unwrap_or_default();
         self.list.add_results(rows);
     }

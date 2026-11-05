@@ -141,6 +141,18 @@ fn is_safe_data_image(value: &str) -> bool {
         .any(|t| value.to_ascii_lowercase().starts_with(&format!("data:image/{t};base64,")))
 }
 
+/// A message's body as sanitised HTML to quote, with no document around it. Pictures sent with
+/// the message go in as `data:` URLs, and remote ones stay out: nothing here may reach a network.
+pub fn fragment(raw: &[u8]) -> String {
+    let Some(parsed) = MessageParser::default().parse(raw) else { return String::new() };
+    let message = parsed.root();
+    let html = message.html_body().find(|p| matches!(p.kind(), PartKind::Html));
+    match html.and_then(|_| message.body_html(0)) {
+        Some(html) => clean(&html, &inline_images(message), false).0,
+        None => crate::compose::text_to_html(&message.body_text(0).unwrap_or_default()),
+    }
+}
+
 /// Sanitises mail HTML into a complete document.
 pub fn document(html: &str, inline_images: &HashMap<String, String>) -> String {
     sanitise(html, inline_images, false).0
@@ -149,6 +161,11 @@ pub fn document(html: &str, inline_images: &HashMap<String, String>) -> String {
 /// A complete document, and the remote images it names. They are left out, or with `load_images`
 /// point at the page's own origin, so that the page still reaches nothing but the webview.
 fn sanitise(html: &str, inline_images: &HashMap<String, String>, load_images: bool) -> (String, Vec<String>) {
+    let (cleaned, remote) = clean(html, inline_images, load_images);
+    (format!("{SHEET}{cleaned}</body></html>"), remote)
+}
+
+fn clean(html: &str, inline_images: &HashMap<String, String>, load_images: bool) -> (String, Vec<String>) {
     let images = inline_images.clone();
     let remote = Arc::new(Mutex::new(Vec::new()));
     let seen = remote.clone();
@@ -194,14 +211,14 @@ fn sanitise(html: &str, inline_images: &HashMap<String, String>, load_images: bo
         .clean(html)
         .to_string();
     let remote = std::mem::take(&mut *remote.lock().expect("remote images"));
-    (format!("{SHEET}{cleaned}</body></html>"), remote)
+    (cleaned, remote)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn clean(html: &str) -> String {
+    fn cleaned(html: &str) -> String {
         document(html, &HashMap::new()).strip_prefix(SHEET).unwrap().strip_suffix("</body></html>").unwrap().to_string()
     }
 
@@ -225,7 +242,7 @@ mod tests {
             "<a href='data:text/html,<script>alert(1)</script>'>x</a>",
             "<a href='vbscript:x'>x</a>",
         ] {
-            let out = clean(attack).to_lowercase();
+            let out = cleaned(attack).to_lowercase();
             for banned in ["<script", "onerror", "onload", "<iframe", "<object", "<embed", "<form", "<input", "<meta", "<link", "<base", "<svg", "<math", "javascript:", "vbscript:", "data:text"] {
                 assert!(!out.contains(banned), "{attack} left {banned} in {out}");
             }
@@ -235,20 +252,20 @@ mod tests {
     #[test]
     fn links_that_reach_local_files_or_shares_are_removed() {
         for href in ["file:///c:/windows/win.ini", "\\\\evil.example\\share\\a", "ms-msdt:/id", "relative/path", "//evil.example/x"] {
-            let out = clean(&format!("<a href='{href}'>x</a>"));
+            let out = cleaned(&format!("<a href='{href}'>x</a>"));
             assert!(!out.contains("href"), "{href} survived in {out}");
         }
     }
 
     #[test]
     fn ordinary_links_stay() {
-        assert!(clean("<a href='https://example.com/a?b=1'>x</a>").contains("href=\"https://example.com/a?b=1\""));
-        assert!(clean("<a href='mailto:a@example.com'>x</a>").contains("mailto:a@example.com"));
+        assert!(cleaned("<a href='https://example.com/a?b=1'>x</a>").contains("href=\"https://example.com/a?b=1\""));
+        assert!(cleaned("<a href='mailto:a@example.com'>x</a>").contains("mailto:a@example.com"));
     }
 
     #[test]
     fn remote_images_lose_their_source_but_keep_their_size() {
-        let out = clean("<img src='https://tracker.example/p.gif' width=1 height=1 alt=logo>");
+        let out = cleaned("<img src='https://tracker.example/p.gif' width=1 height=1 alt=logo>");
         assert!(!out.contains("tracker.example"));
         assert!(out.contains("alt=\"logo\""));
     }
@@ -303,13 +320,13 @@ mod tests {
         let images = HashMap::from([("logo@x".to_string(), "data:image/png;base64,AAAA".to_string())]);
         assert!(document("<img src='cid:logo@x'>", &images).contains("data:image/png;base64,AAAA"));
         assert!(!document("<img src='cid:other'>", &images).contains("cid:"));
-        assert!(!clean("<img src='data:image/svg+xml;base64,AAAA'>").contains("svg"));
-        assert!(clean("<img src='data:image/gif;base64,AAAA'>").contains("data:image/gif"));
+        assert!(!cleaned("<img src='data:image/svg+xml;base64,AAAA'>").contains("svg"));
+        assert!(cleaned("<img src='data:image/gif;base64,AAAA'>").contains("data:image/gif"));
     }
 
     #[test]
     fn a_title_is_not_body_text_and_hidden_preview_text_stays_hidden() {
-        let out = clean(
+        let out = cleaned(
             "<html><head><title>The subject again</title></head><body>\
              <div style='display:none;max-height:0'>Preview</div><p>Hello</p></body></html>",
         );
@@ -326,7 +343,7 @@ mod tests {
 
     #[test]
     fn newsletter_layout_survives() {
-        let out = clean(
+        let out = cleaned(
             "<html><head><style>.a{color:red}</style></head><body>\
              <table width=600 cellpadding=0 bgcolor='#fff'><tr><td colspan=2 style='padding:4px' class=a>hi</td></tr></table>\
              </body></html>",

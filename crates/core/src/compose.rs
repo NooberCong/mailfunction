@@ -10,12 +10,21 @@ use lettre::message::{Attachment as Part, Mailbox, Mailboxes, MessageBuilder, Mu
 use lettre::address::Envelope;
 use mail_parser::{MessageParser, MessageRef};
 
+use crate::render;
+
+/// Where what is being answered starts. Everything above it is the user's.
+const QUOTED: &str = "<div class=\"quoted\">";
+/// How a quote looks in other people's mail, where the editor's style sheet does not go.
+const QUOTE_STYLE: &str = "margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex";
+
 /// A file on a message, whole.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attachment {
     pub name: String,
     pub mime: String,
     pub data: Vec<u8>,
+    /// Set for a picture in the text, which the HTML points to as `cid:`, rather than a file.
+    pub content_id: Option<String>,
 }
 
 /// The fields of a message being written.
@@ -25,7 +34,10 @@ pub struct Compose {
     pub cc: String,
     pub bcc: String,
     pub subject: String,
+    /// The text, which is what is searched and what a plain client shows.
     pub body: String,
+    /// The same with its formatting. Empty for a draft from before there was any.
+    pub html: String,
     /// The Message-ID being answered, without brackets, or empty.
     pub in_reply_to: String,
     /// Message-IDs of the thread so far, without brackets, separated by spaces.
@@ -63,6 +75,21 @@ fn join(list: &[(String, String)]) -> String {
 fn with_prefix(prefix: &str, subject: &str) -> String {
     let already = subject.get(..prefix.len()).is_some_and(|start| start.eq_ignore_ascii_case(prefix));
     if already { subject.to_string() } else { format!("{prefix} {subject}") }
+}
+
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// Plain text as the lines the editor works in.
+pub fn text_to_html(text: &str) -> String {
+    let line = |l: &str| if l.is_empty() { "<div><br></div>".to_string() } else { format!("<div>{}</div>", escape(l)) };
+    text.replace("\r\n", "\n").split('\n').map(line).collect()
+}
+
+/// What a message starts as when it has something quoted under it.
+fn quoting(lead: &str, quoted: &str) -> String {
+    format!("<div><br></div>{QUOTED}{lead}{quoted}</div>")
 }
 
 fn body_of(message: MessageRef) -> String {
@@ -122,6 +149,10 @@ pub fn reply(raw: &[u8], own: &str, all: bool) -> Option<Compose> {
         bcc: String::new(),
         subject: with_prefix("Re:", message.subject().unwrap_or_default()),
         body: format!("\n\nOn {}, {} wrote:\n{quoted}", date_line(message), sender_name(message)),
+        html: quoting(
+            &format!("<div>{}</div>", escape(&format!("On {}, {} wrote:", date_line(message), sender_name(message)))),
+            &format!("<blockquote>{}</blockquote>", render::fragment(raw)),
+        ),
         references: references.join(" "),
         in_reply_to: mid,
     })
@@ -141,6 +172,7 @@ pub fn attachments(raw: &[u8]) -> Vec<Attachment> {
                 |t| format!("{}/{}", t.ctype(), t.subtype().unwrap_or("octet-stream")),
             ),
             data: p.decoded().into_owned(),
+            content_id: None,
         })
         .collect()
 }
@@ -151,6 +183,31 @@ pub fn with_signature(body: &str, signature: &str) -> String {
         "" => body.to_string(),
         signature => format!("\n\n-- \n{signature}{body}"),
     }
+}
+
+/// The HTML of a signature, in a block of its own so that it can be found again.
+pub fn signature_html(signature: &str) -> String {
+    match signature.trim_end() {
+        "" => String::new(),
+        signature => format!("<div class=\"signature\">-- <br>{}</div>", escape(signature).replace('\n', "<br>")),
+    }
+}
+
+/// Puts a signature under what is about to be written, above anything quoted.
+pub fn html_with_signature(html: &str, signature: &str) -> String {
+    let html = if html.is_empty() { "<div><br></div>" } else { html };
+    let quote = html.find(QUOTED).unwrap_or(html.len());
+    format!("{}{}{}", &html[..quote], signature_html(signature), &html[quote..])
+}
+
+/// Turns a draft's `cid:` pictures into ones the editor can show, each remembering its id.
+pub fn show_pictures(html: &str, files: &[Attachment]) -> String {
+    use base64::Engine as _;
+    files.iter().fold(html.to_string(), |html, file| {
+        let Some(id) = &file.content_id else { return html };
+        let data = base64::engine::general_purpose::STANDARD.encode(&file.data);
+        html.replace(&format!("src=\"cid:{id}\""), &format!("src=\"data:{};base64,{data}\" data-cid=\"{id}\"", file.mime))
+    })
 }
 
 /// A forward of a raw message. Its attachments come from [`attachments`].
@@ -169,6 +226,7 @@ pub fn forward(raw: &[u8]) -> Option<Compose> {
     Some(Compose {
         subject: with_prefix("Fwd:", message.subject().unwrap_or_default()),
         body: format!("\n\n{header}\n{}", original.trim_end()),
+        html: quoting(&format!("{}<div><br></div>", text_to_html(header.trim_end())), &render::fragment(raw)),
         ..Compose::default()
     })
 }
@@ -183,6 +241,7 @@ pub fn from_raw(raw: &[u8]) -> Option<(Compose, Option<String>)> {
         bcc: join(&addresses(message.bcc())),
         subject: message.subject().unwrap_or_default().to_string(),
         body: body_of(message),
+        html: if message.html_body().next().is_some() { render::fragment(raw) } else { String::new() },
         in_reply_to: message.in_reply_to().and_then(|r| r.first().map(str::to_string)).unwrap_or_default(),
         references: message.references().map_or_else(String::new, |r| r.iter().collect::<Vec<_>>().join(" ")),
     };
@@ -238,17 +297,50 @@ fn base(compose: &Compose, from: &Mailbox, mid: &str) -> MessageBuilder {
     builder
 }
 
+/// A file's type, or plain bytes if what it says cannot be read.
+fn file_type(file: &Attachment) -> ContentType {
+    ContentType::parse(&file.mime).unwrap_or(ContentType::parse("application/octet-stream").expect("valid"))
+}
+
+/// The message as it goes out, whole, since nothing else will style it there.
+fn html_document(html: &str) -> String {
+    let html = html.replace("<blockquote", &format!("<blockquote style=\"{QUOTE_STYLE}\""));
+    format!("<!doctype html><html><head><meta charset=\"utf-8\"></head><body>{html}</body></html>")
+}
+
+/// The text and HTML of a message, with the pictures its HTML still uses. One deleted from the
+/// text stays behind in the draft, and must not go out with it.
+fn formatted(compose: &Compose, files: &[Attachment]) -> MultiPart {
+    let html = SinglePart::html(html_document(&compose.html));
+    let used = |id: &&String| compose.html.contains(&format!("cid:{id}"));
+    let pictures: Vec<_> = files.iter().filter_map(|f| Some((f, f.content_id.as_ref().filter(|id| used(id))?))).collect();
+    let alternative = MultiPart::alternative().singlepart(SinglePart::plain(compose.body.clone()));
+    if pictures.is_empty() {
+        return alternative.singlepart(html);
+    }
+    let mut related = MultiPart::related().singlepart(html);
+    for (file, id) in pictures {
+        related = related.singlepart(Part::new_inline(id.clone()).body(file.data.clone(), file_type(file)));
+    }
+    alternative.multipart(related)
+}
+
 fn finish(builder: MessageBuilder, compose: &Compose, files: &[Attachment]) -> Result<lettre::Message, String> {
-    let text = SinglePart::plain(compose.body.clone());
-    let built = if files.is_empty() {
-        builder.singlepart(text)
-    } else {
-        let mut parts = MultiPart::mixed().singlepart(text);
-        for file in files {
-            let kind = ContentType::parse(&file.mime).unwrap_or(ContentType::parse("application/octet-stream").expect("valid"));
-            parts = parts.singlepart(Part::new(file.name.clone()).body(file.data.clone(), kind));
+    let attached: Vec<_> = files.iter().filter(|f| f.content_id.is_none()).collect();
+    let built = match (compose.html.is_empty(), attached.is_empty()) {
+        (true, true) => builder.singlepart(SinglePart::plain(compose.body.clone())),
+        (false, true) => builder.multipart(formatted(compose, files)),
+        (plain, false) => {
+            let mut parts = if plain {
+                MultiPart::mixed().singlepart(SinglePart::plain(compose.body.clone()))
+            } else {
+                MultiPart::mixed().multipart(formatted(compose, files))
+            };
+            for file in attached {
+                parts = parts.singlepart(Part::new(file.name.clone()).body(file.data.clone(), file_type(file)));
+            }
+            builder.multipart(parts)
         }
-        builder.multipart(parts)
     };
     built.map_err(|e| e.to_string())
 }
@@ -338,6 +430,71 @@ Date: Wed, 04 Nov 2026 10:00:00 +0700\r\nContent-Type: text/plain; charset=utf-8
     }
 
     #[test]
+    fn a_signature_in_html_sits_above_the_quote_and_escapes_itself() {
+        assert_eq!(html_with_signature("", "Kong <k>\nRocket"), "<div><br></div><div class=\"signature\">-- <br>Kong &lt;k&gt;<br>Rocket</div>");
+        let reply = quoting("<div>On Monday:</div>", "<blockquote>hi</blockquote>");
+        let signed = html_with_signature(&reply, "Kong");
+        assert!(signed.find("signature").unwrap() < signed.find("quoted").unwrap(), "{signed}");
+        assert_eq!(html_with_signature(&reply, " \n"), reply);
+    }
+
+    #[test]
+    fn a_reply_quotes_the_formatting_and_nothing_dangerous() {
+        let raw = b"From: An <an@example.com>\r\nTo: me@example.com\r\nSubject: Hi\r\nMessage-ID: <h@x>\r\n\
+Date: Wed, 04 Nov 2026 10:00:00 +0700\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
+<p onclick=\"x()\">Some <b>bold</b></p><script>alert(1)</script><img src=\"https://t.example/p.gif\">\r\n";
+        let r = reply(raw, "me@example.com", false).unwrap();
+        assert!(r.html.contains("<b>bold</b>"), "{}", r.html);
+        assert!(!r.html.contains("script") && !r.html.contains("onclick") && !r.html.contains("t.example"), "{}", r.html);
+        assert!(r.html.starts_with("<div><br></div><div class=\"quoted\"><div>On "), "{}", r.html);
+
+        let plain = reply(ORIGINAL, "me@example.com", false).unwrap();
+        assert!(plain.html.contains("<blockquote><div>Dòng một</div>"), "{}", plain.html);
+    }
+
+    #[test]
+    fn a_formatted_message_goes_as_text_and_html_with_its_pictures_inside() {
+        let compose = Compose {
+            to: "a@example.com".into(),
+            subject: "Report".into(),
+            body: "Numbers\n".into(),
+            html: "<div><b>Numbers</b><img src=\"cid:kept\"></div><blockquote>Earlier</blockquote>".into(),
+            ..Compose::default()
+        };
+        let picture = |id: &str| Attachment {
+            name: id.into(),
+            mime: "image/png".into(),
+            data: b"PNG".to_vec(),
+            content_id: Some(id.into()),
+        };
+        let file = Attachment { name: "a.pdf".into(), mime: "application/pdf".into(), data: b"PDF".to_vec(), content_id: None };
+        let (_, raw) = outgoing(&compose, &me(), "m@x", &[picture("kept"), picture("deleted"), file]).unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.contains("multipart/mixed") && text.contains("multipart/alternative") && text.contains("multipart/related"), "{text}");
+
+        let parsed = MessageParser::default().parse(&raw).unwrap();
+        assert_eq!(parsed.body_text(0).unwrap().trim_end(), "Numbers");
+        assert!(parsed.body_html(0).unwrap().contains("<b>Numbers</b>"));
+        assert!(parsed.body_html(0).unwrap().contains("border-left"), "a quote keeps its look in other clients");
+        let inline: Vec<_> = parsed.attachments().filter_map(|p| p.content_id()).collect();
+        assert_eq!(inline, ["kept"], "a picture deleted from the text does not go");
+        assert_eq!(attachments(&raw).iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["a.pdf"]);
+    }
+
+    #[test]
+    fn a_draft_with_no_html_goes_as_it_always_did() {
+        let compose = Compose { to: "a@example.com".into(), body: "Text".into(), ..Compose::default() };
+        let (_, raw) = outgoing(&compose, &me(), "m@x", &[]).unwrap();
+        assert!(!String::from_utf8_lossy(&raw).contains("multipart"));
+    }
+
+    #[test]
+    fn pictures_show_in_the_editor_and_remember_their_id() {
+        let file = Attachment { name: "p".into(), mime: "image/png".into(), data: b"x".to_vec(), content_id: Some("a1".into()) };
+        assert_eq!(show_pictures("<img src=\"cid:a1\">", &[file]), "<img src=\"data:image/png;base64,eA==\" data-cid=\"a1\">");
+    }
+
+    #[test]
     fn a_signature_sits_above_the_quote() {
         assert_eq!(with_signature("", "Kong\n"), "\n\n-- \nKong");
         assert_eq!(with_signature("\n\nOn Monday:\n> hi\n", "Kong"), "\n\n-- \nKong\n\nOn Monday:\n> hi\n");
@@ -409,7 +566,7 @@ Date: Wed, 04 Nov 2026 10:00:00 +0700\r\nContent-Type: text/plain; charset=utf-8
             references: "m1@x m2@x".into(),
             ..Compose::default()
         };
-        let file = Attachment { name: "hóa-đơn.pdf".into(), mime: "application/pdf".into(), data: vec![0, 159, 146, 150] };
+        let file = Attachment { content_id: None, name: "hóa-đơn.pdf".into(), mime: "application/pdf".into(), data: vec![0, 159, 146, 150] };
         let (_, raw) = outgoing(&c, &me(), "new@x", std::slice::from_ref(&file)).unwrap();
         let parsed = MessageParser::default().parse(&raw).unwrap();
         let m = parsed.root();

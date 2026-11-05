@@ -5,6 +5,7 @@ mod actions;
 pub mod badge;
 pub mod chrome;
 mod disc;
+pub mod editor;
 pub mod instance;
 pub mod list;
 pub mod logos;
@@ -30,7 +31,7 @@ use mailfunction_core::{logo, oauth, secrets};
 use mailfunction_core::compose;
 use mailfunction_core::render::{self, Body, Rendered};
 use mailfunction_core::settings::{Identity, MarkRead, Settings};
-use mailfunction_core::store::{Account, AuthKind, LabelRow, MessageRow, Reader, Role, Security, Store};
+use mailfunction_core::store::{Account, AuthKind, MessageRow, Reader, Role, Security, SidebarLabel, Store, ThreadKey};
 use notify::{Notice, Notifier, Opens};
 use slint::{CloseRequestResponse, Color, ComponentHandle, Image, Model, ModelRc, Timer, TimerMode, VecModel};
 
@@ -51,6 +52,7 @@ const SMTPS_PORT: u16 = 465;
 /// Avatar sizes, matching app.slint, so that a logo is cut to exactly the pixels it fills.
 const HEADER_AVATAR: f32 = 40.0;
 const ACCOUNT_AVATAR: f32 = 28.0;
+const ACCOUNT_MARK: f32 = 16.0;
 const THREAD_AVATAR: f32 = 22.0;
 
 /// A sender's picture on a notification, in pixels. Windows scales it down to fit the display.
@@ -112,6 +114,19 @@ struct PageImages {
     arrived: bool,
 }
 
+/// Where the body of a message being written goes. The real one is a webview of its own, which
+/// comes into view once the message is in it. Tests record what they are given.
+pub trait ComposePane {
+    /// Starts editing this HTML. Returns false if that cannot happen.
+    fn open(&self, app: &App, html: &str, take_focus: bool) -> bool;
+    fn focus(&self);
+    fn release_focus(&self);
+    /// Replaces the signature with this HTML, or takes it away.
+    fn sign(&self, html: &str);
+    fn hide(&self);
+    fn bounds_changed(&self, app: &App);
+}
+
 /// How an account's connection is doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Link {
@@ -147,13 +162,15 @@ pub struct Controller {
     tray: tray::Tray,
     /// Unread Inbox mail across every account, as the taskbar button shows it.
     unread: Cell<i64>,
-    labels: RefCell<Vec<LabelRow>>,
+    labels: RefCell<Vec<SidebarLabel>>,
     label_items: Rc<VecModel<LabelItem>>,
-    /// Every signed-in account. Mail stays local to its account; only one is on screen.
+    /// Every signed-in account.
     accounts: RefCell<Vec<Mailbox>>,
     account_items: Rc<VecModel<AccountItem>>,
+    /// The account on screen, or `None` for all of them in one list. What is done to mail goes
+    /// by the account the mail is in, which only here is the same thing.
     shown: Cell<Option<i64>>,
-    /// The account on screen has changed since its list was last read.
+    /// Mail on screen has changed since its list was last read.
     list_stale: Cell<bool>,
     /// The message showing in the reader.
     selected: Cell<Option<i64>>,
@@ -161,7 +178,7 @@ pub struct Controller {
     selected_sender: RefCell<String>,
     last_open: Cell<Option<Instant>>,
     /// The thread in the reader, oldest first.
-    open_thread: Cell<Option<i64>>,
+    open_thread: Cell<Option<ThreadKey>>,
     thread: RefCell<Vec<MessageRow>>,
     thread_items: Rc<VecModel<ThreadItem>>,
     read_timer: Timer,
@@ -172,6 +189,8 @@ pub struct Controller {
     search_timer: Timer,
     /// Identifies the latest search, so that late answers to older ones can be told apart.
     search_key: Cell<u64>,
+    /// Accounts yet to answer the latest search.
+    searches_out: Cell<usize>,
     writing: RefCell<Option<writing::Writing>>,
     autosave: Timer,
     suggest_timer: Timer,
@@ -181,13 +200,14 @@ pub struct Controller {
     images: Arc<Images>,
     page_images: RefCell<Option<PageImages>>,
     page_key: Cell<u64>,
+    editor: Box<dyn ComposePane>,
     notifier: Box<dyn Notifier>,
     engine: RefCell<Option<Engine>>,
     client: Option<oauth::Client>,
     refresh: Timer,
     settings: Cell<Settings>,
     /// The thread to go back to when the settings close.
-    returning_to: Cell<Option<i64>>,
+    returning_to: Cell<Option<ThreadKey>>,
     identity_save: Timer,
 }
 
@@ -197,6 +217,7 @@ impl Controller {
         dir: &Path,
         client: Option<oauth::Client>,
         pane: Box<dyn HtmlPane>,
+        editor: Box<dyn ComposePane>,
         notifier: Box<dyn Notifier>,
         network: Arc<dyn Network>,
     ) -> mailfunction_core::Result<Rc<Self>> {
@@ -246,6 +267,7 @@ impl Controller {
             pick_ids: RefCell::default(),
             search_timer: Timer::default(),
             search_key: Cell::new(0),
+            searches_out: Cell::new(0),
             writing: RefCell::default(),
             autosave: Timer::default(),
             suggest_timer: Timer::default(),
@@ -254,6 +276,7 @@ impl Controller {
             images,
             page_images: RefCell::default(),
             page_key: Cell::default(),
+            editor,
             notifier,
             engine: RefCell::default(),
             client,
@@ -307,11 +330,12 @@ impl Controller {
             }
         });
         self.app.on_accept_suggestion(self.bound1(|this, index| this.accept_suggestion(index as usize)));
+        self.app.on_choose_sender(self.bound1(|this, index| this.choose_sender(index as usize)));
         self.app.on_show_copies(self.bound(|this| this.app.set_draft_copies(true)));
         self.app.on_send_draft(self.bound(|this| this.send_draft()));
-        self.app.on_attach_files(self.bound(|this| this.pick_files()));
         self.app.on_remove_draft_file(self.bound1(|this, index| this.remove_draft_file(index as usize)));
-        self.app.on_discard_draft(self.bound(|this| this.discard_draft()));
+        self.app.on_focus_editor(self.bound(|this| this.editor.focus()));
+        self.app.on_editor_moved(self.bound(|this| this.editor.bounds_changed(&this.app)));
         self.app.on_close_draft(self.bound(|this| this.finish_writing()));
         self.app.on_notice_clicked(self.bound(|this| this.notice_clicked()));
     }
@@ -348,12 +372,15 @@ impl Controller {
         let weak = Rc::downgrade(self);
         self.app.on_add_account(move || {
             if let Some(this) = weak.upgrade() {
+                // Sign-in covers the window, and nothing covers a webview but moving it away.
+                this.finish_writing();
                 this.open_sign_in("");
             }
         });
         let weak = Rc::downgrade(self);
         self.app.on_sign_in_again(move || {
             if let Some(this) = weak.upgrade() {
+                this.finish_writing();
                 this.sign_in_again();
             }
         });
@@ -375,6 +402,7 @@ impl Controller {
                 this.select_account(index as usize);
             }
         });
+        self.app.on_select_all_accounts(self.bound(|this| this.select_all_accounts()));
         let weak = Rc::downgrade(self);
         self.app.on_remove_account(move |index| {
             if let Some(this) = weak.upgrade() {
@@ -409,11 +437,12 @@ impl Controller {
         self.app.on_theme_changed(move || {
             if let Some(this) = weak.upgrade() {
                 chrome::paint_title_bar(&this.app);
+                this.reload_editor();
             }
         });
     }
 
-    /// Reads the accounts from the store and shows the first.
+    /// Reads the accounts from the store and shows their mail.
     pub fn load_accounts(&self) -> mailfunction_core::Result<()> {
         let mut mailboxes = Vec::new();
         for account in self.reader.accounts()? {
@@ -421,41 +450,64 @@ impl Controller {
             mailboxes.push(Mailbox::new(account, identity));
         }
         *self.accounts.borrow_mut() = mailboxes;
-        self.show_first();
+        self.show_everything();
         Ok(())
     }
 
-    /// Shows the first account's mail, or the sign-in screen if there is none.
-    fn show_first(&self) {
-        let first = self.accounts.borrow().first().map(|m| m.account.id);
-        self.app.set_signed_in(first.is_some());
-        match first {
-            Some(id) => self.show(id),
-            None => {
+    /// Shows all the mail there is, or the sign-in screen if there are no accounts.
+    fn show_everything(&self) {
+        let accounts: Vec<i64> = self.accounts.borrow().iter().map(|m| m.account.id).collect();
+        self.app.set_signed_in(!accounts.is_empty());
+        match accounts[..] {
+            [] => {
                 self.shown.set(None);
                 self.clear_message();
                 self.publish_accounts();
                 self.app.set_entrance_key(self.app.get_entrance_key() + 1);
             }
+            [only] => self.show(Some(only)),
+            _ => self.show(None),
         }
     }
 
-    fn show(&self, id: i64) {
-        self.shown.set(Some(id));
+    fn show(&self, account: Option<i64>) {
+        self.shown.set(account);
+        self.list.mark_accounts(if account.is_some() { Vec::new() } else { self.accounts_on_screen() });
         self.labels.borrow_mut().clear();
         self.reload_labels();
         self.select_label(0);
         self.publish_accounts();
     }
 
+    fn on_screen(&self, account: i64) -> bool {
+        self.shown.get().is_none_or(|shown| shown == account)
+    }
+
+    fn accounts_on_screen(&self) -> Vec<i64> {
+        self.accounts.borrow().iter().map(|m| m.account.id).filter(|id| self.on_screen(*id)).collect()
+    }
+
     /// Shows another account. What was in progress belongs to the one being left, so it ends
     /// there first.
     pub fn select_account(self: &Rc<Self>, index: usize) {
         let id = self.accounts.borrow().get(index).map(|m| m.account.id);
-        if let Some(id) = id.filter(|id| Some(*id) != self.shown.get()) {
+        if id.is_some() {
+            self.switch_to(id);
+        }
+    }
+
+    /// Shows every account's mail together, which takes more than one to mean anything.
+    pub fn select_all_accounts(self: &Rc<Self>) {
+        if self.accounts.borrow().len() > 1 {
+            self.switch_to(None);
+        }
+    }
+
+    fn switch_to(self: &Rc<Self>, account: Option<i64>) {
+        if account != self.shown.get() {
             self.finish_writing();
             self.close_search();
-            self.show(id);
+            self.show(account);
         }
     }
 
@@ -485,7 +537,7 @@ impl Controller {
             }
         }
         self.app.set_signed_in(true);
-        self.show(id);
+        self.show(Some(id));
         Ok(())
     }
 
@@ -514,8 +566,8 @@ impl Controller {
         if self.accounts.borrow().is_empty() {
             self.leave_settings();
         }
-        if self.shown.get() == Some(removed.id) {
-            self.show_first();
+        if self.on_screen(removed.id) {
+            self.show_everything();
         } else {
             self.publish_accounts();
         }
@@ -534,7 +586,7 @@ impl Controller {
 
     fn sign_in_again(&self) {
         let reason = self.accounts.borrow().iter().find_map(|m| match &m.link {
-            Link::SignedOut(reason) if Some(m.account.id) == self.shown.get() => {
+            Link::SignedOut(reason) if self.on_screen(m.account.id) => {
                 Some(format!("Sign in to {} again.\n{reason}", m.account.email))
             }
             _ => None,
@@ -687,6 +739,7 @@ impl Controller {
         self.save_identities();
         chrome::hide(&self.app);
         self.hide_page();
+        self.editor.hide();
         if !self.settings.get().keep_running {
             let _ = slint::quit_event_loop();
         }
@@ -695,6 +748,9 @@ impl Controller {
     /// Brings the window up, opening again the page that closing it let go of.
     pub fn reveal(self: &Rc<Self>) {
         let returning = chrome::raise(&self.app);
+        if returning {
+            self.reload_editor();
+        }
         if returning
             && !self.app.get_composing()
             && matches!(self.app.get_pane(), Pane::Html | Pane::Loading)
@@ -714,15 +770,14 @@ impl Controller {
         self.leave_settings();
         self.finish_writing();
         self.close_search();
-        if self.shown.get() != Some(opens.account) {
-            self.show(opens.account);
+        if !self.on_screen(opens.account) {
+            self.show(Some(opens.account));
         }
         let inbox = self.labels.borrow().iter().position(|l| l.role == Role::Inbox).unwrap_or_default();
         self.select_label(inbox);
         // The list is of threads, so the message is found by the thread it is in.
-        let thread = opens.message.and_then(|id| self.reader.rows(&[id]).ok()?.first().map(|m| m.thread_id));
-        let row = thread.zip(self.current_label()).and_then(|(thread, label)| self.reader.position(label, thread).ok().flatten());
-        if let Some(row) = row {
+        let thread = opens.message.and_then(|id| self.reader.rows(&[id]).ok()?.first().map(MessageRow::thread_key));
+        if let Some(row) = thread.and_then(|thread| self.list_position(thread)) {
             self.select_row(row);
             self.app.invoke_reveal(row as i32);
         }
@@ -735,26 +790,32 @@ impl Controller {
         self.publish_accounts();
     }
 
-    /// Syncs the shown account now. The engine reports back with [`Event::Syncing`].
+    /// Syncs what is on screen now. The engine reports back with [`Event::Syncing`].
     fn sync_now(&self) {
-        if let Some((account, engine)) = self.shown.get().zip(self.engine.borrow().as_ref()) {
-            engine.sync_now(account);
+        if let Some(engine) = self.engine.borrow().as_ref() {
+            for account in self.accounts_on_screen() {
+                engine.sync_now(account);
+            }
         }
     }
 
-    /// Brings the sidebar's accounts and the state of the shown one up to date.
+    /// Brings the sidebar's accounts and the state of what is on screen up to date.
     fn publish_accounts(&self) {
         let unread = self.reader.inbox_unread().unwrap_or_default();
         let accounts = self.accounts.borrow();
         self.unread.set(accounts.iter().filter_map(|m| unread.get(&m.account.id)).sum());
+        self.app.set_all_unread(if self.unread.get() > 0 { self.unread.get().to_string().into() } else { "".into() });
         self.show_badge();
         let items = accounts
             .iter()
-            .map(|m| AccountItem {
+            .enumerate()
+            .map(|(index, m)| AccountItem {
                 email: m.account.email.as_str().into(),
                 initials: initials(&m.account.email).into(),
-                tone: tone(&m.account.email),
+                // By place, as a colour is all that tells two accounts apart on a row of the list.
+                tone: index as i32,
                 logo: self.account_logo(&m.account.email),
+                picture: self.logos.stored(&logo::picture_key(&m.account.email), ACCOUNT_MARK),
                 unread: unread.get(&m.account.id).map_or_else(Default::default, |n| n.to_string().into()),
                 status: match m.link {
                     Link::Offline => "Offline".into(),
@@ -769,9 +830,9 @@ impl Controller {
         update_rows(&self.account_items, items);
         let active = accounts.iter().position(|m| Some(m.account.id) == self.shown.get());
         self.app.set_active_account(active.map_or(-1, |i| i as i32));
-        let link = active.map(|i| &accounts[i].link);
-        self.app.set_syncing(link == Some(&Link::Syncing));
-        self.app.set_needs_sign_in(matches!(link, Some(Link::SignedOut(_))));
+        let links = || accounts.iter().filter(|m| self.on_screen(m.account.id)).map(|m| &m.link);
+        self.app.set_syncing(links().any(|link| *link == Link::Syncing));
+        self.app.set_needs_sign_in(links().any(|link| matches!(link, Link::SignedOut(_))));
     }
 
     fn show_badge(&self) {
@@ -813,7 +874,7 @@ impl Controller {
     }
 
     fn schedule_refresh(self: &Rc<Self>, account: i64) {
-        if self.shown.get() == Some(account) {
+        if self.on_screen(account) {
             self.list_stale.set(true);
         }
         if self.refresh.running() {
@@ -850,22 +911,29 @@ impl Controller {
     }
 
     /// Where a thread is in the list on screen.
-    fn list_position(&self, thread: i64) -> Option<usize> {
+    fn list_position(&self, thread: ThreadKey) -> Option<usize> {
         if self.app.get_searching() {
             return self.list.result_position(thread);
         }
-        self.reader.position(self.current_label()?, thread).ok().flatten()
+        self.reader.position(&self.current_labels(), thread).ok().flatten()
     }
 
-    /// The label on screen, if a list of one is what is showing.
-    pub(crate) fn current_label(&self) -> Option<i64> {
-        self.labels.borrow().get(self.app.get_active_label() as usize).map(|l| l.id)
+    /// The labels behind the sidebar line on screen, as (account id, label id).
+    pub(crate) fn current_held(&self) -> Vec<(i64, i64)> {
+        self.labels.borrow().get(self.app.get_active_label() as usize).map_or_else(Vec::new, |l| l.held.clone())
+    }
+
+    fn current_labels(&self) -> Vec<i64> {
+        self.current_held().into_iter().map(|(_, label)| label).collect()
     }
 
     fn reload_labels(&self) {
-        let Some(account) = self.shown.get() else { return };
-        let current = self.current_label();
-        let labels = self.reader.labels(account).unwrap_or_default();
+        let accounts = self.accounts_on_screen();
+        if accounts.is_empty() {
+            return;
+        }
+        let current = self.current_labels();
+        let labels = self.reader.sidebar(&accounts).unwrap_or_default();
         let items: Vec<_> = labels
             .iter()
             .map(|l| LabelItem {
@@ -879,21 +947,21 @@ impl Controller {
                 kind: label_kind(l.role),
             })
             .collect();
-        self.app.set_can_label(labels.iter().any(|l| l.role == Role::All));
         let first_custom = labels.iter().position(|l| l.role == Role::None).unwrap_or(labels.len());
         self.app.set_first_custom_label(first_custom as i32);
-        if let Some(index) = labels.iter().position(|l| Some(l.id) == current) {
+        if let Some(index) = labels.iter().position(|l| l.ids().iter().any(|id| current.contains(id))) {
             self.app.set_active_label(index as i32);
+            self.list.set_labels(labels[index].ids());
         }
         *self.labels.borrow_mut() = labels;
         update_rows(&self.label_items, items);
     }
 
     pub fn select_label(&self, index: usize) {
-        // A new account has no labels until it syncs, and no label id matches no mail.
-        let (id, role) = self.labels.borrow().get(index).map_or((0, Role::None), |l| (l.id, l.role));
+        // A new account has no labels until it syncs, and no labels is no mail.
+        let (ids, role) = self.labels.borrow().get(index).map_or((Vec::new(), Role::None), |l| (l.ids(), l.role));
         self.app.set_active_label(index as i32);
-        self.list.show_label(id, role != Role::Spam);
+        self.list.show_labels(ids, role != Role::Spam);
         self.app.invoke_scroll_to_top();
         self.app.set_list_key(self.app.get_list_key() + 1);
         self.clear_message();
@@ -937,7 +1005,7 @@ impl Controller {
 
     fn thread_rows(&self, head: &MessageRow) -> Vec<MessageRow> {
         let binned = matches!(self.current_role(), Role::Trash | Role::Spam);
-        let rows = self.shown.get().and_then(|account| self.reader.thread(account, head.thread_id, binned).ok());
+        let rows = self.reader.thread(head.account_id, head.thread_id, binned).ok();
         rows.filter(|rows| !rows.is_empty()).unwrap_or_else(|| vec![head.clone()])
     }
 
@@ -945,7 +1013,7 @@ impl Controller {
     fn open_thread(self: &Rc<Self>, head: &MessageRow) {
         let thread = self.thread_rows(head);
         let index = thread.iter().position(|m| !m.seen).unwrap_or(thread.len() - 1);
-        self.open_thread.set(Some(head.thread_id));
+        self.open_thread.set(Some(head.thread_key()));
         *self.thread.borrow_mut() = thread;
         self.publish_thread();
         self.open_at(index);
@@ -972,6 +1040,11 @@ impl Controller {
         self.app.set_thread_open(open.map_or(-1, |i| i as i32));
     }
 
+    /// The account the open thread is in.
+    pub(crate) fn open_account(&self) -> Option<i64> {
+        self.thread.borrow().first().map(|m| m.account_id)
+    }
+
     fn publish_thread(&self) {
         let thread = self.thread.borrow();
         let items: Vec<ThreadItem> = thread
@@ -987,6 +1060,7 @@ impl Controller {
             .collect();
         update_rows(&self.thread_items, items);
         self.app.set_starred(thread.iter().any(|m| m.flagged));
+        self.app.set_can_label(thread.first().is_some_and(|m| self.reader.has_role(m.account_id, Role::All).unwrap_or(false)));
         let role = self.current_role();
         self.app.set_in_trash(role == Role::Trash);
         self.app.set_in_spam(role == Role::Spam);
@@ -1027,9 +1101,8 @@ impl Controller {
 
     fn fetch_selected_body(&self, id: i64) {
         self.app.set_pane(Pane::Loading);
-        let asked = self.shown.get().zip(self.engine.borrow().as_ref()).map(|(account, engine)| {
-            engine.fetch_body(account, id)
-        });
+        let account = self.reader.account_of(id).ok().flatten();
+        let asked = account.zip(self.engine.borrow().as_ref()).map(|(account, engine)| engine.fetch_body(account, id));
         if asked == Some(false) {
             self.app.set_pane(Pane::Failed);
         }
@@ -1082,14 +1155,14 @@ impl Controller {
 
     fn sender_allowed(&self) -> bool {
         let sender = self.selected_sender.borrow();
-        self.shown.get().is_some_and(|account| self.reader.images_allowed(account, &sender).unwrap_or(false))
+        self.open_account().is_some_and(|account| self.reader.images_allowed(account, &sender).unwrap_or(false))
     }
 
     /// Images load without asking, except in Spam, where loading one tells a spammer the address
     /// is read. Searches reach Spam too, so this goes by the message and not by the list on show.
     fn all_images_load(&self, id: i64) -> bool {
         let held = self.reader.message_labels(id).unwrap_or_default();
-        let spam = self.labels.borrow().iter().any(|l| l.role == Role::Spam && held.contains(&l.id));
+        let spam = self.labels.borrow().iter().any(|l| l.role == Role::Spam && l.ids().iter().any(|id| held.contains(id)));
         self.settings.get().show_all_images && !spam
     }
 
@@ -1101,7 +1174,7 @@ impl Controller {
     }
 
     fn set_images_allowed(&self, allowed: bool) {
-        let Some(account) = self.shown.get() else { return };
+        let Some(account) = self.open_account() else { return };
         let saved = self.store.set_images_allowed(account, &self.selected_sender.borrow(), allowed);
         match (saved.is_ok(), allowed, self.selected.get()) {
             (true, true, _) => self.load_images(),

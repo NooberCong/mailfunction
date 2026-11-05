@@ -75,13 +75,13 @@ fn a_large_mailbox_stays_within_budget() {
 
     // Three messages to a thread, the first of which is one short.
     let threads = (MESSAGES as usize) / 3 + 1;
-    assert_eq!(timed("count", 50, || reader.message_count(everything).unwrap()), threads);
-    let first = timed("first page", 50, || reader.messages(inbox, 0, 100).unwrap());
+    assert_eq!(timed("count", 50, || reader.message_count(&[everything]).unwrap()), threads);
+    let first = timed("first page", 50, || reader.messages(&[inbox], 0, 100).unwrap());
     assert_eq!(first.len(), 100);
-    let last = timed("deepest page", 50, || reader.messages(everything, threads - 100, 100).unwrap());
+    let last = timed("deepest page", 50, || reader.messages(&[everything], threads - 100, 100).unwrap());
     assert_eq!(last.len(), 100);
     let position = timed("position of the oldest thread", 50, || {
-        reader.position(everything, last[99].thread_id).unwrap().unwrap()
+        reader.position(&[everything], last[99].thread_key()).unwrap().unwrap()
     });
     assert_eq!(position, threads - 1);
     let thread = timed("opening a thread", 50, || reader.thread(account, first[0].thread_id, false).unwrap());
@@ -113,6 +113,43 @@ fn a_large_mailbox_stays_within_budget() {
     });
     timed("expunge scan of local UIDs", 100, || store.uids(&all).unwrap());
     timed("orphan purge", 500, || store.purge_orphans(account).unwrap());
+
+    // Both accounts in one list, where each page is a merge of two walks down an index.
+    let second = store
+        .add_account(&Account { email: "work@example.com".into(), ..reader.accounts().unwrap()[0].clone() })
+        .unwrap();
+    let theirs = store.folder(second, "INBOX", &LabelSpec::system(Role::Inbox)).unwrap();
+    for chunk in (1..=MESSAGES / 2).collect::<Vec<_>>().chunks(1000) {
+        let batch: Vec<_> = chunk
+            .iter()
+            .map(|&uid| NewMessage {
+                uid,
+                remote_id: format!("work:{uid}"),
+                gm_thread_id: Some(uid as u64),
+                mid: None,
+                references: vec![],
+                subject: format!("Work subject {uid}"),
+                from_name: "Colleague".into(),
+                from_addr: "colleague@example.com".into(),
+                date: 1_700_000_030 + uid as i64 * 120,
+                size: 40_000,
+                seen: uid % 50 != 0,
+                flagged: false,
+                labels: vec![],
+            })
+            .collect();
+        store.save_messages(&theirs, &batch).unwrap();
+    }
+    let both = [inbox, theirs.label_id];
+    timed("sidebar of both accounts", 200, || reader.sidebar(&[account, second]).unwrap());
+    let merged = timed("count of both inboxes", 50, || reader.message_count(&both).unwrap());
+    let first = timed("first page of both", 50, || reader.messages(&both, 0, 100).unwrap());
+    assert!(first.is_sorted_by_key(|m| std::cmp::Reverse(m.date)));
+    assert!(first.iter().any(|m| m.account_id == account) && first.iter().any(|m| m.account_id == second));
+    let last = timed("deepest page of both", 50, || reader.messages(&both, merged - 100, 100).unwrap());
+    assert_eq!(last.len(), 100);
+    let oldest = timed("position of the oldest of both", 50, || reader.position(&both, last[99].thread_key()).unwrap().unwrap());
+    assert_eq!(oldest, merged - 1);
     timed("removing the whole account", 60_000, || store.remove_account(account).unwrap());
 
     drop(reader);

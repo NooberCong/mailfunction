@@ -161,7 +161,7 @@ fn world(window: &slint::platform::software_renderer::MinimalSoftwareWindow) -> 
     store.save_messages(&spam, &[mail(5, "Win a prize", "spam@bad.example", 1, vec![])]).unwrap();
     let reader = Reader::open(&dir).unwrap();
     let label = inbox.label_id;
-    for row in reader.messages(label, 0, 10).unwrap() {
+    for row in reader.messages(&[label], 0, 10).unwrap() {
         let raw = if row.subject == "Newsletter" { html_body(&row.from_addr) } else { plain_body(&row.subject) };
         store.save_body(row.id, &raw).unwrap();
     }
@@ -175,7 +175,7 @@ fn world(window: &slint::platform::software_renderer::MinimalSoftwareWindow) -> 
     let notifier = RecordingNotifier::default();
     let notices = notifier.shown.clone();
     let network = Arc::new(Watched::default());
-    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(pane), Box::new(notifier), network.clone()).unwrap();
+    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(pane), Box::new(common::RecordingEditor::default()), Box::new(notifier), network.clone()).unwrap();
     app.show().unwrap();
     window.dispatch_event(WindowEvent::WindowActiveChanged(true));
     controller.load_accounts().unwrap();
@@ -427,14 +427,14 @@ fn identity(w: &World) {
 
     // A new message starts signed, with the cursor above it.
     press(&w.app, "c");
-    assert_eq!(w.app.get_draft_body(), "\n\n-- \nKong\nRocket");
+    assert_eq!(w.controller.draft_text(), "\n\n-- \nKong\nRocket");
     shot(&w.app, "44-signed-compose");
 
     // Nothing written means nothing kept, signature or not.
     let drafts = |w: &World| {
         let labels = w.reader.labels(w.account).unwrap();
         let drafts = labels.iter().find(|l| l.role == Role::Drafts).unwrap();
-        w.reader.message_count(drafts.id).unwrap()
+        w.reader.message_count(&[drafts.id]).unwrap()
     };
     let before = drafts(w);
     press(&w.app, ESCAPE);
@@ -443,7 +443,7 @@ fn identity(w: &World) {
     // Above the quote in a reply.
     w.open("Second");
     press(&w.app, "r");
-    let body = w.app.get_draft_body();
+    let body = w.controller.draft_text();
     let (signature, quote) = (body.find("-- \nKong").unwrap(), body.find("> Hello there").unwrap());
     assert!(signature < quote, "{body}");
     press(&w.app, ESCAPE);

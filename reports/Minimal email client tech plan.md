@@ -177,7 +177,13 @@ The reading pane has one rule: the old message goes with the click. A webview ke
 
 ## Accounts (November 2026)
 
-One thread runs every account, with two tasks and two connections each, because the work is almost all waiting on sockets. An account adds sockets, not a thread. The schema was multi-account from the start and message ids are unique across accounts, so nothing about stored mail changed. An account that loses its sign-in stops alone, and its local mail stays readable. Unread counts for all accounts take 14 ms on a 100,000-message mailbox, and removing that mailbox takes about a second, so removal runs off the UI thread. Mail in an account that is not on screen updates its count and leaves the list alone. Unified inbox remains Phase 2 work.
+One thread runs every account, with two tasks and two connections each, because the work is almost all waiting on sockets. An account adds sockets, not a thread. The schema was multi-account from the start and message ids are unique across accounts, so nothing about stored mail changed. An account that loses its sign-in stops alone, and its local mail stays readable. Unread counts for all accounts take 14 ms on a 100,000-message mailbox, and removing that mailbox takes about a second, so removal runs off the UI thread. Mail in an account that is not on screen updates its count and leaves the list alone.
+
+With two or more accounts the app opens on All accounts, where each system label shows every account's mail. User labels stay in their own account. A list is a merge of each label's index, so the deepest page of 150,000 messages across two inboxes takes under 5 ms. Gmail's thread ids are only unique within a mailbox, so a thread is known by its account and id together, and anything done to mail goes by the account the mail is in, not the one on screen. New mail starts from the first account, and the composer's From line moves it to another, signature and all. Microsoft and iCloud are set aside for now.
+
+## Compose (November 2026)
+
+The body of a message is `crates/app/editor` in a second WebView2. The reading pane keeps scripts off, because mail is hostile, and this one needs them, so it serves only the app's own script from memory, under a CSP that forbids inline script and every network. What it quotes is sanitised by ammonia and again by the page. It sits on the same browser profile as the reading pane, so the two share browser processes. It reports every change as it happens, so nothing is left in the page when the user leaves. Pictures stay out of those reports: each is handed over once and kept beside the draft as an inline attachment, which the HTML points to by `cid:`. Mail goes as `multipart/alternative`, with the pictures it still uses in `multipart/related`. Replies quote the original's formatting, without its remote images, since an editor that cannot reach a network cannot show them. Tables can be quoted but not inserted.
 
 ## Conclusion
 

@@ -17,6 +17,8 @@ try {
     }
     rustup run stable-x86_64-pc-windows-msvc cargo test -p mailfunction-core --test dovecot -- --ignored --test-threads=4
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    rustup run stable-x86_64-pc-windows-msvc cargo test -p mailfunction --test editor
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     rustup run stable-x86_64-pc-windows-msvc cargo test -p mailfunction --test live
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     rustup run stable-x86_64-pc-windows-msvc cargo test -p mailfunction --test images

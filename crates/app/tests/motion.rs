@@ -6,6 +6,8 @@
 //!
 //!     cargo test --release -p mailfunction --test motion -- --nocapture
 
+mod common;
+
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -185,7 +187,7 @@ fn seed(dir: &std::path::Path) -> (Store, i64) {
         .collect();
     store.save_messages(&inbox, &messages).unwrap();
     let reader = Reader::open(dir).unwrap();
-    for row in reader.messages(inbox.label_id, 0, 100).unwrap() {
+    for row in reader.messages(&[inbox.label_id], 0, 100).unwrap() {
         let body = format!("From: a@example.vn\r\nTo: b@example.vn\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}", "Chào anh, em gửi lịch họp tuần sau.\r\n".repeat(30));
         store.save_body(row.id, body.as_bytes()).unwrap();
     }
@@ -197,7 +199,7 @@ fn reader_id(dir: &std::path::Path, row: usize) -> i64 {
     let reader = Reader::open(dir).unwrap();
     let account = reader.accounts().unwrap()[0].id;
     let inbox = reader.labels(account).unwrap()[0].id;
-    reader.messages(inbox, row, 1).unwrap()[0].id
+    reader.messages(&[inbox], row, 1).unwrap()[0].id
 }
 
 #[test]
@@ -212,7 +214,7 @@ fn motion_is_cheap_and_stops() {
     let app = App::new().unwrap();
     window.dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: SCALE });
     window.set_size(PhysicalSize::new(SIZE.0, SIZE.1));
-    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(NoHtml), Box::new(Silent), Arc::new(Offline)).unwrap();
+    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(NoHtml), Box::new(common::RecordingEditor::default()), Box::new(Silent), Arc::new(Offline)).unwrap();
     app.show().unwrap();
     window.dispatch_event(WindowEvent::WindowActiveChanged(true));
     controller.load_accounts().unwrap();

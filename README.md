@@ -1,7 +1,7 @@
 # mailfunction
 
 A minimal, fast desktop mail client for Windows, for any number of Gmail accounts: threads, triage,
-plain-text compose with attachments, undo send, local search and full keyboard control.
+one inbox across all of them, formatted compose with pictures and attachments, undo send, local search and full keyboard control.
 [The plan](reports/Minimal%20email%20client%20tech%20plan.md) covers what comes next and why.
 
 ## Layout
@@ -41,7 +41,10 @@ except in Spam.
 2. Save the client JSON as `%USERPROFILE%\.config\mailfunction\google-client.json`.
 3. Run the app and sign in. Google will warn that the app is unverified, which is expected for
    a personal project. Add more accounts from the sidebar, and switch with a click or `Ctrl+1`
-   to `Ctrl+9`. Removing an account deletes its local mail and its saved sign-in.
+   to `Ctrl+9`. With two or more, the app opens on All accounts (`Ctrl+0`): every account's Inbox,
+   Starred, Sent and so on in one list, where a small badge says whose each message is. Whatever you
+   do to a message happens in its own account, and the From line chooses where new mail goes from.
+   Removing an account deletes its local mail and its saved sign-in.
 
 ```powershell
 rustup run stable-x86_64-pc-windows-msvc cargo run --release -p mailfunction

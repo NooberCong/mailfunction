@@ -6,11 +6,15 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use mailfunction_core::compose::{self, Attachment, Compose};
 use mailfunction_core::draft::MAX_ATTACHMENTS;
+use mailfunction_core::store::Store;
 use slint::{ModelRc, SharedString, TimerMode, VecModel};
 
 use crate::actions::Reversible;
+use crate::editor::EditorEvent;
 use crate::{Controller, FileItem, chrome, on_ui_thread};
 
 const AUTOSAVE_DELAY: Duration = Duration::from_millis(800);
@@ -21,6 +25,14 @@ const SUGGEST_DELAY: Duration = Duration::from_millis(120);
 
 /// The message being written.
 pub(crate) struct Writing {
+    /// The account it goes from.
+    pub account: i64,
+    /// What is in the editor now, as it last reported it.
+    pub body: String,
+    pub html: String,
+    /// Pictures from the editor, until there is a draft to keep them with. A reply that is only
+    /// looked at is not worth keeping, whatever was in what it quotes.
+    pub pictures: Vec<Attachment>,
     /// Its draft, once there is anything worth keeping.
     pub draft: Option<i64>,
     /// The message it answers, whose thread it joins.
@@ -32,6 +44,16 @@ pub(crate) struct Writing {
     pub touched: bool,
     /// It started from nothing, so if it is back to how it began, nothing has been written.
     pub new: bool,
+}
+
+impl Writing {
+    fn start_draft(&mut self, store: &Store, fields: &Compose) {
+        self.draft = store.create_draft(self.account, fields, self.reply_to, &self.pictures).ok();
+        if self.draft.is_some() {
+            self.pictures.clear();
+        }
+        self.touched = true;
+    }
 }
 
 /// Bytes as a person would say them.
@@ -66,58 +88,72 @@ fn last_address(field: &str) -> &str {
 
 impl Controller {
     pub(crate) fn compose_new(self: &Rc<Self>) {
-        let fields = self.signed(Compose::default());
-        self.open_composer(fields, None, None, &[]);
+        let first = self.accounts.borrow().first().map(|m| m.account.id);
+        let Some(account) = self.shown.get().or(first) else { return };
+        let fields = self.signed(account, Compose::default());
+        self.open_composer(account, fields, None, None, &[]);
         if let Some(writing) = self.writing.borrow_mut().as_mut() {
             writing.new = true;
         }
     }
 
-    /// A new message as the shown account signs it.
-    fn signed(&self, fields: Compose) -> Compose {
+    fn signature(&self, account: i64) -> String {
         let accounts = self.accounts.borrow();
-        let shown = accounts.iter().find(|m| Some(m.account.id) == self.shown.get());
-        let signature = shown.map_or("", |m| m.identity.signature.as_str());
-        Compose { body: compose::with_signature(&fields.body, signature), ..fields }
+        accounts.iter().find(|m| m.account.id == account).map_or_else(String::new, |m| m.identity.signature.clone())
+    }
+
+    /// A new message as an account signs it.
+    fn signed(&self, account: i64, fields: Compose) -> Compose {
+        let signature = self.signature(account);
+        Compose {
+            body: compose::with_signature(&fields.body, &signature),
+            html: compose::html_with_signature(&fields.html, &signature),
+            ..fields
+        }
     }
 
     pub(crate) fn reply(self: &Rc<Self>, all: bool) {
-        let Some(id) = self.selected.get() else { return };
+        let Some((id, account)) = self.selected_with_account() else { return };
         let Some(raw) = self.reader.body(id).ok().flatten() else {
             self.show_notice("This message hasn't arrived yet", "", NOTICE_TIME);
             return;
         };
-        let own = self.shown_email();
+        let own = self.email_of(account);
         if let Some(fields) = compose::reply(&raw, &own, all) {
-            self.open_composer(self.signed(fields), None, Some(id), &[]);
+            self.open_composer(account, self.signed(account, fields), None, Some(id), &[]);
         }
     }
 
     pub(crate) fn forward(self: &Rc<Self>) {
-        let Some(id) = self.selected.get() else { return };
+        let Some((id, account)) = self.selected_with_account() else { return };
         let Some(raw) = self.reader.body(id).ok().flatten() else {
             self.show_notice("This message hasn't arrived yet", "", NOTICE_TIME);
             return;
         };
         if let Some(fields) = compose::forward(&raw) {
-            self.open_composer(self.signed(fields), None, None, &compose::attachments(&raw));
+            self.open_composer(account, self.signed(account, fields), None, None, &compose::attachments(&raw));
         }
     }
 
-    fn shown_email(&self) -> String {
+    fn selected_with_account(&self) -> Option<(i64, i64)> {
+        let id = self.selected.get()?;
+        Some((id, self.reader.account_of(id).ok()??))
+    }
+
+    fn email_of(&self, account: i64) -> String {
         let accounts = self.accounts.borrow();
-        let shown = accounts.iter().find(|m| Some(m.account.id) == self.shown.get());
-        shown.map_or_else(String::new, |m| m.account.email.clone())
+        accounts.iter().find(|m| m.account.id == account).map_or_else(String::new, |m| m.account.email.clone())
     }
 
     /// Opens a draft, taking it over first if it was written elsewhere. That needs its body,
     /// which may not be here yet: [`Controller::body_ready`] picks this up again if not.
     pub(crate) fn open_draft(self: &Rc<Self>, id: i64) {
+        let Some(account) = self.reader.account_of(id).ok().flatten() else { return };
         if let Some(fields) = self.reader.draft(id).ok().flatten() {
             if self.store.take_back(id).unwrap_or(false) {
-                self.queued();
+                self.queued(account);
                 self.list.refresh();
-                self.open_composer(fields, Some(id), None, &[]);
+                self.open_composer(account, fields, Some(id), None, &[]);
             } else {
                 self.show_notice("This is on its way", "", NOTICE_TIME);
             }
@@ -126,7 +162,7 @@ impl Controller {
         match self.reader.body(id).ok().flatten() {
             Some(raw) => {
                 if let Some(fields) = self.store.adopt_draft(id, &raw).ok().flatten() {
-                    self.open_composer(fields, Some(id), None, &[]);
+                    self.open_composer(account, fields, Some(id), None, &[]);
                 }
             }
             None => {
@@ -137,14 +173,13 @@ impl Controller {
         }
     }
 
-    fn open_composer(self: &Rc<Self>, fields: Compose, draft: Option<i64>, reply_to: Option<i64>, files: &[Attachment]) {
+    fn open_composer(self: &Rc<Self>, account: i64, fields: Compose, draft: Option<i64>, reply_to: Option<i64>, files: &[Attachment]) {
         self.finish_writing();
         self.hide_page();
         self.app.set_draft_to(fields.to.as_str().into());
         self.app.set_draft_cc(fields.cc.as_str().into());
         self.app.set_draft_bcc(fields.bcc.as_str().into());
         self.app.set_draft_subject(fields.subject.as_str().into());
-        self.app.set_draft_body(fields.body.as_str().into());
         self.app.set_draft_copies(!fields.cc.is_empty() || !fields.bcc.is_empty());
         self.app.set_draft_error("".into());
         self.app.set_composing(true);
@@ -153,16 +188,145 @@ impl Controller {
         let mut touched = false;
         // Files have to live somewhere from the first moment.
         if draft.is_none() && !files.is_empty() {
-            draft = self.shown.get().and_then(|account| self.store.create_draft(account, &fields, reply_to, files).ok());
+            draft = self.store.create_draft(account, &fields, reply_to, files).ok();
             touched = true;
         }
-        *self.writing.borrow_mut() = Some(Writing { draft, reply_to, initial: fields, touched, new: false });
+        let html = self.editor_html(&fields, draft);
+        *self.writing.borrow_mut() = Some(Writing {
+            account,
+            body: fields.body.clone(),
+            html: fields.html.clone(),
+            pictures: Vec::new(),
+            draft,
+            reply_to,
+            initial: fields,
+            touched,
+            new: false,
+        });
+        self.publish_sender();
         self.publish_files();
+        if !self.editor.open(&self.app, &html, !needs_recipients) {
+            self.app.set_draft_error("The editor couldn't start".into());
+        }
         if needs_recipients {
             self.app.invoke_focus_recipients();
-        } else {
-            self.app.invoke_focus_draft_body();
         }
+    }
+
+    /// A message as the editor shows it. A draft from before formatting is just its text.
+    fn editor_html(&self, fields: &Compose, draft: Option<i64>) -> String {
+        let html = if fields.html.is_empty() { compose::text_to_html(&fields.body) } else { fields.html.clone() };
+        let files = draft.and_then(|id| self.reader.draft_files(id).ok()).unwrap_or_default();
+        compose::show_pictures(&html, &files)
+    }
+
+    /// Puts what is being written back in the editor, which may have closed or changed colours.
+    pub(crate) fn reload_editor(&self) {
+        let Some(fields) = self.fields() else { return };
+        let draft = self.writing.borrow().as_ref().and_then(|w| w.draft);
+        self.editor.open(&self.app, &self.editor_html(&fields, draft), false);
+    }
+
+    /// What the editor said.
+    pub fn editor_event(self: &Rc<Self>, event: EditorEvent) {
+        match event {
+            EditorEvent::Ready => {}
+            EditorEvent::Loaded { html, text } => self.editor_loaded(html, text),
+            EditorEvent::Changed { html, text } => {
+                let mut writing = self.writing.borrow_mut();
+                let Some(writing) = writing.as_mut() else { return };
+                writing.html = html;
+                writing.body = text;
+            }
+            EditorEvent::Send => return self.send_draft(),
+            EditorEvent::Close => return self.finish_writing(),
+            EditorEvent::Leave => {
+                self.editor.release_focus();
+                return self.app.invoke_focus_subject();
+            }
+            EditorEvent::Sender { index } => return self.choose_sender(index),
+            EditorEvent::Discard => return self.discard_draft(),
+            EditorEvent::AttachFiles => return self.pick_files(),
+            EditorEvent::Picture { cid, name, mime, data } => return self.add_picture(cid, name, mime, &data),
+            EditorEvent::File { name, mime, data } => {
+                let attached = STANDARD.decode(data).map_err(|_| format!("{name} couldn't be read"));
+                if let Err(problem) = attached.and_then(|data| self.attach_bytes(name, Some(mime), data)) {
+                    self.app.set_draft_error(problem.into());
+                }
+                return self.publish_files();
+            }
+            EditorEvent::Problem { text } => return self.app.set_draft_error(text.into()),
+        }
+        self.draft_edited();
+    }
+
+    /// The browser writes HTML its own way, so what it made of a message is what counts as
+    /// untouched, unless the user has already changed something, as a signature can come later.
+    fn editor_loaded(&self, html: String, text: String) {
+        let fields = self.fields();
+        if let Some(writing) = self.writing.borrow_mut().as_mut() {
+            if fields.as_ref() == Some(&writing.initial) {
+                writing.initial.html.clone_from(&html);
+                writing.initial.body.clone_from(&text);
+            }
+            writing.html = html;
+            writing.body = text;
+        }
+    }
+
+    fn add_picture(&self, cid: String, name: String, mime: String, data: &str) {
+        let Ok(data) = STANDARD.decode(data) else { return };
+        let file = Attachment { name, mime, data, content_id: Some(cid) };
+        let draft = self.writing.borrow().as_ref().and_then(|w| w.draft);
+        match draft {
+            Some(id) if self.store.attach(id, &file).is_err() => {
+                self.app.set_draft_error(format!("Attachments are limited to {} MB", MAX_ATTACHMENTS / 1024 / 1024).into());
+            }
+            Some(_) => self.touch_files(),
+            None => {
+                if let Some(writing) = self.writing.borrow_mut().as_mut() {
+                    writing.pictures.push(file);
+                }
+            }
+        }
+    }
+
+    /// What is in the editor, as text.
+    pub fn draft_text(&self) -> String {
+        self.writing.borrow().as_ref().map_or_else(String::new, |w| w.body.clone())
+    }
+
+    fn publish_sender(&self) {
+        let account = self.writing.borrow().as_ref().map(|w| w.account);
+        let index = self.accounts.borrow().iter().position(|m| Some(m.account.id) == account);
+        self.app.set_draft_from(index.map_or(0, |i| i as i32));
+    }
+
+    /// Sends from another account instead. Its signature comes along, and a draft moves there.
+    pub fn choose_sender(self: &Rc<Self>, index: usize) {
+        self.app.set_choosing_sender(false);
+        let to = self.accounts.borrow().get(index).map(|m| m.account.id);
+        let from = self.writing.borrow().as_ref().map(|w| w.account);
+        let (Some(to), Some(from)) = (to, from.filter(|from| Some(*from) != to)) else { return };
+        let moved = match self.save_draft().map(|draft| self.store.move_draft(draft, to)).transpose() {
+            Ok(moved) => moved,
+            Err(_) => {
+                self.app.set_draft_error("This draft couldn't move to that account".into());
+                return;
+            }
+        };
+        if let Some(writing) = self.writing.borrow_mut().as_mut() {
+            writing.account = to;
+            writing.draft = moved;
+            // A thread is its account's own. The headers still place a reply where it belongs.
+            writing.reply_to = None;
+            writing.touched |= moved.is_some();
+        }
+        self.editor.sign(&compose::signature_html(&self.signature(to)));
+        self.publish_sender();
+        self.save_draft();
+        self.queued(from);
+        self.list.refresh();
     }
 
     fn fields(&self) -> Option<Compose> {
@@ -173,7 +337,8 @@ impl Controller {
             cc: self.app.get_draft_cc().to_string(),
             bcc: self.app.get_draft_bcc().to_string(),
             subject: self.app.get_draft_subject().to_string(),
-            body: self.app.get_draft_body().to_string(),
+            body: writing.body.clone(),
+            html: writing.html.clone(),
             in_reply_to: writing.initial.in_reply_to.clone(),
             references: writing.initial.references.clone(),
         })
@@ -198,9 +363,7 @@ impl Controller {
         let saved = writing.draft.is_some_and(|id| self.store.update_draft(id, &fields).is_ok());
         // With its draft gone from under it, what is on screen starts a new one rather than vanish.
         if !saved && (keep || writing.draft.is_some()) {
-            let account = self.shown.get()?;
-            writing.draft = self.store.create_draft(account, &fields, writing.reply_to, &[]).ok();
-            writing.touched = true;
+            writing.start_draft(&self.store, &fields);
         }
         writing.draft
     }
@@ -227,10 +390,14 @@ impl Controller {
     fn close_composer(self: &Rc<Self>) {
         self.autosave.stop();
         self.suggest_timer.stop();
-        self.writing.borrow_mut().take();
+        let writing = self.writing.borrow_mut().take();
+        self.editor.hide();
         self.app.set_composing(false);
         self.app.set_suggesting(-1);
-        self.queued();
+        self.app.set_choosing_sender(false);
+        if let Some(writing) = writing {
+            self.queued(writing.account);
+        }
         self.list.refresh();
         // The message that was open comes back, now that nothing is over it.
         match self.selected.get() {
@@ -258,8 +425,10 @@ impl Controller {
         }
         // Even one that has no changes, like a forward sent as it stands.
         let draft = self.save_draft().or_else(|| {
-            let reply_to = self.writing.borrow().as_ref().and_then(|w| w.reply_to);
-            self.store.create_draft(self.shown.get()?, &fields, reply_to, &[]).ok()
+            let mut writing = self.writing.borrow_mut();
+            let writing = writing.as_mut()?;
+            writing.start_draft(&self.store, &fields);
+            writing.draft
         });
         let Some(id) = draft else {
             self.app.set_draft_error("This couldn't be saved, so it hasn't been sent".into());
@@ -335,16 +504,19 @@ impl Controller {
 
     fn attach_path(&self, path: &Path) -> Result<(), String> {
         let name = path.file_name().map_or_else(|| "Attachment".to_string(), |n| n.to_string_lossy().into_owned());
-        let too_large = || format!("{name} is too large: attachments are limited to {} MB", MAX_ATTACHMENTS / 1024 / 1024);
-        let unreadable = |_| format!("{name} couldn't be read");
+        let unreadable = format!("{name} couldn't be read");
         // Before reading it, because a dropped file can be any size at all.
-        if path.metadata().map_err(unreadable)?.len() > MAX_ATTACHMENTS as u64 {
-            return Err(too_large());
+        if path.metadata().map_err(|_| unreadable.clone())?.len() > MAX_ATTACHMENTS as u64 {
+            return Err(format!("{name} is too large: attachments are limited to {} MB", MAX_ATTACHMENTS / 1024 / 1024));
         }
-        let data = std::fs::read(path).map_err(unreadable)?;
+        self.attach_bytes(name, None, std::fs::read(path).map_err(|_| unreadable)?)
+    }
+
+    fn attach_bytes(&self, name: String, mime: Option<String>, data: Vec<u8>) -> Result<(), String> {
         let id = self.ensure_draft().ok_or_else(|| format!("{name} couldn't be attached"))?;
-        let file = Attachment { mime: mime_type(&name).into(), name: name.clone(), data };
-        self.store.attach(id, &file).map_err(|_| too_large())?;
+        let mime = mime.filter(|m| !m.is_empty()).unwrap_or_else(|| mime_type(&name).into());
+        let problem = format!("{name} is too large: attachments are limited to {} MB", MAX_ATTACHMENTS / 1024 / 1024);
+        self.store.attach(id, &Attachment { mime, name, data, content_id: None }).map_err(|_| problem)?;
         self.touch_files();
         Ok(())
     }
@@ -361,11 +533,9 @@ impl Controller {
             return Some(id);
         }
         let fields = self.fields()?;
-        let account = self.shown.get()?;
         let mut writing = self.writing.borrow_mut();
         let writing = writing.as_mut()?;
-        writing.draft = self.store.create_draft(account, &fields, writing.reply_to, &[]).ok();
-        writing.touched = true;
+        writing.start_draft(&self.store, &fields);
         writing.draft
     }
 
@@ -391,7 +561,7 @@ impl Controller {
     }
 
     fn suggest(&self, field: i32, text: &str) {
-        let Some(account) = self.shown.get() else { return };
+        let Some(account) = self.writing.borrow().as_ref().map(|w| w.account) else { return };
         let contacts = self.reader.contacts(account, last_address(text), SUGGESTIONS).unwrap_or_default();
         let items: Vec<SharedString> = contacts
             .into_iter()

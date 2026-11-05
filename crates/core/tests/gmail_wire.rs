@@ -175,7 +175,7 @@ async fn gmail_labels_ids_and_folders_map_onto_the_store() {
     let label = |name: &str| reader.labels(account.id).unwrap().into_iter().find(|l| l.name == name);
     let subjects = |name: &str| -> Vec<String> {
         let id = label(name).unwrap().id;
-        reader.messages(id, 0, 10).unwrap().into_iter().map(|m| m.subject).collect()
+        reader.messages(&[id], 0, 10).unwrap().into_iter().map(|m| m.subject).collect()
     };
     assert_eq!(subjects("Inbox"), ["First"]);
     assert_eq!(subjects("Sent"), ["Second"]);
@@ -237,8 +237,8 @@ async fn actions_reach_gmail_as_flags_labels_and_moves() {
     let mut imap = Imap::connect(&account, &Credential::Password("x".into())).await.unwrap();
     sync_account(&mut imap, &store, account.id, |_| {}).await.unwrap();
     let label = |name: &str| reader.labels(account.id).unwrap().into_iter().find(|l| l.name == name).unwrap();
-    let first = reader.messages(label("Inbox").id, 0, 1).unwrap()[0].id;
-    let second = reader.messages(label("Sent").id, 0, 1).unwrap()[0].id;
+    let first = reader.messages(&[label("Inbox").id], 0, 1).unwrap()[0].id;
+    let second = reader.messages(&[label("Sent").id], 0, 1).unwrap()[0].id;
 
     // Read state goes out in bulk, as marking a whole label read would otherwise take minutes.
     let start = script.lock().unwrap().commands.len();

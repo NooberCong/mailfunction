@@ -3,16 +3,18 @@
 //! It opens a window, but injects no input: the one message it sends about the pointer goes to
 //! its own window, and moves nothing on the desktop. Run with `scripts/test-imap.ps1`.
 
+mod common;
+
 use std::cell::Cell;
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use common::server::{canary, client_pixels, create_folders, deliver, delivered_to_mailpit, dovecot_port, on_server, received_by_mailpit, sleep, until};
+use mailfunction::editor::{EditorEvent, EditorView};
 use mailfunction::notify::{ACTIVATOR, APP_ID, Toasts};
 use mailfunction::webview::Webview;
 use mailfunction::{App, Controller, ImageBar, Pane, Theme, Verb, chrome};
@@ -26,9 +28,7 @@ use slint::{ComponentHandle, Model, PhysicalSize};
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
 use webview2_com::{CapturePreviewCompletedHandler, take_pwstr};
 use windows::UI::Notifications::ToastNotificationManager;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Com::{
     CLSCTX_LOCAL_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, STATFLAG_NONAME, STGC_DEFAULT,
     STREAM_SEEK_SET,
@@ -36,75 +36,11 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Notifications::INotificationActivationCallback;
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SHCreateMemStream, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetCursor, HTCLIENT, IDC_HAND, IsWindowVisible, LoadCursorW, PostMessageW, SendMessageW, WM_CLOSE,
+    GetCursor, HTCLIENT, IDC_HAND, IsWindowVisible, LoadCursorW, PostMessageW, SendMessageW, WM_CLOSE,
     WM_MOUSEMOVE, WM_SETCURSOR,
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 use wry::WebViewExtWindows;
-
-/// Another session may be using the usual port, so it can be moved.
-fn dovecot_port() -> u16 {
-    std::env::var("MAILFUNCTION_IMAP_PORT").map_or(14143, |port| port.parse().unwrap())
-}
-
-fn sleep(ms: u64) -> impl Future<Output = ()> {
-    let (tx, rx) = mpsc::channel::<()>();
-    let done = Rc::new(Cell::new(false));
-    let flag = done.clone();
-    slint::Timer::single_shot(Duration::from_millis(ms), move || {
-        flag.set(true);
-        let _ = tx.send(());
-    });
-    Wait { done, rx }
-}
-
-/// Polls from the Slint executor, which wakes on timers.
-struct Wait {
-    done: Rc<Cell<bool>>,
-    rx: mpsc::Receiver<()>,
-}
-
-impl Future for Wait {
-    type Output = ();
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-        if self.done.get() {
-            let _ = self.rx.try_recv();
-            return std::task::Poll::Ready(());
-        }
-        let waker = cx.waker().clone();
-        slint::Timer::single_shot(Duration::from_millis(10), move || waker.wake());
-        std::task::Poll::Pending
-    }
-}
-
-async fn until(what: &str, mut ready: impl FnMut() -> bool) {
-    let started = Instant::now();
-    while !ready() {
-        assert!(started.elapsed() < Duration::from_secs(30), "timed out waiting for {what}");
-        sleep(25).await;
-    }
-    println!("  {what}: {} ms", started.elapsed().as_millis());
-}
-
-/// Counts every connection made to it. Any hit at all means mail reached the network.
-fn canary() -> (u16, Arc<AtomicU32>) {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let hits = Arc::new(AtomicU32::new(0));
-    let count = hits.clone();
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            count.fetch_add(1, Ordering::SeqCst);
-            let mut stream = stream;
-            let mut line = String::new();
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-            let _ = BufReader::new(&stream).read_line(&mut line);
-            println!("  canary hit: {:?}", line.trim());
-            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        }
-    });
-    (port, hits)
-}
 
 /// Deliberately not sanitised: this attacks the webview layers directly.
 fn hostile_page(port: u16) -> String {
@@ -240,35 +176,6 @@ fn window(app: &App) -> isize {
 }
 
 type Frame = Vec<u8>;
-
-/// The window's whole client area, webview included, as blue, green, red and a spare byte.
-fn client_pixels(hwnd: isize) -> Option<(i32, i32, Vec<u8>)> {
-    let hwnd = HWND(hwnd as _);
-    unsafe {
-        let mut client = RECT::default();
-        GetClientRect(hwnd, &mut client).ok()?;
-        let (w, h) = (client.right, client.bottom);
-        let dc = GetDC(Some(hwnd));
-        let memory = CreateCompatibleDC(Some(dc));
-        let bitmap = CreateCompatibleBitmap(dc, w, h);
-        let previous = SelectObject(memory, bitmap.into());
-        // PW_CLIENTONLY | PW_RENDERFULLCONTENT: the second is what includes the webview.
-        let _ = PrintWindow(hwnd, memory, PRINT_WINDOW_FLAGS(3));
-        let mut info = BITMAPINFO::default();
-        info.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
-        info.bmiHeader.biWidth = w;
-        info.bmiHeader.biHeight = -h;
-        info.bmiHeader.biPlanes = 1;
-        info.bmiHeader.biBitCount = 32;
-        let mut pixels = vec![0u8; (w * h * 4) as usize];
-        GetDIBits(memory, bitmap, 0, h as u32, Some(pixels.as_mut_ptr().cast()), &mut info, DIB_RGB_COLORS);
-        SelectObject(memory, previous);
-        let _ = DeleteObject(bitmap.into());
-        let _ = DeleteDC(memory);
-        ReleaseDC(Some(hwnd), dc);
-        Some((w, h, pixels))
-    }
-}
 
 /// A coarse grid of colours over part of a window. Read-only. Colour matters: a page fading in
 /// from white passes through the brightness of any darker page.
@@ -474,72 +381,16 @@ async fn clickable_things_show_the_hand(app: &App) {
     println!("  every clickable thing shows the hand, and the heading does not");
 }
 
-/// Delivers mail the way another client would, from its own thread and runtime.
-fn deliver(user: String, messages: Vec<Vec<u8>>) {
-    std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", dovecot_port()))
-                .await
-                .expect("start Dovecot: scripts/test-imap.ps1");
-            let mut client = async_imap::Client::new(tcp);
-            client.read_response().await.unwrap();
-            let mut session = client.login(&user, "pass").await.map_err(|(e, _)| e).unwrap();
-            for message in messages {
-                session.append("INBOX", None, None, &message).await.unwrap();
-            }
-        });
-    })
-    .join()
-    .unwrap();
+thread_local! {
+    static EDITOR: std::cell::RefCell<Option<Rc<EditorView>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// How many messages a folder holds on the server, and how many of them are read.
-fn on_server(user: &str, folder: &str) -> (u32, usize) {
-    let (user, folder) = (user.to_string(), folder.to_string());
-    std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", dovecot_port())).await.unwrap();
-            let mut client = async_imap::Client::new(tcp);
-            client.read_response().await.unwrap();
-            let mut session = client.login(&user, "pass").await.map_err(|(e, _)| e).unwrap();
-            let exists = session.select(&folder).await.unwrap().exists;
-            (exists, session.search("SEEN").await.unwrap().len())
-        })
-    })
-    .join()
-    .unwrap()
-}
-
-fn create_folders(user: String) {
-    std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let tcp = tokio::net::TcpStream::connect(("127.0.0.1", dovecot_port())).await.unwrap();
-            let mut client = async_imap::Client::new(tcp);
-            client.read_response().await.unwrap();
-            let mut session = client.login(&user, "pass").await.map_err(|(e, _)| e).unwrap();
-            for folder in ["Trash", "Sent", "Drafts"] {
-                session.create(folder).await.unwrap();
-            }
-        });
-    })
-    .join()
-    .unwrap();
-}
-
-fn delivered_to_mailpit(subject: &str) -> usize {
-    let url = format!("http://127.0.0.1:18025/api/v1/search?query=subject:{subject}");
-    let mut response = ureq::get(&url).call().expect("start mailpit: scripts/test-imap.ps1");
-    let body = response.body_mut().read_to_string().unwrap();
-    body.split("\"ID\"").count() - 1
-}
-
-/// The message as mailpit received it, headers and all.
-fn received_by_mailpit(subject: &str) -> String {
-    let url = format!("http://127.0.0.1:18025/api/v1/search?query=subject:{subject}");
-    let found = ureq::get(&url).call().unwrap().body_mut().read_to_string().unwrap();
-    let id = found.split("\"ID\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
-    let url = format!("http://127.0.0.1:18025/api/v1/message/{id}/raw");
-    ureq::get(&url).call().unwrap().body_mut().read_to_string().unwrap()
+/// Puts text in the message being written, once the editor has it. `tests/editor.rs` does the
+/// real page's real work, and all this needs is its report.
+async fn write(controller: &Rc<Controller>, text: &str) {
+    let editor = EDITOR.with(|e| e.borrow().clone().unwrap());
+    until("the editor", || editor.is_on_screen()).await;
+    controller.editor_event(EditorEvent::Changed { html: format!("<div>{text}</div>"), text: text.into() });
 }
 
 /// What only a real desktop can show about the settings.
@@ -617,7 +468,7 @@ async fn settings(app: &App, controller: &Rc<Controller>, view: &Rc<Webview>, us
     controller.close_settings();
     let subject = format!("livesigned{}", std::process::id());
     app.invoke_verb(Verb::Compose);
-    assert!(app.get_draft_body().contains("Sent from afar"));
+    assert!(controller.draft_text().contains("Sent from afar"));
     app.set_draft_to("someone@example.com".into());
     app.set_draft_subject(subject.as_str().into());
     let sent = Instant::now();
@@ -664,7 +515,7 @@ async fn daily_use(app: &App, controller: &Rc<Controller>, user: &str) {
     assert!(app.get_composing());
     app.set_draft_to("someone@example.com".into());
     app.set_draft_subject(subject.as_str().into());
-    app.set_draft_body("Chào bạn".into());
+    write(&controller, "Chào bạn").await;
     app.invoke_send_draft();
     assert!(!app.get_composing());
     assert_eq!(app.get_notice(), "Sending");
@@ -797,8 +648,8 @@ async fn scenario(app: App, dir: PathBuf, user: String, controller: Rc<Controlle
         port: dovecot_port(),
         security: Security::Plain,
         auth: AuthKind::Password,
-        smtp_host: "localhost".into(),
-        smtp_port: 25,
+        smtp_host: "127.0.0.1".into(),
+        smtp_port: 11025,
     };
     controller.add_account(local(&second)).unwrap();
     assert_eq!(app.get_active_account(), 1);
@@ -823,6 +674,35 @@ async fn scenario(app: App, dir: PathBuf, user: String, controller: Rc<Controlle
     until("a message from the second account", || app.get_pane() == Pane::Html).await;
     println!("  opened in {} ms", opened.elapsed().as_millis());
 
+    println!("every account in one list");
+    controller.select_all_accounts();
+    assert_eq!(app.get_active_account(), -1);
+    until("both inboxes in one list", || app.get_rows().row_count() == first_rows + 2).await;
+    let row = app.get_rows().iter().position(|r| r.subject == "Plain").unwrap();
+    assert_eq!(app.get_rows().row_data(row).unwrap().account, 1);
+    controller.select_row(row);
+    until("a message opened from the list of both", || matches!(app.get_pane(), Pane::Text | Pane::Html)).await;
+
+    // New mail for either account appears here, by way of its own connection.
+    deliver(second.clone(), vec![colour_message("for both", "#1838a8")]);
+    until("new mail in the list of both", || app.get_rows().row_count() == first_rows + 3).await;
+
+    // Mail goes from the account chosen, whichever the list is showing.
+    let subject = format!("from-second-{}", std::process::id());
+    app.invoke_verb(Verb::Compose);
+    assert_eq!(app.get_draft_from(), 0);
+    app.set_draft_to("someone@example.com".into());
+    app.set_draft_subject(subject.as_str().into());
+    write(&controller, "Sent from the second account").await;
+    controller.save_draft();
+    controller.choose_sender(1);
+    assert_eq!(app.get_draft_from(), 1);
+    controller.send_draft();
+    until("gone from the second account", || delivered_to_mailpit(&subject) == 1).await;
+    let raw = received_by_mailpit(&subject);
+    assert!(raw.contains(&format!("<{second}>")), "{raw}");
+    assert!(!raw.contains(&format!("<{user}>")), "{raw}");
+
     println!("the pointer");
     controller.select_account(0);
     clickable_things_show_the_hand(&app).await;
@@ -831,7 +711,7 @@ async fn scenario(app: App, dir: PathBuf, user: String, controller: Rc<Controlle
     let reader = Reader::open(&dir).unwrap();
     let id = reader.accounts().unwrap()[1].id;
     let inbox = reader.labels(id).unwrap().into_iter().next().unwrap().id;
-    let message = reader.messages(inbox, 0, 1).unwrap()[0].id;
+    let message = reader.messages(&[inbox], 0, 1).unwrap()[0].id;
     controller.remove_account(1);
     assert_eq!(app.get_accounts().row_count(), 1);
     assert_eq!(app.get_rows().row_count(), first_rows);
@@ -854,7 +734,7 @@ async fn scenario(app: App, dir: PathBuf, user: String, controller: Rc<Controlle
     assert!(std::path::Path::new(picture).exists(), "the picture Windows was given: {picture}");
 
     let inbox = reader.labels(reader.accounts().unwrap()[0].id).unwrap()[0].id;
-    let lunch = reader.messages(inbox, 0, 100).unwrap().into_iter().find(|m| m.subject == "Lunch on Friday?").unwrap().id;
+    let lunch = reader.messages(&[inbox], 0, 100).unwrap().into_iter().find(|m| m.subject == "Lunch on Friday?").unwrap().id;
     controller.select_label(1);
     assert_ne!(controller.selected_message(), Some(lunch));
     let launch = toasts[0].split(r#"launch=""#).nth(1).unwrap().split('"').next().unwrap();
@@ -877,9 +757,9 @@ async fn scenario(app: App, dir: PathBuf, user: String, controller: Rc<Controlle
     let page = ((app.get_slot_x() * scale) as i32, (app.get_slot_y() * scale) as i32, (app.get_slot_w() * scale) as i32, (app.get_slot_h() * scale) as i32);
 
     // A page lets go of its browser while nobody can see it, and comes back with the window.
-    let messages = reader.messages(inbox, 0, 100).unwrap();
-    let newsletter = messages.iter().find(|m| m.subject.starts_with("Bản tin")).unwrap().id;
-    controller.select_row(reader.position(inbox, newsletter).unwrap().unwrap());
+    let messages = reader.messages(&[inbox], 0, 100).unwrap();
+    let newsletter = messages.iter().find(|m| m.subject.starts_with("Bản tin")).unwrap();
+    controller.select_row(reader.position(&[inbox], newsletter.thread_key()).unwrap().unwrap());
     until("page on screen", || app.get_pane() == Pane::Html).await;
     sleep(500).await;
     let on_screen = grab(hwnd, page).unwrap();
@@ -890,7 +770,7 @@ async fn scenario(app: App, dir: PathBuf, user: String, controller: Rc<Controlle
     controller.reveal();
     assert!(showing());
     until("page back", || app.get_pane() == Pane::Html).await;
-    assert_eq!(controller.selected_message(), Some(newsletter));
+    assert_eq!(controller.selected_message(), Some(newsletter.id));
     assert_on_slot(&app, &view);
     until("page painted", || grab(hwnd, page).is_some_and(|now| looks_like(&now, &on_screen))).await;
 
@@ -906,7 +786,7 @@ async fn scenario(app: App, dir: PathBuf, user: String, controller: Rc<Controlle
     assert!(!showing(), "new mail opened the window");
     let toast = delivered_toasts().remove(0);
     assert!(toast.contains("Keys are at reception"), "{toast}");
-    let keys = reader.messages(inbox, 0, 100).unwrap().into_iter().find(|m| m.subject.starts_with("Keys")).unwrap().id;
+    let keys = reader.messages(&[inbox], 0, 100).unwrap().into_iter().find(|m| m.subject.starts_with("Keys")).unwrap().id;
     let launch = toast.split(r#"launch=""#).nth(1).unwrap().split('"').next().unwrap();
     let mut click = std::process::Command::new(std::env::current_exe().unwrap()).args(["--click", launch]).spawn().unwrap();
     until("click to message, window closed", || showing() && controller.selected_message() == Some(keys)).await;
@@ -966,8 +846,10 @@ fn main() {
 
     let app = App::new().unwrap();
     let view = Rc::new(Webview::new(dir.join("webview")));
+    let editor = Rc::new(EditorView::new(dir.join("webview")));
+    EDITOR.with(|e| *e.borrow_mut() = Some(editor.clone()));
     let toasts = Box::new(Toasts::new(&dir));
-    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(view.clone()), toasts, Arc::new(RedDot)).unwrap();
+    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(view.clone()), Box::new(editor.clone()), toasts, Arc::new(RedDot)).unwrap();
     controller.load_accounts().unwrap();
     app.show().unwrap();
     chrome::set_icon(&app);

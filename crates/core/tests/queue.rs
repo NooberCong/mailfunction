@@ -71,12 +71,38 @@ impl Fixture {
     }
 
     fn subjects(&self, name: &str) -> Vec<String> {
-        self.reader.messages(self.label(name).id, 0, 100).unwrap().into_iter().map(|m| m.subject).collect()
+        self.reader.messages(&[self.label(name).id], 0, 100).unwrap().into_iter().map(|m| m.subject).collect()
     }
 
     fn id(&self, name: &str, row: usize) -> i64 {
-        self.reader.messages(self.label(name).id, row, 1).unwrap()[0].id
+        self.reader.messages(&[self.label(name).id], row, 1).unwrap()[0].id
     }
+}
+
+#[test]
+fn a_draft_moves_to_another_account_with_everything_in_it() {
+    let f = fixture("move-draft");
+    let work = Account { email: "work@example.com".into(), ..f.reader.accounts().unwrap()[0].clone() };
+    let work = f.store.add_account(&work).unwrap();
+    let compose = Compose {
+        to: "a@example.com".into(),
+        subject: "Quote".into(),
+        body: "Here it is".into(),
+        in_reply_to: "<root@x>".into(),
+        ..Compose::default()
+    };
+    let file = Attachment { content_id: None, name: "quote.pdf".into(), mime: "application/pdf".into(), data: b"PDF".to_vec() };
+    let draft = f.store.create_draft(f.account, &compose, None, std::slice::from_ref(&file)).unwrap();
+
+    let moved = f.store.move_draft(draft, work).unwrap();
+    assert_eq!(f.reader.account_of(moved).unwrap(), Some(work));
+    assert_eq!(f.reader.draft(moved).unwrap().unwrap(), compose);
+    assert_eq!(f.reader.draft_attachments(moved).unwrap().len(), 1);
+    assert_eq!(f.reader.account_of(draft).unwrap(), None, "it is in one place, not two");
+    assert!(f.subjects("Drafts").is_empty());
+    assert_eq!(f.store.pending_count(f.account).unwrap(), 0, "a draft never uploaded has nothing to take back");
+
+    assert!(f.store.move_draft(draft, f.account).is_err(), "there is nothing left to move");
 }
 
 #[test]
@@ -84,18 +110,18 @@ fn a_list_shows_one_row_per_thread_led_by_its_newest_message() {
     let f = fixture("heads");
     f.store.save_messages(&f.all, &[message(1, 7, 10), message(2, 7, 20), message(3, 8, 15)]).unwrap();
     assert_eq!(f.subjects("Inbox"), ["Subject 2", "Subject 3"]);
-    assert_eq!(f.reader.message_count(f.label("Inbox").id).unwrap(), 2);
+    assert_eq!(f.reader.message_count(&[f.label("Inbox").id]).unwrap(), 2);
 
-    let row = &f.reader.messages(f.label("Inbox").id, 0, 1).unwrap()[0];
+    let row = &f.reader.messages(&[f.label("Inbox").id], 0, 1).unwrap()[0];
     assert_eq!(row.count, 2);
     let thread = f.reader.thread(f.account, row.thread_id, false).unwrap();
     assert_eq!(thread.iter().map(|m| m.subject.as_str()).collect::<Vec<_>>(), ["Subject 1", "Subject 2"]);
-    assert_eq!(f.reader.position(f.label("Inbox").id, row.thread_id).unwrap(), Some(0));
+    assert_eq!(f.reader.position(&[f.label("Inbox").id], row.thread_key()).unwrap(), Some(0));
 
     // A later reply moves the thread up, whichever batch it came in.
     f.store.save_messages(&f.all, &[message(4, 8, 30)]).unwrap();
     assert_eq!(f.subjects("Inbox"), ["Subject 4", "Subject 2"]);
-    assert_eq!(f.reader.message_count(f.label("Inbox").id).unwrap(), 2);
+    assert_eq!(f.reader.message_count(&[f.label("Inbox").id]).unwrap(), 2);
 }
 
 #[test]
@@ -106,7 +132,7 @@ fn a_thread_is_unread_if_any_of_it_is_and_starred_if_any_of_it_is() {
     let mut new = message(2, 7, 20);
     new.seen = true;
     f.store.save_messages(&f.all, &[old, new]).unwrap();
-    let row = &f.reader.messages(f.label("Inbox").id, 0, 1).unwrap()[0];
+    let row = &f.reader.messages(&[f.label("Inbox").id], 0, 1).unwrap()[0];
     assert!(!row.seen && row.flagged, "{row:?}");
 }
 
@@ -127,7 +153,7 @@ fn servers_without_threads_get_them_from_references() {
     // A message that mentions two threads joins them.
     f.store.save_messages(&f.all, &[plain(10, "d@x", &["c@x", "other@x"])]).unwrap();
     assert_eq!(f.subjects("Inbox"), ["Subject 10"]);
-    assert_eq!(f.reader.messages(f.label("Inbox").id, 0, 1).unwrap()[0].count, 4);
+    assert_eq!(f.reader.messages(&[f.label("Inbox").id], 0, 1).unwrap()[0].count, 4);
 }
 
 #[test]
@@ -185,7 +211,7 @@ fn trash_takes_mail_out_of_every_label_until_undone() {
     }
     assert_eq!(f.subjects("Trash"), ["Subject 1"]);
     // A list of what is in the bin and a thread of what is not see different things.
-    let row = &f.reader.messages(f.label("Trash").id, 0, 1).unwrap()[0];
+    let row = &f.reader.messages(&[f.label("Trash").id], 0, 1).unwrap()[0];
     assert!(f.reader.thread(f.account, row.thread_id, false).unwrap().is_empty());
     assert_eq!(f.reader.thread(f.account, row.thread_id, true).unwrap().len(), 1);
 
@@ -289,7 +315,7 @@ fn a_server_copy_of_a_draft_stays_the_same_message() {
     copy.labels = vec![LabelSpec::system(Role::Drafts)];
     f.store.save_messages(&f.all, &[copy]).unwrap();
 
-    assert_eq!(f.reader.messages(f.label("Drafts").id, 0, 10).unwrap().len(), 1);
+    assert_eq!(f.reader.messages(&[f.label("Drafts").id], 0, 10).unwrap().len(), 1);
     assert_eq!(f.id("Drafts", 0), id);
     assert_eq!(f.reader.location(id).unwrap().unwrap().1, 50);
     assert!(f.reader.draft(id).unwrap().is_some());
@@ -342,8 +368,8 @@ fn a_reply_joins_its_thread_but_waits_there_unseen() {
     let original = f.id("Inbox", 0);
     let reply = Compose { in_reply_to: "1@x".into(), references: "1@x".into(), ..compose() };
     let id = f.store.create_draft(f.account, &reply, Some(original), &[]).unwrap();
-    let thread = f.reader.messages(f.label("Inbox").id, 0, 1).unwrap()[0].thread_id;
-    assert_eq!(f.reader.messages(f.label("Drafts").id, 0, 1).unwrap()[0].thread_id, thread);
+    let thread = f.reader.messages(&[f.label("Inbox").id], 0, 1).unwrap()[0].thread_id;
+    assert_eq!(f.reader.messages(&[f.label("Drafts").id], 0, 1).unwrap()[0].thread_id, thread);
     assert_eq!(f.reader.thread(f.account, thread, false).unwrap().len(), 1, "a draft is not part of the conversation");
     assert_eq!(f.id("Drafts", 0), id);
 }
@@ -444,7 +470,7 @@ fn queued_mail_can_be_called_back_until_it_goes() {
 #[test]
 fn attachments_stay_with_the_draft_within_the_limit() {
     let f = fixture("attach");
-    let file = |n: &str, size| Attachment { name: n.into(), mime: "text/plain".into(), data: vec![b'x'; size] };
+    let file = |n: &str, size| Attachment { content_id: None, name: n.into(), mime: "text/plain".into(), data: vec![b'x'; size] };
     let id = f.store.create_draft(f.account, &compose(), None, &[file("a.txt", 3)]).unwrap();
     f.store.attach(id, &file("b.txt", 5)).unwrap();
     let names = |f: &Fixture| f.reader.draft_attachments(id).unwrap().into_iter().map(|a| (a.name, a.size)).collect::<Vec<_>>();
@@ -553,7 +579,7 @@ fn a_store_from_before_the_queue_migrates_with_its_mail() {
     let account = reader.accounts().unwrap()[0].clone();
     assert_eq!((account.smtp_host.as_str(), account.smtp_port), ("smtp.gmail.com", 465));
     let inbox = reader.labels(account.id).unwrap()[0].id;
-    let rows = reader.messages(inbox, 0, 10).unwrap();
+    let rows = reader.messages(&[inbox], 0, 10).unwrap();
     assert_eq!(rows.iter().map(|m| (m.subject.as_str(), m.count)).collect::<Vec<_>>(), [("Second", 2), ("Alone", 1)]);
     assert_eq!(reader.search(account.id, "alone", 10).unwrap().len(), 1, "headers are indexed");
     assert_eq!(reader.search(account.id, "past", 10).unwrap()[0].subject, "Second", "and bodies already here");
