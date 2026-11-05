@@ -65,6 +65,12 @@ name = "tray"
 harness = false
 test = false
 
+# Opens a window and reaches the web for logos. Takes the README's pictures.
+[[test]]
+name = "showcase"
+harness = false
+test = false
+
 [build-dependencies]
 slint-build = "1.18"
 winresource = "0.1"

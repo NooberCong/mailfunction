@@ -1,90 +1,97 @@
-# mailfunction
+<p align="center">
+  <img src="docs/images/logo.png" width="112" alt="mailfunction logo">
+</p>
 
-A minimal, fast desktop mail client for Windows, for any number of Gmail accounts: threads, triage,
-one inbox across all of them, formatted compose with pictures and attachments, undo send, local search and full keyboard control.
-[The plan](reports/Minimal%20email%20client%20tech%20plan.md) covers what comes next and why.
+<h1 align="center">mailfunction</h1>
 
-## Layout
+<p align="center">
+  <b>Email that keeps up with you.</b><br>
+  A fast, private desktop mail client for Gmail on Windows.
+</p>
 
-- `crates/core`: everything that is not UI. The SQLite store, IMAP sync, the operation queue,
-  drafts and sending, Google sign-in and the HTML sanitiser.
-- `crates/app`: the Slint window and the locked-down WebView2 that shows HTML mail. The typeface
-  is Be Vietnam Pro, bundled in `crates/app/ui/fonts` under the SIL Open Font License.
+<p align="center">
+  <a href="https://github.com/NooberCong/mailfunction/releases/latest/download/mailfunction-setup.exe"><b>Download for Windows</b></a>
+  &nbsp;·&nbsp;
+  <a href="#sign-in">Get started</a>
+  &nbsp;·&nbsp;
+  <a href="#keyboard">Keyboard</a>
+  &nbsp;·&nbsp;
+  <a href="docs/Development.md">Development</a>
+</p>
 
-The UI reads only from the local store and writes only to it, so it never waits on the network. A
-change lands in the store and in a durable queue in one transaction, and the server hears about it
-later, in order, even across a restart. Until then sync re-applies what is queued over whatever the
-server reports, and if the server refuses, the message goes back where it was and the app says so.
+<p align="center">
+  <a href="https://github.com/NooberCong/mailfunction/releases/latest"><img src="https://img.shields.io/github/v/release/NooberCong/mailfunction?label=release&color=b5122e" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-b5122e" alt="Windows 10 and 11">
+  <img src="https://img.shields.io/badge/built%20with-Rust-b5122e" alt="Built with Rust">
+</p>
 
-One background thread runs every account, with three tasks each: sync and IDLE, which also replays
-the queue, on one connection; bodies and server search on a second; and the outbox, over SMTP.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/inbox-dark.png">
+    <img src="docs/images/inbox.png" width="900" alt="The mailfunction inbox with a message open">
+  </picture>
+</p>
 
-Mail goes out once or not at all. It waits ten seconds to be called back, and anything that cannot
-leave waits in the Outbox and tries again. If the connection dies while mail is being handed over,
-or the app stops, nobody can say whether it went, so it returns to Drafts for its author to decide.
+## Why mailfunction
 
-The webview has no network at all. Remote images stay out of a message until the user loads them,
-once or always for that sender. A message then goes up at once, and its images come in behind it
-through the same hook that serves the page: from a disk cache, or fetched by the app. So the page's
-lockdown never changes, and a message opened again touches no server. Loading images the first time
-can still tell the sender the mail was opened.
+- **Instant.** Your mail lives on your PC, so opening, searching and triaging never wait on the network.
+- **Every account, one inbox.** See all your Gmail accounts together, or switch between them with a keystroke.
+- **Private by default.** Remote images stay blocked until you allow them, so senders can't quietly track when you read their mail.
+- **Hard to fool.** Only senders Gmail has verified get a logo, and a forged From line gets no trust.
+- **Works offline.** Read, write and organize anywhere. Your changes reach the server when you're back.
+- **Undo send.** Changed your mind? You have ten seconds to call a message back.
+- **Made for the keyboard.** Move through your whole inbox without reaching for the mouse.
 
-Anyone can write a From line, so the app believes one only if Gmail does: sync keeps Gmail's own
-DMARC verdict with each message, for the one address on show. Only such mail gets a logo, or can be
-trusted with always loading images, and nothing in Spam ever is. A logo comes from the sender's own
-domain, so the Sender logos setting does tell that domain your IP address, the first time its mail
-is on screen. Mail arriving tells nobody. Free hosting domains get no logo, as they would let a
-sender give each recipient a domain of their own.
+## Write beautifully
 
-Saved attachments are marked as coming from the internet, as a browser would, and are never opened.
+Format your text, add pictures and attachments, and choose which account to send from. Light and dark themes follow Windows, or you can pick your own.
 
-Settings are in the sidebar, or `Ctrl+,`, and apply as they change. The app's own are one JSON
-document in the store, so a new one needs no migration. Each account's name, signature and
-notifications live on the account. Show all images loads every remote image without asking,
-except in Spam.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/compose-dark.png">
+    <img src="docs/images/compose.png" width="900" alt="Writing a reply in mailfunction">
+  </picture>
+</p>
 
-## Run it
+## Install
 
-1. In Google Cloud, create a project, enable the Gmail API, set the OAuth app to External and
-   "In production", and create a Desktop client.
-2. Save the client JSON as `%USERPROFILE%\.config\mailfunction\google-client.json`.
-3. Run the app and sign in. Google will warn that the app is unverified, which is expected for
-   a personal project. Add more accounts from the sidebar, and switch with a click or `Ctrl+1`
-   to `Ctrl+9`. With two or more, the app opens on All accounts (`Ctrl+0`): every account's Inbox,
-   Starred, Sent and so on in one list, where a small badge says whose each message is. Whatever you
-   do to a message happens in its own account, and the From line chooses where new mail goes from.
-   Removing an account deletes its local mail and its saved sign-in, overwriting them on disk, and
-   revokes that sign-in at Google.
+| | |
+| --- | --- |
+| **[Installer](https://github.com/NooberCong/mailfunction/releases/latest/download/mailfunction-setup.exe)** | Recommended. Adds mailfunction to the Start menu, with no administrator rights needed. |
+| **[Executable](https://github.com/NooberCong/mailfunction/releases/latest/download/mailfunction.exe)** | One file to run from anywhere, with nothing to install. |
 
-```powershell
-rustup run stable-x86_64-pc-windows-msvc cargo run --release -p mailfunction
-```
+You'll need 64-bit Windows 10 or 11, and [WebView2](https://developer.microsoft.com/microsoft-edge/webview2/), which Windows 11 already includes.
 
-`?` lists every key. The ones that matter most: `j` `k` move between threads, `e` archives, `#`
-deletes, `r` replies, `c` composes, `/` searches, `z` undoes, and `Ctrl+Enter` sends. Drop a file on
-the window to attach it.
+Releases aren't code signed yet, so Windows may warn you the first time. Choose **More info**, then **Run anyway**.
 
-Mail is stored in `%LOCALAPPDATA%\mailfunction`, or wherever `MAILFUNCTION_DATA_DIR` points. The
-refresh tokens are kept in Windows Credential Manager.
+## Sign in
 
-## Test it
+mailfunction doesn't have a shared Google sign-in yet, so you connect it with your own free Google client. It takes about five minutes, once:
 
-```powershell
-rustup run stable-x86_64-pc-windows-msvc cargo test   # offline; UI screenshots go to target/ui
-.\scripts\test-imap.ps1                               # sync, sending and the live window, needs Docker
-rustup run stable-x86_64-pc-windows-msvc cargo test --release -p mailfunction-core --test scale -- --ignored --nocapture
-rustup run stable-x86_64-pc-windows-msvc cargo test --release -p mailfunction --test motion -- --nocapture
-```
+1. In [Google Cloud](https://console.cloud.google.com/), create a project and enable the **Gmail API**.
+2. Set the OAuth app to **External** and **In production**, then create a **Desktop** client.
+3. Download the client JSON and save it as `%USERPROFILE%\.config\mailfunction\google-client.json`.
+4. Open mailfunction and sign in. Google will say the app is unverified, which is expected for a client you made yourself.
 
-The motion test prints what each animation costs per frame, and fails if the app paints anything
-once motion has ended. Real-server tests use Dovecot for IMAP and mailpit for SMTP, and check what
-reached each one. Gmail's own commands are pinned by a scripted server in `gmail_wire.rs`, which
-proves what goes on the wire but not what Gmail does with it.
+## Keyboard
 
-No test injects real mouse or keyboard input. The UI and motion tests drive an offscreen window,
-and the live test opens a real window but works through the controller. To check the cursor it
-posts pointer messages to its own window, which moves nothing on the desktop. It also records the
-window's pixels while moving between messages, and fails if the old message outlives the click.
-The tray test starts the real executable and sends it the messages Windows would send. The
-settings test works each setting from its control to what it changes, and the live and tray tests
-cover the ones that need a real page, real SMTP or Windows itself.
+| Key | Action | | Key | Action |
+| --- | --- | --- | --- | --- |
+| `j` `k` | Next, previous | | `c` | Compose |
+| `e` | Archive | | `r` | Reply |
+| `#` | Delete | | `Ctrl+Enter` | Send |
+| `/` | Search | | `z` | Undo |
+| `Ctrl+0` | All accounts | | `Ctrl+1` to `9` | One account |
+| `Ctrl+,` | Settings | | `?` | Every shortcut |
+
+## Your data
+
+There are no mailfunction servers. Your mail is stored on your PC and synced directly with Google, and your sign-in is kept in Windows Credential Manager. Removing an account deletes its local mail and revokes its access.
+
+Two things do reach beyond Google. Sender logos come from each sender's own domain, which tells it your IP address, and you can turn them off in Settings. Images you choose to load can tell a sender you opened their mail.
+
+## Development
+
+mailfunction is written in Rust with [Slint](https://slint.dev) and WebView2. See [Development](docs/Development.md) to build it, run the tests or learn how it works.
+
+<sub>The pictures above show made-up mail. Product names and logos belong to their owners.</sub>
