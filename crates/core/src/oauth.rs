@@ -13,7 +13,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{Error, Result};
 
-const SCOPE: &str = "https://mail.google.com/ openid email";
+const SCOPE: &str = "https://mail.google.com/ openid email profile";
+const USER_INFO: &str = "https://openidconnect.googleapis.com/v1/userinfo";
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
@@ -233,6 +234,23 @@ pub fn sign_in(client: &Client, open_browser: impl FnOnce(&str)) -> Result<Signe
     Ok(SignedIn { email: email_from_id_token(&id_token)?, refresh_token })
 }
 
+/// The address of the account's profile picture, if Google gives one. A grant made before the
+/// app asked for `profile` may not include it.
+pub fn picture(access_token: &str) -> Result<Option<String>> {
+    picture_from(USER_INFO, access_token)
+}
+
+fn picture_from(url: &str, access_token: &str) -> Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct UserInfo {
+        picture: Option<String>,
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15))).build().into();
+    let mut response = agent.get(url).header("Authorization", format!("Bearer {access_token}")).call()?;
+    let info: UserInfo = response.body_mut().read_json()?;
+    Ok(info.picture.filter(|p| p.starts_with("https://")))
+}
+
 pub fn refresh(client: &Client, refresh_token: &str) -> Result<AccessToken> {
     let tokens = post_token(
         client,
@@ -295,6 +313,34 @@ mod tests {
             auth_url: "http://auth.invalid/authorize".into(),
             token_url,
         }
+    }
+
+    fn user_info_server(body: &'static str) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!("http://{}/userinfo", listener.local_addr().unwrap());
+        let (sent, received) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            let read = stream.read(&mut request).unwrap();
+            let _ = sent.send(String::from_utf8_lossy(&request[..read]).into_owned());
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(body.as_bytes()).unwrap();
+        });
+        (url, received)
+    }
+
+    #[test]
+    fn a_picture_needs_the_token_and_only_https_counts() {
+        let (url, request) = user_info_server(r#"{"sub":"1","picture":"https://lh3.example/a=s96-c"}"#);
+        assert_eq!(picture_from(&url, "tok").unwrap().as_deref(), Some("https://lh3.example/a=s96-c"));
+        assert!(request.recv().unwrap().to_lowercase().contains("authorization: bearer tok"));
+
+        let (url, _) = user_info_server(r#"{"sub":"1"}"#);
+        assert_eq!(picture_from(&url, "tok").unwrap(), None);
+        let (url, _) = user_info_server(r#"{"picture":"http://lh3.example/a"}"#);
+        assert_eq!(picture_from(&url, "tok").unwrap(), None);
     }
 
     fn id_token(email: &str) -> String {

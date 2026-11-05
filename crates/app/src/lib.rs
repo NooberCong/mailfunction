@@ -418,6 +418,12 @@ impl Controller {
             Event::BodyReady(id) if self.selected.get() == Some(id) => self.show_body(id),
             Event::BodyFailed(id) if self.selected.get() == Some(id) => self.app.set_pane(Pane::Failed),
             Event::BodyReady(_) | Event::BodyFailed(_) => {}
+            Event::AccountPicture => {
+                let email = self.accounts.borrow().iter().find(|m| m.account.id == account).map(|m| m.account.email.clone());
+                if let Some(email) = email {
+                    self.logo_ready(&logo::picture_key(&email));
+                }
+            }
         }
     }
 
@@ -445,8 +451,7 @@ impl Controller {
                 email: m.account.email.as_str().into(),
                 initials: initials(&m.account.email).into(),
                 tone: tone(&m.account.email),
-                logo: logo::account_domain(&m.account.email)
-                    .map_or_else(Image::default, |domain| self.logos.image(&domain, ACCOUNT_AVATAR)),
+                logo: self.account_logo(&m.account.email),
                 unread: unread.get(&m.account.id).map_or_else(Default::default, |n| n.to_string().into()),
                 status: match m.link {
                     Link::Offline => "Offline".into(),
@@ -461,6 +466,15 @@ impl Controller {
         let link = active.map(|i| &accounts[i].link);
         self.app.set_syncing(link == Some(&Link::Syncing));
         self.app.set_needs_sign_in(matches!(link, Some(Link::SignedOut(_))));
+    }
+
+    /// The account's own picture if it has one, or else its provider's logo.
+    fn account_logo(&self, email: &str) -> Image {
+        let picture = self.logos.stored(&logo::picture_key(email), ACCOUNT_AVATAR);
+        if picture.size().width > 0 {
+            return picture;
+        }
+        logo::account_domain(email).map_or_else(Image::default, |domain| self.logos.image(&domain, ACCOUNT_AVATAR))
     }
 
     fn schedule_refresh(self: &Rc<Self>, account: i64) {

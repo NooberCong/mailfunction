@@ -53,6 +53,16 @@ pub fn sender_domain(address: &str) -> Option<String> {
     domain(address).filter(|d| !SHARED_MAIL.contains(&d.as_str()))
 }
 
+/// Where an account's own picture is kept, among the logos.
+pub fn picture_key(email: &str) -> String {
+    format!("account:{}", email.to_lowercase())
+}
+
+/// Fetches a profile picture and prepares it like any logo.
+pub(crate) fn picture(url: &str) -> Option<Vec<u8>> {
+    prepare(&Web::default().get(url, MAX_ICON).ok()?.bytes)
+}
+
 pub(crate) enum Dns {
     Records(Vec<String>),
     /// The name has no such records.
@@ -311,6 +321,7 @@ mod tests {
         assert_eq!(sender_domain("not an address"), None);
         assert_eq!(account_domain("me@gmail.com").as_deref(), Some("google.com"));
         assert_eq!(account_domain("me@rocketjump.io").as_deref(), Some("rocketjump.io"));
+        assert_eq!(picture_key("Me@Gmail.com"), "account:me@gmail.com");
     }
 
     #[test]

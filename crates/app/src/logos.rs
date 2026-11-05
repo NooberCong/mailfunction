@@ -87,16 +87,22 @@ impl Logos {
 
     /// A domain's logo for an avatar of `size` logical pixels, or an empty image if there is none.
     pub fn image(&self, domain: &str, size: f32) -> Image {
-        let scale = self.window.upgrade().map_or(1.0, |app| app.window().scale_factor());
-        let pixels = (size * scale).round() as u32;
-        let key = (domain.to_string(), pixels);
-        if let Some(image) = self.images.borrow().get(&key) {
-            return image.clone();
-        }
         let known = self.reader.logo(domain).ok().flatten();
         if known.as_ref().is_none_or(|(_, checked)| now() - checked > RECHECK_SECONDS) {
             self.ask(domain);
         }
+        self.stored(domain, size)
+    }
+
+    /// As [`Self::image`], for what the store already has, without looking anything up.
+    pub fn stored(&self, name: &str, size: f32) -> Image {
+        let scale = self.window.upgrade().map_or(1.0, |app| app.window().scale_factor());
+        let pixels = (size * scale).round() as u32;
+        let key = (name.to_string(), pixels);
+        if let Some(image) = self.images.borrow().get(&key) {
+            return image.clone();
+        }
+        let known = self.reader.logo(name).ok().flatten();
         let image = known.and_then(|(png, _)| logo::avatar(&png?, pixels)).map_or_else(Image::default, |avatar| {
             let (width, height) = avatar.dimensions();
             Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(avatar.as_raw(), width, height))

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use mailfunction::{App, Controller, HtmlPane, ImageBar, Pane, Theme};
 use mailfunction_core::engine::Event;
+use mailfunction_core::logo;
 use mailfunction_core::remote::Offline;
 use mailfunction_core::store::{Account, AuthKind, Folder, LabelSpec, NewMessage, Reader, Role, Security, Store};
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
@@ -253,7 +254,18 @@ fn the_whole_window() {
     assert_eq!(app.get_message().logo.size().width, 40);
     let stranger = (0..MAIL.len()).find(|&i| !MAIL[i].from.1.ends_with("@linear.example")).unwrap();
     assert_eq!(app.get_rows().row_data(stranger).unwrap().logo.size().width, 0);
+    let account_colour = || {
+        let logo = app.get_accounts().row_data(0).unwrap().logo;
+        let pixels = logo.to_rgba8().unwrap();
+        pixels.as_slice()[14 * 28 + 14].rgb()
+    };
     assert_eq!(app.get_accounts().row_data(0).unwrap().logo.size().width, 28);
+    assert_eq!(account_colour(), slint::Rgb8Pixel::new(196, 18, 47));
+
+    // The account's own picture takes over from its provider's logo as soon as it arrives.
+    store.save_logo(&logo::picture_key("kong@example.com"), Some(&logo_png([20, 160, 90])), fresh).unwrap();
+    controller.on_event(account, Event::AccountPicture);
+    assert_eq!(account_colour(), slint::Rgb8Pixel::new(20, 160, 90));
 
     // Remote images stay out until asked for, and nothing is fetched by opening the message.
     let opened = controller.selected_message().unwrap();
@@ -265,11 +277,17 @@ fn the_whole_window() {
     settle();
     shot(&app, "03-images-blocked-dark");
     app.global::<Theme>().set_dark(false);
+    settle();
+
+    // A subject that wraps pushes everything below it down, so the attachments stay in view.
+    let one_line = app.get_slot_y();
     window.set_size(PhysicalSize::new(900, 480));
     settle();
     shot(&app, "03-images-blocked-narrow");
+    assert!(app.get_slot_y() >= one_line + 25.0, "the header did not grow: {} to {}", one_line, app.get_slot_y());
     window.set_size(PhysicalSize::new(1280, 760));
     settle();
+    assert_eq!(app.get_slot_y(), one_line);
 
     click(&app, 1055.0, 176.0);
     assert_eq!(app.get_image_bar(), ImageBar::Loading);

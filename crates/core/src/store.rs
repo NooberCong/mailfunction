@@ -314,6 +314,10 @@ impl Store {
                 "DELETE FROM bodies.body WHERE message_id IN (SELECT id FROM message WHERE account_id = ?1)",
                 [account_id],
             )?;
+            tx.execute(
+                "DELETE FROM logo WHERE domain = 'account:' || (SELECT lower(email) FROM account WHERE id = ?1)",
+                [account_id],
+            )?;
             tx.execute("DELETE FROM account WHERE id = ?1", [account_id])?;
             // Logos are shared between accounts, but the last one out leaves no trace of who wrote.
             tx.execute("DELETE FROM logo WHERE NOT EXISTS (SELECT 1 FROM account)", [])?;

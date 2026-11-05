@@ -1251,6 +1251,9 @@ export component App inherits Window {
                                 spacing: 14px;
 
                                 Text {
+                                    // Measured here, at the width it really gets. Through the
+                                    // `if` and `Reveal` around it, a layout sizes this as one line.
+                                    height: self.preferred-height;
                                     text: root.message.subject;
                                     color: Theme.text;
                                     font-size: Theme.title;
@@ -1334,7 +1337,8 @@ export component App inherits Window {
                             }
                         }
 
-                        if root.pane != Pane.empty: Rectangle {
+                        // The images bar spans the pane, and this inset line would notch its ends.
+                        if root.pane != Pane.empty && root.image-bar == ImageBar.hidden: Rectangle {
                             height: 1px;
                             Rectangle {
                                 x: Theme.gutter;

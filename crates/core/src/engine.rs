@@ -17,6 +17,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio::task::LocalSet;
 
 use crate::imap::{Credential, Imap};
+use crate::logo;
 use crate::oauth::{self, AccessToken};
 use crate::store::{Account, AuthKind, Reader, Store};
 use crate::sync::sync_account;
@@ -29,6 +30,8 @@ const PREFETCH_MAX_SIZE: u32 = 2 * 1024 * 1024;
 /// Bodies load on demand; only this many of the newest Inbox messages are fetched ahead.
 const PREFETCH_NEWEST: usize = 200;
 const PREFETCH_RETRY: Duration = Duration::from_secs(30);
+/// How long a profile picture is kept before asking whether it has changed.
+const PICTURE_RECHECK_SECONDS: i64 = 7 * 24 * 3600;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -43,6 +46,8 @@ pub enum Event {
     BodyReady(i64),
     /// A requested body could not be fetched.
     BodyFailed(i64),
+    /// The account's profile picture is in the store.
+    AccountPicture,
 }
 
 type Listener = Arc<dyn Fn(Event) + Send + Sync>;
@@ -159,10 +164,34 @@ impl Engine {
 /// the body task when the UI drops the account.
 async fn run_account(job: Job, store: Arc<Store>, reader: Rc<Reader>, listener: Listener) {
     let Job { credentials, requests, wake } = job;
+    tokio::task::spawn_local(account_picture(store.clone(), reader.clone(), credentials.clone(), listener.clone()));
     let prefetch = Notify::new();
     tokio::select! {
         () = sync_task(&store, &credentials, &listener, &wake, &prefetch) => {}
         () = body_task(&reader, &store, &credentials, &listener, requests, &prefetch) => {}
+    }
+}
+
+/// Keeps the account's profile picture current. It only decorates the sidebar, so if anything
+/// goes wrong the account keeps the logo it has, and sync is what reports a sign-in problem.
+async fn account_picture(store: Arc<Store>, reader: Rc<Reader>, credentials: Arc<Credentials>, listener: Listener) {
+    if credentials.account.auth != AuthKind::Google {
+        return;
+    }
+    let key = logo::picture_key(&credentials.account.email);
+    let now = chrono::Utc::now().timestamp();
+    if reader.logo(&key).ok().flatten().is_some_and(|(_, checked)| now - checked < PICTURE_RECHECK_SECONDS) {
+        return;
+    }
+    let Ok(Credential::AccessToken(token)) = credentials.get().await else { return };
+    let fetched = tokio::task::spawn_blocking(move || {
+        let url = oauth::picture(&token).ok()??;
+        logo::picture(&url)
+    });
+    if let Ok(Some(png)) = fetched.await
+        && store.save_logo(&key, Some(&png), now).is_ok()
+    {
+        listener(Event::AccountPicture);
     }
 }
 
