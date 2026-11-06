@@ -6,6 +6,8 @@
 //! offer no `EXAMINE (CONDSTORE)` and hide X-GM-THRID.
 
 use std::fmt::Debug;
+use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,8 +16,9 @@ use async_imap::imap_proto::rfc4315::UidSetMember;
 use async_imap::{Authenticator, Client, Session};
 use base64::Engine as _;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, lookup_host};
 use tokio::sync::Notify;
+use tokio::task::JoinSet;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
@@ -24,6 +27,8 @@ use crate::store::{Account, Role, Security};
 use crate::{Error, Result};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long an address has to itself before the next one starts alongside it.
+const NEXT_ADDRESS_DELAY: Duration = Duration::from_millis(250);
 /// A stalled socket must fail, or sync would hang forever with no error to act on.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// A message is read in pieces this big, so that no single response can be unbounded.
@@ -58,8 +63,38 @@ impl Authenticator for XOAuth2 {
     }
 }
 
+/// Connects to whichever address answers first, starting them a moment apart in the order given.
+///
+/// A VPN can leave IPv6 looking fine while dropping everything sent over it, and Windows takes
+/// longer to give up on such an address than `CONNECT_TIMEOUT` allows. One at a time, the working
+/// address behind it would never get a turn.
+async fn connect_first(addresses: impl IntoIterator<Item = SocketAddr>) -> io::Result<TcpStream> {
+    let mut waiting = addresses.into_iter().peekable();
+    let mut attempts = JoinSet::new();
+    let mut failure = None;
+    loop {
+        if let Some(address) = waiting.next() {
+            attempts.spawn(TcpStream::connect(address));
+        }
+        let more = waiting.peek().is_some();
+        let finished = if more {
+            tokio::time::timeout(NEXT_ADDRESS_DELAY, attempts.join_next()).await.ok().flatten()
+        } else {
+            attempts.join_next().await
+        };
+        match finished {
+            Some(Ok(Ok(stream))) => return Ok(stream),
+            Some(Ok(Err(error))) => failure = Some(error),
+            Some(Err(error)) => failure = Some(error.into()),
+            None if more => {}
+            None => return Err(failure.unwrap_or_else(|| io::Error::other("the host has no addresses"))),
+        }
+    }
+}
+
 async fn open_stream(account: &Account) -> Result<Box<dyn Stream>> {
-    let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((account.host.as_str(), account.port)))
+    let connecting = async { connect_first(lookup_host((account.host.as_str(), account.port)).await?).await };
+    let tcp = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
         .await
         .map_err(|_| Error::Protocol(format!("timed out connecting to {}", account.host)))??;
     tcp.set_nodelay(true)?;
@@ -544,6 +579,39 @@ pub fn decode_utf7(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reserved for documentation, so nothing there answers.
+    const NOWHERE: &str = "192.0.2.1:993";
+
+    async fn listener() -> (tokio::net::TcpListener, SocketAddr) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        (listener, address)
+    }
+
+    #[tokio::test]
+    async fn an_address_that_never_answers_does_not_hold_up_the_next() {
+        let (_listener, working) = listener().await;
+        let started = std::time::Instant::now();
+        let stream = connect_first([NOWHERE.parse().unwrap(), working]).await.unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), working);
+        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn the_first_address_wins_when_it_answers() {
+        let (_first, first) = listener().await;
+        let (_second, second) = listener().await;
+        assert_eq!(connect_first([first, second]).await.unwrap().peer_addr().unwrap(), first);
+    }
+
+    #[tokio::test]
+    async fn fails_once_every_address_has() {
+        let (closed, address) = listener().await;
+        drop(closed);
+        assert!(connect_first([address, address]).await.is_err());
+        assert!(connect_first([]).await.is_err());
+    }
 
     #[test]
     fn decodes_modified_utf7() {
