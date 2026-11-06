@@ -368,6 +368,28 @@ fn the_whole_window() {
     assert_eq!(status(0), "Offline");
     settle();
     shot(&app, "04-offline");
+
+    // Asking for a sync while offline shows at once, and says so if it fails.
+    app.invoke_sync_now();
+    assert!(app.get_syncing(), "the click shows nothing");
+    assert_eq!(status(0), "");
+    controller.on_event(account, Event::Offline);
+    assert!(!app.get_syncing());
+    assert_eq!(status(0), "Offline");
+    assert_eq!(app.get_notice(), "Couldn't connect. Check your connection.");
+    settle();
+    shot(&app, "04-offline-retry-failed");
+    app.set_notice("".into());
+    controller.on_event(account, Event::Offline);
+    assert_eq!(app.get_notice(), "", "the engine's own tries stay quiet");
+
+    // One that connects has nothing to report.
+    app.invoke_sync_now();
+    controller.on_event(account, Event::Syncing);
+    assert!(app.get_syncing());
+    controller.on_event(account, Event::UpToDate);
+    controller.on_event(account, Event::Offline);
+    assert_eq!(app.get_notice(), "", "a later drop is not the answer to the click");
     controller.on_event(account, Event::Syncing);
     assert_eq!(status(0), "", "reconnecting clears the word");
     controller.on_event(account, Event::UpToDate);

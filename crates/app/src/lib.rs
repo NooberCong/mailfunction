@@ -42,6 +42,9 @@ slint::include_modules!();
 
 /// Bursts of sync events become at most one list refresh per interval.
 const REFRESH_INTERVAL: Duration = Duration::from_millis(400);
+/// How long a sync the user asked for has to connect. A token refresh and a connection that both
+/// run out their time take 35 seconds, and a server that stalls after answering could take forever.
+const RETRY_LIMIT: Duration = Duration::from_secs(40);
 
 /// Messages opened closer together than this are being flicked through, so they appear at once
 /// rather than fading, which would leave the pane half-transparent while a key is held.
@@ -152,11 +155,13 @@ struct Mailbox {
     identity: Identity,
     /// The identity has changes the store has not seen yet.
     unsaved: bool,
+    /// The user asked for a sync while offline, and has yet to hear how it went.
+    retrying: bool,
 }
 
 impl Mailbox {
     fn new(account: Account, identity: Identity) -> Self {
-        Self { account, link: Link::Quiet, identity, unsaved: false }
+        Self { account, link: Link::Quiet, identity, unsaved: false, retrying: false }
     }
 }
 
@@ -215,6 +220,7 @@ pub struct Controller {
     engine: RefCell<Option<Engine>>,
     client: Option<oauth::Client>,
     refresh: Timer,
+    retry_limit: Timer,
     settings: Cell<Settings>,
     /// The thread to go back to when the settings close.
     returning_to: Cell<Option<ThreadKey>>,
@@ -294,6 +300,7 @@ impl Controller {
             engine: RefCell::default(),
             client,
             refresh: Timer::default(),
+            retry_limit: Timer::default(),
             settings: Cell::new(settings),
             returning_to: Cell::new(None),
             identity_save: Timer::default(),
@@ -907,14 +914,47 @@ impl Controller {
     }
 
     fn set_link(&self, account: i64, link: Link) {
+        let mut failed = false;
         if let Some(mailbox) = self.accounts.borrow_mut().iter_mut().find(|m| m.account.id == account) {
+            failed = std::mem::take(&mut mailbox.retrying) && link == Link::Offline;
             mailbox.link = link;
         }
         self.publish_accounts();
+        // Only for a try the user asked for: the engine keeps trying by itself, and quietly.
+        if failed {
+            self.show_notice("Couldn't connect. Check your connection.", "", Duration::from_secs(8));
+        }
+    }
+
+    /// Shows a try at the offline accounts on screen as a sync, as the engine says nothing of one
+    /// until it has connected, and would say nothing new if it could not.
+    fn show_retry(self: &Rc<Self>) {
+        let on_screen = self.accounts_on_screen();
+        let mut offline = false;
+        for mailbox in self.accounts.borrow_mut().iter_mut() {
+            if mailbox.link == Link::Offline && on_screen.contains(&mailbox.account.id) {
+                mailbox.link = Link::Syncing;
+                mailbox.retrying = true;
+                offline = true;
+            }
+        }
+        if !offline {
+            return;
+        }
+        self.publish_accounts();
+        let weak = Rc::downgrade(self);
+        self.retry_limit.start(TimerMode::SingleShot, RETRY_LIMIT, move || {
+            let Some(this) = weak.upgrade() else { return };
+            let waiting: Vec<i64> = this.accounts.borrow().iter().filter(|m| m.retrying).map(|m| m.account.id).collect();
+            for account in waiting {
+                this.set_link(account, Link::Offline);
+            }
+        });
     }
 
     /// Syncs what is on screen now. The engine reports back with [`Event::Syncing`].
-    fn sync_now(&self) {
+    fn sync_now(self: &Rc<Self>) {
+        self.show_retry();
         if let Some(engine) = self.engine.borrow().as_ref() {
             for account in self.accounts_on_screen() {
                 engine.sync_now(account);
