@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
+use mailfunction::notify::Opens;
 use mailfunction::webview::Webview;
 use mailfunction::{App, Controller, Pane, Theme};
 use mailfunction_core::engine::Event;
@@ -145,6 +146,8 @@ fn mail(uid: u32, subject: &str) -> NewMessage {
 struct Stage {
     app: App,
     controller: Rc<Controller>,
+    view: Rc<Webview>,
+    reader: Reader,
     account: i64,
     failed: Cell<usize>,
 }
@@ -301,6 +304,27 @@ async fn scenario(stage: &Stage, store: &Store, inbox: &Folder) {
         until("the page", || app.get_pane() == Pane::Html).await;
     }
 
+    // A notification names a message of its own, so the page left open has no reason to load.
+    let activity = &stage.view.activity;
+    let other = stage.reader.messages(&[inbox.label_id], 0, 20).unwrap().into_iter().find(|m| m.subject == "Other").unwrap().id;
+    stage.close().await;
+    sleep(800).await;
+    let (loaded, cancelled) = (activity.loaded.get(), activity.cancelled_navigations.borrow().len());
+    controller.open(Opens { account: stage.account, message: Some(other) });
+    until("the window to open", || showing(app)).await;
+    until("the message", || controller.selected_message() == Some(other) && stage.view.is_on_screen()).await;
+    sleep(600).await;
+    assert_eq!(activity.handed_out.borrow().as_slice(), [""; 0], "a page of the app's went to the browser");
+    assert_eq!(activity.cancelled_navigations.borrow().len(), cancelled, "a page was abandoned on the way");
+    assert_eq!(activity.loaded.get(), loaded + 1, "more than the message was loaded");
+
+    // One about an account since removed still opens the window on what was there.
+    stage.close().await;
+    controller.open(Opens { account: 999, message: Some(other) });
+    until("the window to open", || showing(app)).await;
+    until("the page back", || stage.view.is_on_screen()).await;
+    assert_eq!(controller.selected_message(), Some(other));
+
     controller.select_row(row(app, "Large"));
     sleep(1).await;
     stage.close().await;
@@ -361,12 +385,12 @@ fn main() {
     let view = Rc::new(Webview::new(dir.join("webview")));
     let editor = Box::new(common::RecordingEditor::default());
     let notifier = Box::new(common::RecordingNotifier::default());
-    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(view), editor, notifier, Arc::new(Offline)).unwrap();
+    let controller = Controller::new(app.clone_strong(), &dir, None, Box::new(view.clone()), editor, notifier, Arc::new(Offline)).unwrap();
     controller.load_accounts().unwrap();
     app.window().set_size(slint::LogicalSize::new(1100.0, 760.0));
     app.show().unwrap();
 
-    let stage = Stage { app: app.clone_strong(), controller, account, failed: Cell::new(0) };
+    let stage = Stage { app: app.clone_strong(), controller, view, reader, account, failed: Cell::new(0) };
     let result = Rc::new(Cell::new(None));
     let outcome = result.clone();
     slint::spawn_local(async move {

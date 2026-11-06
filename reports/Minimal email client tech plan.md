@@ -119,7 +119,7 @@ These replace the estimates above where they differ. Numbers are private bytes a
 Three findings change the design:
 
 - **A request hook is not a network block.** Chromium preconnects to hosts it sees in the HTML, so WebResourceRequested alone still let TCP connections out, and a bare connection tells a tracker the mail was opened. The spike missed this because it counted HTTP requests rather than connections. The webview now runs with a dead proxy and failing DNS as well.
-- **A sanitiser bypass must not be able to open a URL.** Links open in the browser only when `IsUserInitiated` is true, and all other navigation is cancelled.
+- **A sanitiser bypass must not be able to open a URL.** Links open in the browser only when `IsUserInitiated` is true, and all other navigation is cancelled. That flag is also true for the app's own page loads, so nothing at the document's origin ever leaves.
 - **An expunge must not delete at once.** A message moved between folders looks like a delete followed by a new message, which lost its identity and body. Messages with no location are now hidden, and purged only after a full pass over every folder.
 
 Still open:

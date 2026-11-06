@@ -768,13 +768,18 @@ impl Controller {
         }
     }
 
-    /// Brings the window up, opening again the page that closing it let go of.
-    pub fn reveal(self: &Rc<Self>) {
+    /// Brings the window up, and says whether it had been closed.
+    fn raise(&self) -> bool {
         let returning = chrome::raise(&self.app);
         if returning {
             self.reload_editor();
         }
-        if returning
+        returning
+    }
+
+    /// Brings the window up, opening again the page that closing it let go of.
+    pub fn reveal(self: &Rc<Self>) {
+        if self.raise()
             && !self.app.get_composing()
             && matches!(self.app.get_pane(), Pane::Html | Pane::Loading)
             && let Ok(row) = usize::try_from(self.app.get_selected_row())
@@ -785,10 +790,10 @@ impl Controller {
 
     /// Brings up what a clicked notification is about.
     pub fn open(self: &Rc<Self>, opens: Opens) {
-        self.reveal();
         if !self.accounts.borrow().iter().any(|m| m.account.id == opens.account) {
-            return;
+            return self.reveal();
         }
+        self.raise();
         self.app.set_adding(false);
         self.leave_settings();
         self.finish_writing();

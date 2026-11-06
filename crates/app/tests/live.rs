@@ -783,7 +783,7 @@ async fn scenario(app: App, dir: PathBuf, user: String, controller: Rc<Controlle
     until("window gone", || !showing()).await;
     let mail = b"From: Minh Pham <minh@gmail.com>\r\nTo: me@example.com\r\nSubject: Keys are at reception\r\n\
                  Message-ID: <keys@x>\r\nDate: Wed, 04 Nov 2026 13:00:00 +0700\r\n\
-                 Content-Type: text/plain; charset=utf-8\r\n\r\nSee you there.\r\n";
+                 Content-Type: text/html; charset=utf-8\r\n\r\n<p>See you there.</p>\r\n";
     deliver(user.clone(), vec![mail.to_vec()]);
     until("IDLE to notification, window closed", || !delivered_toasts().is_empty()).await;
     assert!(!showing(), "new mail opened the window");
@@ -794,8 +794,9 @@ async fn scenario(app: App, dir: PathBuf, user: String, controller: Rc<Controlle
     let mut click = std::process::Command::new(std::env::current_exe().unwrap()).args(["--click", launch]).spawn().unwrap();
     until("click to message, window closed", || showing() && controller.selected_message() == Some(keys)).await;
     assert!(click.wait().unwrap().success());
-    until("message on screen", || app.get_pane() == Pane::Text).await;
+    until("message on screen", || app.get_pane() == Pane::Html).await;
     assert_eq!(app.get_message().subject, "Keys are at reception");
+    assert_eq!(view.activity.handed_out.borrow().as_slice(), [""; 0], "a page of the app's went to the browser");
     until("list repainted", || grab(hwnd, list).is_some_and(|now| now != list_before)).await;
     clear_toasts();
 
@@ -865,6 +866,7 @@ fn main() {
         slint::quit_event_loop().unwrap();
     })
     .unwrap();
-    slint::run_event_loop().unwrap();
+    // Closing the window must not end the loop, as in the app.
+    slint::run_event_loop_until_quit().unwrap();
     std::process::exit(0);
 }

@@ -195,11 +195,12 @@ fn nested(depth: usize) -> Vec<u8> {
     format!("From: a@example.com\r\nSubject: x\r\nContent-Type: text/html\r\n\r\n{tags}Deep down\r\n").into_bytes()
 }
 
-/// One link to write to, and under it one to look at. The second is never clicked, as a real
-/// browser would open.
+/// One link to write to, under it one to look at, and under that one to the page's own address.
+/// The second is never clicked, as a real browser would open.
 const LINKS: &[u8] = b"From: a@example.com\r\nSubject: x\r\nContent-Type: text/html\r\n\r\n\
     <a href=\"mailto:ann@example.com?subject=Hi&attach=C:%5Csecret.txt\" style=\"display:block;height:120px;background:#ddd\">Write</a>\
-    <a href=\"https://hover.example/where-it-goes\" style=\"display:block;height:120px;background:#bbb\">Look</a>\r\n";
+    <a href=\"https://hover.example/where-it-goes\" style=\"display:block;height:120px;background:#bbb\">Look</a>\
+    <a href=\"https://message.invalid/1\" style=\"display:block;height:120px;background:#999\">Own</a>\r\n";
 
 /// Puts a mouse event into this one page through the browser's own input path, so that nothing
 /// reaches the desktop.
@@ -352,6 +353,14 @@ async fn scenario(app: App, controller: Rc<Controller>, view: Rc<Webview>, web: 
     assert_eq!(view.activity.loaded.get(), loaded + 1, "a page nobody wanted went up");
     assert_eq!(app.get_pane(), Pane::Html);
 
+    // The browser hears of a page after the app has moved on, and must not take it for a link.
+    println!("a page replaced before it started");
+    controller.select_row(row(&app, "Warm up"));
+    controller.select_row(row(&app, "Plain page"));
+    until("the page that was wanted", || view.is_on_screen()).await;
+    sleep(300).await;
+    assert_eq!(view.activity.handed_out.borrow().as_slice(), [""; 0], "a page of the app's went to the browser");
+
     println!("a mail too deep to clean at all");
     controller.select_row(row(&app, "Too deep"));
     let text = until("its text", || app.get_pane() == Pane::Text).await;
@@ -361,12 +370,18 @@ async fn scenario(app: App, controller: Rc<Controller>, view: Rc<Webview>, web: 
     println!("following a mailto link, and looking at where another goes");
     open("Links", "page up").await;
     sleep(1000).await;
-    let (write, look) = ((40, 60), (40, 180));
+    let (write, look, own) = ((40, 60), (40, 180), (40, 300));
     let said = status_text(&view);
     assert!(!bubble_on_show(&view));
     mouse(&view, "mouseMoved", "none", look);
     until("the link's address", || said.borrow().contains("hover.example")).await;
     until("the bubble that shows it", || bubble_on_show(&view)).await;
+    mouse(&view, "mouseMoved", "none", own);
+    sleep(200).await;
+    mouse(&view, "mousePressed", "left", own);
+    mouse(&view, "mouseReleased", "left", own);
+    until("the click on the page's own address", || view.activity.cancelled_navigations.borrow().iter().any(|url| url.ends_with("/1"))).await;
+    assert_eq!(view.activity.handed_out.borrow().as_slice(), [""; 0], "the page's own address went to the browser");
     mouse(&view, "mouseMoved", "none", write);
     sleep(200).await;
     mouse(&view, "mousePressed", "left", write);

@@ -93,6 +93,8 @@ struct Document {
 pub struct Activity {
     pub refused: RefCell<Vec<String>>,
     pub cancelled_navigations: RefCell<Vec<String>>,
+    /// What went to the default browser.
+    pub handed_out: RefCell<Vec<String>>,
     pub image_requests: Cell<u32>,
     pub loaded: Cell<u32>,
 }
@@ -410,6 +412,8 @@ fn lock_down(
 
         // Only our own document may load. A link opens in the browser, but only for a real
         // click: if a redirect ever got past the sanitiser, it must not be able to open a URL.
+        // The app's own loads count as the user's too, and one replaced before it started is only
+        // heard of here after the document has moved on, so nothing at our own origin ever leaves.
         let (allowed, cancelled) = (document.clone(), activity.clone());
         core.add_NavigationStarting(
             &NavigationStartingEventHandler::create(Box::new(move |_, args| {
@@ -421,10 +425,13 @@ fn lock_down(
                     args.SetCancel(true)?;
                     let mut by_user = BOOL::default();
                     args.IsUserInitiated(&mut by_user)?;
-                    if by_user.as_bool() {
+                    if by_user.as_bool() && !uri.starts_with(DOCUMENT_ORIGIN) {
                         match compose::from_mailto(&uri) {
                             Some(fields) => on_ui_thread(move |this| this.compose_to(fields)),
-                            None => open_externally(&uri),
+                            None => {
+                                open_externally(&uri);
+                                cancelled.handed_out.borrow_mut().push(uri.clone());
+                            }
                         }
                     }
                     cancelled.cancelled_navigations.borrow_mut().push(uri);
