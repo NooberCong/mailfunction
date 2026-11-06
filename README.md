@@ -40,6 +40,7 @@
 - **Hard to fool.** Only senders Gmail has verified get a logo, and a forged From line gets no trust.
 - **Works offline.** Read, write and organize anywhere. Your changes reach the server when you're back.
 - **Undo send.** Changed your mind? You have ten seconds to call a message back.
+- **Login codes in one click.** Copy a code straight from its notification, or from the top of the message. Only verified senders get the button.
 - **Made for the keyboard.** Move through your whole inbox without reaching for the mouse.
 
 ## Write beautifully

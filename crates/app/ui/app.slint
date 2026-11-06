@@ -24,6 +24,7 @@ export struct Preferences {
     notifications: bool,
     notification-sound: bool,
     notification-preview: bool,
+    login-codes: bool,
     taskbar-count: bool,
 }
 
@@ -149,6 +150,8 @@ export struct MessageView {
     recipients: string,
     attachments: [FileItem],
     text: string,
+    /// The login code in the message, if its sender can be believed.
+    code: string,
     initials: string,
     tone: int,
     logo: image,
@@ -1122,6 +1125,48 @@ component ImagesBar inherits Rectangle {
             BarAction {
                 text: "Stop";
                 clicked => { root.stop(); }
+            }
+        }
+    }
+}
+
+/// The login code in the open message, ready to copy.
+component CodeBar inherits Rectangle {
+    in property <string> code;
+    /// Says whether the code got to the clipboard.
+    callback copy() -> bool;
+    property <bool> copied;
+
+    height: 40px;
+    background: Theme.hover;
+
+    Timer {
+        interval: 2s;
+        running: root.copied;
+        triggered => { root.copied = false; }
+    }
+
+    HorizontalLayout {
+        padding-left: Theme.gutter;
+        padding-right: Theme.gutter - 10px;
+        spacing: 4px;
+
+        Text {
+            text: root.code;
+            color: Theme.text;
+            font-size: Theme.body;
+            font-weight: 600;
+            letter-spacing: 1px;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            BarAction {
+                text: root.copied ? "Copied" : "Copy code";
+                clicked => { root.copied = root.copy(); }
             }
         }
     }
@@ -2562,6 +2607,11 @@ component SettingsScreen inherits Rectangle {
                             on <=> Theme.preferences.notification-preview;
                         }
                         Toggle {
+                            title: "Copy button for login codes";
+                            enabled: Theme.preferences.notifications && Theme.preferences.notification-preview;
+                            on <=> Theme.preferences.login-codes;
+                        }
+                        Toggle {
                             title: "Unread count on the taskbar";
                             on <=> Theme.preferences.taskbar-count;
                         }
@@ -2623,6 +2673,7 @@ export component App inherits Window {
     in-out property <int> selected-row: -1;
     in property <Pane> pane: Pane.empty;
     in property <ImageBar> image-bar: ImageBar.hidden;
+    callback copy-code() -> bool;
     in property <bool> can-always-load;
     in property <MessageView> message;
     /// The open thread's messages, and which is showing. One message needs no list.
@@ -3271,14 +3322,19 @@ export component App inherits Window {
                             }
                         }
 
-                        // The images bar spans the pane, and this inset line would notch its ends.
-                        if root.pane != Pane.empty && root.image-bar == ImageBar.hidden: Rectangle {
+                        // The bars span the pane, and this inset line would notch their ends.
+                        if root.pane != Pane.empty && root.image-bar == ImageBar.hidden && root.message.code == "": Rectangle {
                             height: 1px;
                             Rectangle {
                                 x: Theme.gutter;
                                 width: parent.width - 2 * Theme.gutter;
                                 background: Theme.line;
                             }
+                        }
+
+                        if root.pane != Pane.empty && root.message.code != "": CodeBar {
+                            code: root.message.code;
+                            copy => { return root.copy-code(); }
                         }
 
                         if root.pane != Pane.empty && root.image-bar != ImageBar.hidden: ImagesBar {

@@ -8,8 +8,12 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use arboard::{Clipboard, SetExtWindows};
+use mailfunction_core::codes;
 use windows::Data::Xml::Dom::XmlDocument;
+use windows::Foundation::{DateTime, IReference, PropertyValue};
 use windows::UI::Notifications::{ToastNotification, ToastNotificationManager, ToastNotifier};
 use windows::Win32::Foundation::CLASS_E_NOAGGREGATION;
 use windows::Win32::System::Com::{
@@ -27,7 +31,14 @@ use crate::on_ui_thread;
 pub const APP_ID: &str = "mailfunction";
 /// Identifies the app's activator to COM. Keep it: delivered notifications point to it.
 pub const ACTIVATOR: GUID = GUID::from_u128(0x6f1c_2a54_8d3e_4b7a_9c21_5e0d_7a3b_1f46);
+/// What Windows starts the app with to deliver a click, once it has closed.
+pub const ACTIVATED: &str = "-ToastActivated";
 const ICON: &[u8] = include_bytes!("../ui/icon.png");
+/// Starts the arguments of the button that copies a code. What follows says which message, as the
+/// code itself is read again from the store: Windows keeps a notification's XML on disk.
+const COPY_CODE: &str = "copy ";
+/// From 1601, when Windows starts counting, to 1970, in the 100 ns ticks it counts.
+const UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
 
 /// Who an account's notifications come from. Windows heads a notification with the name of the
 /// identity that sent it and offers no other way to set that line, so each account has its own.
@@ -85,6 +96,8 @@ pub struct Notice {
     /// It appears without a sound.
     pub silent: bool,
     pub opens: Opens,
+    /// It can copy the message's login code, and goes when the code would have expired.
+    pub has_code: bool,
 }
 
 /// Where notices go. The real one is Windows; tests record what they are given.
@@ -92,6 +105,10 @@ pub trait Notifier {
     fn show(&self, notice: &Notice);
     /// The account is gone, and nothing of it should stay behind.
     fn forget(&self, _account: i64) {}
+    /// Puts a login code on the clipboard, and says whether it got there.
+    fn copy(&self, _code: &str) -> bool {
+        false
+    }
 }
 
 fn escape(text: &str) -> String {
@@ -103,8 +120,14 @@ fn toast_xml(notice: &Notice, picture: Option<&Path>) -> String {
         format!(r#"<image placement="appLogoOverride" src="{}"/>"#, escape(&path.to_string_lossy()))
     });
     let audio = if notice.silent { r#"silent="true""# } else { r#"src="ms-winsoundevent:Notification.Mail""# };
+    let actions = if notice.has_code {
+        let copy = notice.opens.to_launch();
+        format!(r#"<actions><action content="Copy code" arguments="{COPY_CODE}{copy}" activationType="background"/></actions>"#)
+    } else {
+        String::new()
+    };
     format!(
-        r#"<toast launch="{}"><visual><binding template="ToastGeneric"><text>{}</text><text>{}</text>{image}</binding></visual><audio {audio}/></toast>"#,
+        r#"<toast launch="{}"><visual><binding template="ToastGeneric"><text>{}</text><text>{}</text>{image}</binding></visual>{actions}<audio {audio}/></toast>"#,
         notice.opens.to_launch(),
         escape(&notice.title),
         escape(&notice.text),
@@ -123,7 +146,9 @@ impl INotificationActivationCallback_Impl for Clicked_Impl {
         _: u32,
     ) -> windows::core::Result<()> {
         let launch = unsafe { launch.to_string() }.unwrap_or_default();
-        if let Some(opens) = Opens::from_launch(&launch) {
+        if let Some(opens) = launch.strip_prefix(COPY_CODE).and_then(Opens::from_launch) {
+            on_ui_thread(move |this| this.copy_code(opens));
+        } else if let Some(opens) = Opens::from_launch(&launch) {
             on_ui_thread(move |this| this.open(opens));
         }
         Ok(())
@@ -164,7 +189,7 @@ fn register(pictures: &Path) -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     declare(APP_ID, APP_ID, &icon)?;
     let server = format!(r"Software\Classes\CLSID\{}\LocalServer32", activator_id());
-    set_registry(&server, None, &format!(r#""{}" -ToastActivated"#, exe.display()))?;
+    set_registry(&server, None, &format!(r#""{}" {ACTIVATED}"#, exe.display()))?;
 
     unsafe {
         // Already done on this thread by the windowing library, which is fine.
@@ -174,6 +199,12 @@ fn register(pictures: &Path) -> Option<PathBuf> {
         CoRegisterClassObject(&ACTIVATOR, &factory, CLSCTX_LOCAL_SERVER, REGCLS_MULTIPLEUSE).ok()?;
     }
     Some(icon)
+}
+
+/// A moment as Windows wants it for a notification's expiry.
+fn windows_time(moment: SystemTime) -> windows::core::Result<IReference<DateTime>> {
+    let ticks = moment.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64 / 100;
+    PropertyValue::CreateDateTime(DateTime { UniversalTime: UNIX_EPOCH_TICKS + ticks })?.cast()
 }
 
 /// Notifications from Windows. If registering failed, the app simply goes without them.
@@ -221,8 +252,18 @@ impl Notifier for Toasts {
         let document = XmlDocument::new().and_then(|document| document.LoadXml(&xml).map(|()| document));
         let toast = document.and_then(|document| ToastNotification::CreateToastNotification(&document));
         if let Ok(toast) = toast {
+            if notice.has_code
+                && let Ok(expiry) = windows_time(SystemTime::now() + codes::LIFETIME)
+            {
+                let _ = toast.SetExpirationTime(&expiry);
+            }
             let _ = notifier.Show(&toast);
         }
+    }
+
+    /// Kept out of clipboard history and away from the user's other devices.
+    fn copy(&self, code: &str) -> bool {
+        Clipboard::new().and_then(|mut clipboard| clipboard.set().exclude_from_monitoring().text(code)).is_ok()
     }
 
     fn forget(&self, account: i64) {
@@ -247,6 +288,7 @@ mod tests {
             picture: None,
             silent: false,
             opens: Opens { account: 2, message: Some(9) },
+            has_code: false,
         }
     }
 
@@ -273,6 +315,14 @@ mod tests {
         assert!(toast_xml(&notice(), None).contains("Notification.Mail"));
         let xml = toast_xml(&Notice { silent: true, ..notice() }, None);
         assert!(xml.contains(r#"<audio silent="true"/>"#) && !xml.contains("Notification.Mail"), "{xml}");
+    }
+
+    #[test]
+    fn only_a_notice_with_a_code_has_the_button() {
+        assert!(!toast_xml(&notice(), None).contains("<action"));
+        let xml = toast_xml(&Notice { has_code: true, ..notice() }, None);
+        assert!(xml.contains(r#"<action content="Copy code" arguments="copy 2 9" activationType="background"/>"#), "{xml}");
+        XmlDocument::new().unwrap().LoadXml(&HSTRING::from(xml)).expect("well-formed");
     }
 
     #[test]

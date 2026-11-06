@@ -69,6 +69,8 @@ pub struct Settings {
     pub notification_sound: bool,
     /// Notifications say who wrote and about what, rather than only that mail came.
     pub notification_preview: bool,
+    /// Notifications of a login mail offer to copy its code.
+    pub login_codes: bool,
     pub taskbar_count: bool,
 }
 
@@ -89,6 +91,7 @@ impl Default for Settings {
             notifications: true,
             notification_sound: true,
             notification_preview: true,
+            login_codes: true,
             taskbar_count: true,
         }
     }

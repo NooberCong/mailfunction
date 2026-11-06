@@ -36,6 +36,12 @@ sender give each recipient a domain of their own.
 
 Saved attachments are marked as coming from the internet, as a browser would, and are never opened.
 
+A login code can be copied from its notification, or from a bar over the open message. Mail arrives
+as headers, so the notification of a mail that only looks like a login waits up to three seconds for
+its body. Finding a code (`crates/core/src/codes.rs`) fails closed, as a wrong code is worse than none:
+only mail Gmail verified counts, only one code per mail, and only in the languages listed there. The
+code stays out of the notification's XML, which Windows keeps on disk, and out of clipboard history.
+
 Settings are in the sidebar, or `Ctrl+,`, and apply as they change. The app's own are one JSON
 document in the store, so a new one needs no migration. Each account's name, signature and
 notifications live on the account. Show all images loads every remote image without asking,

@@ -4,6 +4,7 @@
 //! The UI reads only from the store through a [`store::Reader`] and hears about changes from
 //! the [`engine::Engine`], so it never waits on the network.
 
+pub mod codes;
 pub mod compose;
 pub mod draft;
 pub mod engine;

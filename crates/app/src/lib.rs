@@ -19,6 +19,7 @@ mod writing;
 pub use writing::save_dialog;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -29,7 +30,7 @@ use logos::Logos;
 use mailfunction_core::engine::{Engine, Event};
 use mailfunction_core::images::{Images, Page};
 use mailfunction_core::remote::Network;
-use mailfunction_core::{logo, oauth, secrets};
+use mailfunction_core::{codes, logo, oauth, secrets};
 use mailfunction_core::compose;
 use mailfunction_core::render::{self, Body, Rendered};
 use mailfunction_core::settings::{Identity, MarkRead, Placement, Settings};
@@ -69,6 +70,8 @@ const NOTICE_INITIALS_SCALE: f32 = 0.4;
 const MOST_NOTICES: usize = 3;
 /// How many senders a summary names.
 const SENDERS_NAMED: usize = 3;
+/// How long a login mail's notification waits for the body that may hold its code.
+const NOTICE_HOLD: Duration = Duration::from_secs(3);
 
 thread_local! {
     /// The controller, for work that finishes on another thread. `Rc` cannot cross threads,
@@ -207,6 +210,8 @@ pub struct Controller {
     page_key: Cell<u64>,
     editor: Box<dyn ComposePane>,
     notifier: Box<dyn Notifier>,
+    /// Messages whose notification is waiting for their body.
+    held_notices: RefCell<HashSet<i64>>,
     engine: RefCell<Option<Engine>>,
     client: Option<oauth::Client>,
     refresh: Timer,
@@ -285,6 +290,7 @@ impl Controller {
             page_key: Cell::default(),
             editor,
             notifier,
+            held_notices: RefCell::default(),
             engine: RefCell::default(),
             client,
             refresh: Timer::default(),
@@ -420,6 +426,15 @@ impl Controller {
             if let Some(this) = weak.upgrade() {
                 this.remove_account(index as usize);
             }
+        });
+        let weak = Rc::downgrade(self);
+        self.app.on_copy_code(move || {
+            let Some(this) = weak.upgrade() else { return false };
+            let copied = this.notifier.copy(&this.app.get_message().code);
+            if !copied {
+                this.show_notice("The code could not be copied", "", Duration::from_secs(8));
+            }
+            copied
         });
         let weak = Rc::downgrade(self);
         self.app.on_load_images(move || {
@@ -660,6 +675,9 @@ impl Controller {
     }
 
     pub fn on_event(self: &Rc<Self>, account: i64, event: Event) {
+        if let Event::BodyReady(id) | Event::BodyFailed(id) = event {
+            self.release_notice(id);
+        }
         match event {
             Event::Changed => self.schedule_refresh(account),
             Event::Arrived(messages) => self.announce(account, &messages),
@@ -698,7 +716,7 @@ impl Controller {
 
     /// Tells the user about new mail. Only unread Inbox mail is news: the rest is their own sent
     /// mail, spam, or mail they have already read somewhere else.
-    fn announce(&self, account: i64, arrived: &[i64]) {
+    fn announce(self: &Rc<Self>, account: i64, arrived: &[i64]) {
         let settings = self.settings.get();
         let messages = self.reader.unread_in_inbox(arrived).unwrap_or_default();
         let accounts = self.accounts.borrow();
@@ -723,20 +741,97 @@ impl Controller {
                 picture: None,
                 silent,
                 opens: Opens { account, message: one },
+                has_code: false,
             });
             return;
         }
         // Oldest first, so that the newest ends up on top of the stack.
         for message in messages.iter().rev() {
-            let view = header(message);
-            self.notifier.show(&Notice {
-                title: view.sender.to_string(),
-                text: view.subject.to_string(),
-                account: address.clone(),
-                picture: self.sender_picture(message, &view),
-                silent,
-                opens: Opens { account, message: Some(message.id) },
-            });
+            match self.has_code(message) {
+                Some(has_code) => self.announce_message(message, &address, has_code),
+                None => self.hold_notice(account, message.id),
+            }
+        }
+    }
+
+    fn announce_message(&self, message: &MessageRow, address: &str, has_code: bool) {
+        let view = header(message);
+        self.notifier.show(&Notice {
+            title: view.sender.to_string(),
+            text: view.subject.to_string(),
+            account: address.to_string(),
+            picture: self.sender_picture(message, &view),
+            silent: !self.settings.get().notification_sound,
+            opens: Opens { account: message.account_id, message: Some(message.id) },
+            has_code,
+        });
+    }
+
+    /// Whether a new message's notification can offer a login code, or `None` while that depends
+    /// on a body yet to arrive. A forged sender gets no button, and a code that waited out the
+    /// app being closed has expired.
+    fn has_code(&self, message: &MessageRow) -> Option<bool> {
+        let fresh = logos::now() - message.date < codes::LIFETIME.as_secs() as i64;
+        if !self.settings.get().login_codes || !message.verified || !fresh {
+            return Some(false);
+        }
+        if codes::in_subject(&message.subject).is_some() {
+            return Some(true);
+        }
+        if !codes::may_have_code(&message.subject) {
+            return Some(false);
+        }
+        match self.reader.body(message.id) {
+            Ok(Some(raw)) => Some(codes::in_message(&message.subject, &raw).is_some()),
+            Ok(None) => None,
+            Err(_) => Some(false),
+        }
+    }
+
+    /// Mail arrives as headers, and most codes are in the body, so this one notification waits.
+    fn hold_notice(self: &Rc<Self>, account: i64, message: i64) {
+        self.held_notices.borrow_mut().insert(message);
+        if let Some(engine) = self.engine.borrow().as_ref() {
+            engine.fetch_notice_body(account, message);
+        }
+        let weak = Rc::downgrade(self);
+        Timer::single_shot(NOTICE_HOLD, move || {
+            if let Some(this) = weak.upgrade() {
+                this.release_notice(message);
+            }
+        });
+    }
+
+    /// Shows a held notification, with or without its code, unless the mail was read meanwhile.
+    fn release_notice(&self, id: i64) {
+        if !self.held_notices.borrow_mut().remove(&id) {
+            return;
+        }
+        let accounts = self.accounts.borrow();
+        for message in self.reader.unread_in_inbox(&[id]).unwrap_or_default() {
+            if let Some(mailbox) = accounts.iter().find(|m| m.account.id == message.account_id) {
+                self.announce_message(&message, &mailbox.account.email, self.has_code(&message).unwrap_or(false));
+            }
+        }
+    }
+
+    /// The code in a message whose sender can be believed.
+    fn code_in(&self, id: i64, raw: &[u8]) -> Option<String> {
+        let message = self.reader.rows(&[id]).ok()?.pop().filter(|m| m.verified)?;
+        codes::in_message(&message.subject, raw)
+    }
+
+    /// Answers the button on a notification. With no code to copy, the message itself will do.
+    pub fn copy_code(self: &Rc<Self>, opens: Opens) {
+        let code = opens.message.filter(|&id| self.reader.account_of(id).ok().flatten() == Some(opens.account)).and_then(|id| {
+            self.code_in(id, &self.reader.body(id).ok().flatten().unwrap_or_default())
+        });
+        if !code.is_some_and(|code| self.notifier.copy(&code)) {
+            return self.open(opens);
+        }
+        // Windows started the app just for this, and it is not one to stay in the background.
+        if !self.settings.get().keep_running && !self.app.window().is_visible() {
+            let _ = slint::quit_event_loop();
         }
     }
 
@@ -1196,7 +1291,7 @@ impl Controller {
             failed: 0,
             arrived: false,
         }));
-        self.display(&raw, rendered, bar);
+        self.display(id, &raw, rendered, bar);
     }
 
     /// Takes the page away, along with whatever it was still waiting for.
@@ -1296,10 +1391,11 @@ impl Controller {
         }
     }
 
-    fn display(&self, raw: &[u8], rendered: Rendered, bar: ImageBar) {
+    fn display(&self, id: i64, raw: &[u8], rendered: Rendered, bar: ImageBar) {
         self.app.set_image_bar(bar);
         let mut view = self.app.get_message();
         view.recipients = rendered.recipients.into();
+        view.code = self.code_in(id, raw).unwrap_or_default().into();
         let files: Vec<FileItem> = compose::attachments(raw)
             .into_iter()
             .map(|file| writing::file_item(&file.name, file.data.len()))
@@ -1350,5 +1446,6 @@ fn header(m: &MessageRow) -> MessageView {
         recipients: "".into(),
         attachments: ModelRc::default(),
         text: "".into(),
+        code: "".into(),
     }
 }

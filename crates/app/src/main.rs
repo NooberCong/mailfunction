@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use mailfunction::editor::EditorView;
-use mailfunction::notify::Toasts;
+use mailfunction::notify::{ACTIVATED, Toasts};
 use mailfunction::webview::Webview;
 use mailfunction::{App, Controller, Theme, chrome, instance, on_ui_thread, startup};
 use mailfunction_core::oauth;
@@ -45,7 +45,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     controller.place_window();
     // Unshown, the native window still comes to exist as the loop starts, with nothing on screen.
-    if !std::env::args().any(|argument| argument == startup::BACKGROUND) {
+    // A notification's click brings it up if that is what the click is for.
+    if !std::env::args().any(|argument| argument == startup::BACKGROUND || argument == ACTIVATED) {
         app.show()?;
     }
     // Slint applies the window's own (empty) icon as the loop starts, so this has to come after.

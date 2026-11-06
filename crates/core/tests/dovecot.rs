@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_imap::types::Flag;
 use async_imap::{Client, Session};
@@ -329,6 +329,43 @@ async fn the_engine_syncs_hears_new_mail_through_idle_and_fetches_bodies() {
     assert!(String::from_utf8_lossy(&h.reader.body(id).unwrap().unwrap()).contains("body text"));
 
     assert!(engine.fetch_body(h.account.id, 999_999));
+    wait_for(&mut events, Event::BodyFailed(999_999)).await;
+
+    secrets::delete(&h.account.email).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs a local Dovecot: scripts/test-imap.ps1"]
+async fn every_notification_waiting_for_a_body_gets_an_answer() {
+    let mut h = harness("notice-bodies").await;
+    for (id, subject) in [("a", "On screen"), ("b", "First code"), ("c", "Second code")] {
+        h.deliver("INBOX", id, subject).await;
+    }
+    // Nothing fetched ahead, so that each body has to come from these requests.
+    h.store.save_settings(&Settings { offline_messages: 0, ..Settings::default() }).unwrap();
+    secrets::save(&h.account.email, PASSWORD).unwrap();
+
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let mut engine = Engine::start(h.dir.clone(), h.store.clone(), None, move |_, e| {
+        let _ = tx.send(e);
+    });
+    engine.add(h.account.clone());
+    wait_for(&mut events, Event::UpToDate).await;
+    let id = |h: &Harness, subject: &str| h.rows("Inbox").into_iter().find(|m| m.subject == subject).unwrap().id;
+    let (screen, first, second) = (id(&h, "On screen"), id(&h, "First code"), id(&h, "Second code"));
+
+    // All at once, as when two codes arrive while a message is opening.
+    let asked = Instant::now();
+    assert!(engine.fetch_body(h.account.id, screen));
+    assert!(engine.fetch_notice_body(h.account.id, first));
+    assert!(engine.fetch_notice_body(h.account.id, second));
+    for message in [screen, first, second] {
+        wait_for(&mut events, Event::BodyReady(message)).await;
+        assert!(h.reader.has_body(message).unwrap());
+    }
+    println!("three bodies in {:?}", asked.elapsed());
+
+    assert!(engine.fetch_notice_body(h.account.id, 999_999));
     wait_for(&mut events, Event::BodyFailed(999_999)).await;
 
     secrets::delete(&h.account.email).unwrap();

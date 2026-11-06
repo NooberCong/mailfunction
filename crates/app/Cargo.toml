@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+arboard = { version = "3", default-features = false }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -17,7 +18,7 @@ unicode-normalization = "0.1"
 slint = { version = "1.18", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-software", "raw-window-handle-06", "unstable-winit-030"] }
 webview2-com = "0.39"
 windows-core = "0.62"
-windows = { version = "0.62", features = ["Data_Xml_Dom", "UI_Notifications", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Notifications", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62", features = ["Data_Xml_Dom", "Foundation", "UI_Notifications", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Notifications", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 wry = "0.57"
 
 [dev-dependencies]
@@ -26,7 +27,7 @@ async-imap = { version = "0.12", default-features = false, features = ["runtime-
 png = "0.18"
 rusqlite = "0.41"
 ureq = "3"
-windows = { version = "0.62", features = ["Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_UI_HiDpi"] }
+windows = { version = "0.62", features = ["Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_System_DataExchange", "Win32_UI_HiDpi"] }
 tokio = { version = "1", features = ["net", "rt"] }
 
 # Needs Dovecot and opens a window, so plain `cargo test` leaves it out.

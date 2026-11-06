@@ -39,7 +39,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetCursor, HTCLIENT, IDC_HAND, IsWindowVisible, LoadCursorW, PostMessageW, SendMessageW, WM_CLOSE,
     WM_MOUSEMOVE, WM_SETCURSOR,
 };
-use windows::core::{HSTRING, PCWSTR, PWSTR};
+use windows::Win32::System::DataExchange::{IsClipboardFormatAvailable, RegisterClipboardFormatW};
+use windows::core::{HSTRING, PCWSTR, PWSTR, w};
 use wry::WebViewExtWindows;
 
 /// Deliberately not sanitised: this attacks the webview layers directly.
@@ -542,6 +543,45 @@ fn clear_toasts() {
     ToastNotificationManager::History().unwrap().ClearWithId(&HSTRING::from(identity(NOTIFIED))).unwrap();
 }
 
+/// A login mail through the real server, notification and clipboard. The user's clipboard text is
+/// put back afterwards.
+async fn login_code(app: &App, user: &str, dir: &std::path::Path) {
+    println!("login codes");
+    // Only Gmail can vouch for a sender, so this store is told to believe everyone for a moment.
+    let store = rusqlite::Connection::open(dir.join("meta.db")).unwrap();
+    store.execute_batch("CREATE TRIGGER vouched AFTER INSERT ON message BEGIN UPDATE message SET verified = 1 WHERE id = new.id; END").unwrap();
+    let mail = b"From: Brand <hello@brand.example>\r\nTo: me@example.com\r\nSubject: Verify your email address\r\n\
+                 Message-ID: <code@x>\r\nDate: Wed, 04 Nov 2026 12:30:00 +0700\r\n\
+                 Content-Type: text/plain; charset=utf-8\r\n\r\nConfirm it is you: 482913\r\nThis code will expire soon.\r\n";
+    deliver(user.to_string(), vec![mail.to_vec()]);
+    until("IDLE to notification with a code", || !delivered_toasts().is_empty()).await;
+    store.execute_batch("DROP TRIGGER vouched").unwrap();
+
+    let history = ToastNotificationManager::History().unwrap().GetHistoryWithId(&HSTRING::from(identity(NOTIFIED))).unwrap();
+    let toast = history.GetAt(0).unwrap();
+    let xml = toast.Content().unwrap().GetXml().unwrap().to_string();
+    assert!(xml.contains(r#"content="Copy code""#) && xml.contains(r#"activationType="background""#), "{xml}");
+    assert!(!xml.contains("482913"), "Windows keeps this on disk: {xml}");
+    assert!(toast.ExpirationTime().is_ok_and(|expiry| expiry.Value().is_ok()), "a code outlived its use");
+
+    let mut clipboard = arboard::Clipboard::new().unwrap();
+    let kept = clipboard.get_text().ok();
+    clipboard.clear().unwrap();
+    let copy = xml.split(r#"arguments=""#).nth(1).unwrap().split('"').next().unwrap();
+    let mut click = std::process::Command::new(std::env::current_exe().unwrap()).args(["--click", copy]).spawn().unwrap();
+    until("code on the clipboard", || clipboard.get_text().is_ok_and(|text| text == "482913")).await;
+    assert!(click.wait().unwrap().success());
+    let private = unsafe { IsClipboardFormatAvailable(RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing"))) };
+    assert!(private.is_ok(), "the code can reach clipboard history");
+    match kept {
+        Some(text) => clipboard.set_text(text).unwrap(),
+        None => clipboard.clear().unwrap(),
+    }
+    clear_toasts();
+    // What follows picks rows by position, so the list has to have caught up.
+    until("code mail in the list", || app.get_rows().iter().any(|row| row.subject == "Verify your email address")).await;
+}
+
 /// Does what the shell does for a click on a notification, from outside the app's process.
 fn click_toast(launch: &str) {
     unsafe {
@@ -748,6 +788,8 @@ async fn scenario(app: App, dir: PathBuf, user: String, controller: Rc<Controlle
     until("message on screen", || app.get_pane() == Pane::Text).await;
     assert_eq!(app.get_message().subject, "Lunch on Friday?");
     clear_toasts();
+
+    login_code(&app, &user, &dir).await;
 
     println!("the window closed");
     let hwnd = window(&app);

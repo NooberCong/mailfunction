@@ -20,7 +20,7 @@ const FETCHERS: usize = 4;
 /// Brands change their logos, and a domain with none may gain one.
 const RECHECK_SECONDS: i64 = 30 * 24 * 3600;
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 

@@ -85,11 +85,17 @@ impl ComposePane for RecordingEditor {
 #[derive(Default, Clone)]
 pub struct RecordingNotifier {
     pub shown: Rc<RefCell<Vec<Notice>>>,
+    pub copied: Rc<RefCell<Vec<String>>>,
 }
 
 impl Notifier for RecordingNotifier {
     fn show(&self, notice: &Notice) {
         self.shown.borrow_mut().push(notice.clone());
+    }
+
+    fn copy(&self, code: &str) -> bool {
+        self.copied.borrow_mut().push(code.to_string());
+        true
     }
 }
 

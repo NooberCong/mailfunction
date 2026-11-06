@@ -96,6 +96,8 @@ impl Credentials {
 /// What the body task can be asked for.
 enum Request {
     Body(i64),
+    /// A body a notification is waiting for. Unlike the one on screen, it never goes out of date.
+    NoticeBody(i64),
     Search { key: u64, query: String },
 }
 
@@ -181,6 +183,12 @@ impl Engine {
     /// unless this returns false because the account has stopped, so no answer will come.
     pub fn fetch_body(&self, account_id: i64, message_id: i64) -> bool {
         self.running.get(&account_id).is_some_and(|r| r.requests.send(Request::Body(message_id)).is_ok())
+    }
+
+    /// Asks for the body of a message whose notification is waiting for it, answered as
+    /// [`Self::fetch_body`] is.
+    pub fn fetch_notice_body(&self, account_id: i64, message_id: i64) -> bool {
+        self.running.get(&account_id).is_some_and(|r| r.requests.send(Request::NoticeBody(message_id)).is_ok())
     }
 
     /// Asks the server to search, for what is not stored here. Answered with
@@ -418,8 +426,8 @@ async fn body_task(
                 }
             },
         };
-        let (body, search) = latest(request, &mut requests);
-        if let Some(id) = body {
+        let (body, notices, search) = latest(request, &mut requests);
+        for id in body.into_iter().chain(notices) {
             let ok = fetcher.fetch(id, reader, store, credentials).await.is_ok();
             listener(if ok { Event::BodyReady(id) } else { Event::BodyFailed(id) });
         }
@@ -430,18 +438,19 @@ async fn body_task(
     }
 }
 
-/// Only the most recent request of each kind matters: the user has moved on from the others.
-fn latest(first: Request, requests: &mut mpsc::UnboundedReceiver<Request>) -> (Option<i64>, Option<(u64, String)>) {
-    let (mut body, mut search) = (None, None);
+/// Only the most recent body and search matter, as the user has moved on from the others.
+fn latest(first: Request, requests: &mut mpsc::UnboundedReceiver<Request>) -> (Option<i64>, Vec<i64>, Option<(u64, String)>) {
+    let (mut body, mut notices, mut search) = (None, Vec::new(), None);
     let mut next = Some(first);
     while let Some(request) = next {
         match request {
             Request::Body(id) => body = Some(id),
+            Request::NoticeBody(id) => notices.push(id),
             Request::Search { key, query } => search = Some((key, query)),
         }
         next = requests.try_recv().ok();
     }
-    (body, search)
+    (body, notices, search)
 }
 
 struct BodyFetcher {

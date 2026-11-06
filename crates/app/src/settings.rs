@@ -30,6 +30,7 @@ impl From<Settings> for Preferences {
             notifications: s.notifications,
             notification_sound: s.notification_sound,
             notification_preview: s.notification_preview,
+            login_codes: s.login_codes,
             taskbar_count: s.taskbar_count,
         }
     }
@@ -53,6 +54,7 @@ impl From<Preferences> for Settings {
             notifications: p.notifications,
             notification_sound: p.notification_sound,
             notification_preview: p.notification_preview,
+            login_codes: p.login_codes,
             taskbar_count: p.taskbar_count,
         }
     }
