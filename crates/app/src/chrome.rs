@@ -227,6 +227,7 @@ pub(crate) fn raise(app: &App) -> bool {
 /// Keeps the unread count on the taskbar from now on, on the button and in the notification area.
 pub fn watch_window(app: &App) {
     let weak = app.as_weak();
+    let mut minimized = false;
     app.window().on_winit_window_event(move |_, event| {
         match event {
             // A press that gets here missed the webviews, and one of them may still have the
@@ -237,7 +238,20 @@ pub fn watch_window(app: &App) {
                     let _ = unsafe { SetFocus(Some(hwnd)) };
                 }
             }
-            WindowEvent::Moved(_) | WindowEvent::Resized(_) => on_ui_thread(|this| this.window_changed()),
+            // Windows drops what a minimized window showed, and Slint puts back only what changed
+            // since its last frame. A frame drawn while minimized went nowhere but counts as shown,
+            // and the window would come back see-through wherever nothing has changed since.
+            WindowEvent::Resized(size) => {
+                let gone = size.width == 0 || size.height == 0;
+                if std::mem::replace(&mut minimized, gone)
+                    && !gone
+                    && let Some(app) = weak.upgrade()
+                {
+                    app.invoke_repaint();
+                }
+                on_ui_thread(|this| this.window_changed());
+            }
+            WindowEvent::Moved(_) => on_ui_thread(|this| this.window_changed()),
             // A file dropped on the window goes on the message being written.
             WindowEvent::DroppedFile(path) => {
                 let path = path.clone();

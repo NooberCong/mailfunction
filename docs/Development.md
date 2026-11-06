@@ -77,10 +77,11 @@ and the live test opens a real window but works through the controller. To check
 posts pointer messages to its own window, which moves nothing on the desktop. It also records the
 window's pixels while moving between messages, and fails if the old message outlives the click.
 The closed test works in the real window, and fails if the UI thread stays busy behind a closed
-window or if the window comes back with anything missing. The tray test starts the real executable
-and sends it the messages Windows would send. The settings test works each setting from its control
-to what it changes, and the live and tray tests cover the ones that need a real page, real SMTP or
-Windows itself.
+window or if the window comes back with anything missing. The restored test minimizes the real
+window, lets mail and syncs happen, and fails if it comes back with any of itself see-through. The
+tray test starts the real executable and sends it the messages Windows would send. The settings
+test works each setting from its control to what it changes, and the live and tray tests cover
+the ones that need a real page, real SMTP or Windows itself.
 
 ## Release it
 

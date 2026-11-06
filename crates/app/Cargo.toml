@@ -66,6 +66,12 @@ name = "closed"
 harness = false
 test = false
 
+# Opens a window, without taking focus.
+[[test]]
+name = "restored"
+harness = false
+test = false
+
 # Opens a window, and needs the real executable.
 [[test]]
 name = "tray"
