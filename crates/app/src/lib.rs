@@ -356,6 +356,7 @@ impl Controller {
         self.app.on_show_copies(self.bound(|this| this.app.set_draft_copies(true)));
         self.app.on_send_draft(self.bound(|this| this.send_draft()));
         self.app.on_remove_draft_file(self.bound1(|this, index| this.remove_draft_file(index as usize)));
+        self.app.on_save_draft_file(self.bound1(|this, index| this.save_draft_file(index as usize)));
         self.app.on_focus_editor(self.bound(|this| this.editor.focus()));
         self.app.on_editor_moved(self.bound(|this| {
             this.editor.bounds_changed(&this.app);

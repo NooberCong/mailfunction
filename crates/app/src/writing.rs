@@ -670,6 +670,23 @@ impl Controller {
         let Some(id) = self.selected.get() else { return };
         let Some(raw) = self.reader.body(id).ok().flatten() else { return };
         let Some(file) = compose::attachments(&raw).into_iter().nth(index) else { return };
+        self.save_file(file);
+    }
+
+    /// A file of the draft being written, counted as the composer shows them.
+    pub fn draft_file(&self, index: usize) -> Option<Attachment> {
+        let draft = self.writing.borrow().as_ref().and_then(|w| w.draft)?;
+        self.reader.draft_files(draft).ok()?.into_iter().filter(|file| file.content_id.is_none()).nth(index)
+    }
+
+    /// Saves a file of the draft being written, as a message's are.
+    pub(crate) fn save_draft_file(&self, index: usize) {
+        if let Some(file) = self.draft_file(index) {
+            self.save_file(file);
+        }
+    }
+
+    fn save_file(&self, file: Attachment) {
         let parent = chrome::dialog_parent(&self.app);
         std::thread::spawn(move || {
             let chosen = save_dialog(&file.name).set_parent(&parent).save_file();

@@ -581,12 +581,24 @@ fn writing(s: &Scene) {
     assert_eq!(app.get_draft_files().row_data(1).unwrap().size, "10 B");
     settle();
     shot(app, "34-attachments");
-    // A draft's files can't be opened, but their names can still be read, except on the cross.
+    // A draft's names can be read, except on the cross.
     let name = file.file_name().unwrap().to_string_lossy();
     assert_eq!(hover(app, 870.0, 117.0), name);
     assert_eq!(hover(app, 990.0, 117.0), "");
     hover(app, 800.0, 500.0);
-    app.invoke_remove_draft_file(0);
+    // Its files save as a message's do, which a real dialog would answer, so this stands in.
+    let asked = Rc::new(std::cell::Cell::new(-1));
+    let saving = asked.clone();
+    app.on_save_draft_file(move |index| saving.set(index));
+    click(app, 870.0, 117.0);
+    assert_eq!(asked.get(), 1);
+    assert_eq!(s.controller.draft_file(1).unwrap().name, name);
+    assert_eq!(s.controller.draft_file(1).unwrap().data.len(), 10);
+    assert!(s.controller.draft_file(2).is_none());
+    // The cross only takes a file off.
+    asked.set(-1);
+    click(app, 990.0, 117.0);
+    assert_eq!(asked.get(), -1);
     assert_eq!(app.get_draft_files().row_count(), 1);
     let large = file.with_extension("bin");
     std::fs::File::create(&large).unwrap().set_len(40 * 1024 * 1024).unwrap();

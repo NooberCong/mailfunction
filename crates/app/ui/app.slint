@@ -1400,7 +1400,7 @@ component ThreadStrip inherits Rectangle {
     }
 }
 
-/// A file, to save from a message or to take off a draft.
+/// A file, to save from a message or a draft, or to take off a draft.
 component FileChip inherits Rectangle {
     in property <FileItem> file;
     in property <bool> removable;
@@ -1413,16 +1413,11 @@ component FileChip inherits Rectangle {
     background: touch.has-hover ? Theme.faint : Theme.hover;
     animate background { duration: Theme.fast; }
 
-    // A draft's files have only their cross to press, but the name still shows on resting here.
     touch := TipPress {
         tip: root.file.name;
         tip-above: true;
-        mouse-cursor: root.removable ? MouseCursor.default : MouseCursor.pointer;
-        clicked => {
-            if (!root.removable) {
-                root.clicked();
-            }
-        }
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.clicked(); }
     }
 
     layout := HorizontalLayout {
@@ -1613,6 +1608,7 @@ component Composer inherits Rectangle {
     callback accept-suggestion(int);
     callback show-copies();
     callback remove-file(int);
+    callback save-file(int);
     callback focus-editor();
     callback editor-moved();
 
@@ -1762,6 +1758,7 @@ component Composer inherits Rectangle {
             FileRow {
                 files: root.files;
                 removable: true;
+                open(index) => { root.save-file(index); }
                 remove(index) => { root.remove-file(index); }
             }
         }
@@ -2768,6 +2765,7 @@ export component App inherits Window {
     callback show-copies();
     callback send-draft();
     callback remove-draft-file(int);
+    callback save-draft-file(int);
     callback focus-editor();
     callback editor-moved();
     callback close-draft();
@@ -3425,6 +3423,7 @@ export component App inherits Window {
                         accept-suggestion(index) => { root.accept-suggestion(index); }
                         show-copies => { root.show-copies(); }
                         remove-file(index) => { root.remove-draft-file(index); }
+                        save-file(index) => { root.save-draft-file(index); }
                         focus-editor => { root.focus-editor(); }
                         editor-moved => { root.editor-moved(); }
                     }
