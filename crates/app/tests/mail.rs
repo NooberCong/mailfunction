@@ -330,6 +330,7 @@ fn a_day_of_mail() {
 
     tips_and_mark_all(&s);
     writing(&s);
+    draft_still_on_the_server(&s);
     searching(&s);
     across_accounts(&s);
     all_accounts(&s);
@@ -640,6 +641,58 @@ fn writing(s: &Scene) {
     assert_eq!(s.notice().0, "Sent");
     s.controller.on_event(s.account, Event::ActionRefused);
     assert!(s.notice().0.contains("put back"));
+}
+
+/// A draft written elsewhere waits for its body, and the pane must say so under its own name.
+fn draft_still_on_the_server(s: &Scene) {
+    let app = &s.app;
+    press(app, "j");
+    let read = app.get_message().subject;
+    assert!(!read.is_empty());
+
+    let all = s.store.folder(s.account, "[Gmail]/All Mail", &LabelSpec::system(Role::All)).unwrap();
+    let web = NewMessage {
+        uid: 901,
+        remote_id: "gm:901".into(),
+        gm_thread_id: Some(901),
+        mid: Some("away@x".into()),
+        references: vec![],
+        subject: "Still on the server".into(),
+        from_name: "".into(),
+        from_addr: "kong@example.com".into(),
+        verified: true,
+        date: NOW,
+        size: 100,
+        seen: true,
+        flagged: false,
+        labels: vec![LabelSpec::system(Role::Drafts)],
+    };
+    s.store.save_messages(&all, &[web]).unwrap();
+    let id = rusqlite_id(&s.dir, 901);
+    s.controller.refresh_now();
+
+    press(app, "g");
+    press(app, "d");
+    press(app, "j");
+    assert!(!app.get_composing());
+    assert_eq!(app.get_pane(), Pane::Loading);
+    assert_eq!(app.get_message().subject, "Still on the server", "not {read}, the message read before it");
+
+    s.controller.on_event(s.account, Event::BodyFailed(id));
+    assert_eq!(app.get_pane(), Pane::Failed);
+    assert_eq!(app.get_message().subject, "Still on the server");
+
+    let raw = "From: kong@example.com\r\nTo: a@example.com\r\nSubject: Still on the server\r\nMessage-ID: <away@x>\r\n\
+               Content-Type: text/plain\r\n\r\nHello\r\n";
+    s.store.save_body(id, raw.as_bytes()).unwrap();
+    s.controller.on_event(s.account, Event::BodyReady(id));
+    assert!(app.get_composing());
+    assert_eq!(app.get_draft_subject(), "Still on the server");
+
+    press(app, ESCAPE);
+    s.store.discard_draft(id).unwrap();
+    press(app, "g");
+    press(app, "i");
 }
 
 /// Whatever is in progress stays with the account it began in.

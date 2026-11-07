@@ -232,6 +232,10 @@ impl Controller {
                 }
             }
             None => {
+                // The pane shows a header while it waits, and it must not be the last message's.
+                if let Some(row) = self.reader.rows(&[id]).ok().and_then(|rows| rows.into_iter().next()) {
+                    self.show_header(&row);
+                }
                 self.selected.set(Some(id));
                 self.opening_draft.set(Some(id));
                 self.fetch_selected_body(id);

@@ -1238,9 +1238,7 @@ impl Controller {
         self.app.set_image_bar(ImageBar::Hidden);
         // The old message goes in the same frame as the click, whatever the new one takes.
         self.hide_page();
-        let mut view = header(&message);
-        view.logo = self.list.logo(&message, HEADER_AVATAR);
-        self.app.set_message(view);
+        self.show_header(&message);
         let now = Instant::now();
         if self.last_open.replace(Some(now)).is_none_or(|last| now - last > FLICKING) {
             self.app.set_header_key(self.app.get_header_key() + 1);
@@ -1250,6 +1248,13 @@ impl Controller {
             Ok(true) => self.show_body(message.id),
             _ => self.fetch_selected_body(message.id),
         }
+    }
+
+    /// Puts a message's header up, in place of whatever the last one left behind.
+    fn show_header(&self, message: &MessageRow) {
+        let mut view = header(message);
+        view.logo = self.list.logo(message, HEADER_AVATAR);
+        self.app.set_message(view);
     }
 
     /// Puts a message back in the reader after something covered it.
