@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::json;
 use slint::{Color, ComponentHandle, Timer, TimerMode};
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
-use webview2_com::{NavigationStartingEventHandler, WebResourceRequestedEventHandler, take_pwstr};
+use webview2_com::{CapturePreviewCompletedHandler, NavigationStartingEventHandler, WebResourceRequestedEventHandler, take_pwstr};
 use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows::core::{HSTRING, Interface, PWSTR, w};
 use wry::{WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows, WebViewExtWindows};
@@ -77,6 +77,8 @@ struct Page {
     slot: Cell<Bounds>,
     /// A message is on its way, and comes into view when it lands.
     wanted: Cell<bool>,
+    /// Messages sent to the page that it has not yet said are in place. Only the last one counts.
+    loading: Cell<u32>,
     take_focus: Cell<bool>,
     on_screen: Cell<bool>,
 }
@@ -90,7 +92,7 @@ impl Page {
         }
     }
 
-    fn heard(&self, event: &EditorEvent) {
+    fn heard(self: &Rc<Self>, event: &EditorEvent) {
         match event {
             EditorEvent::Ready => {
                 self.ready.set(true);
@@ -98,12 +100,51 @@ impl Page {
                     self.run(script);
                 }
             }
-            EditorEvent::Loaded { .. } if self.wanted.take() => self.bring_in(),
+            EditorEvent::Loaded { .. } => {
+                self.loading.set(self.loading.get().saturating_sub(1));
+                self.after_next_frame();
+            }
             _ => {}
         }
     }
 
+    /// Brings the page in once it has drawn the message. Until then it would show the last thing
+    /// written here, which can be a quoted mail. As in the reading pane, a capture only completes
+    /// after a frame, and that is the signal.
+    fn after_next_frame(self: &Rc<Self>) {
+        if !self.settled() {
+            return;
+        }
+        let page = Rc::downgrade(self);
+        let open = self.open.borrow();
+        let Some(open) = open.as_ref() else { return };
+        let asked = unsafe {
+            SHCreateMemStream(None).ok_or(windows::core::Error::empty()).and_then(|stream| {
+                let done = CapturePreviewCompletedHandler::create(Box::new(move |_| {
+                    if let Some(page) = page.upgrade() {
+                        page.bring_in();
+                    }
+                    Ok(())
+                }));
+                open.view.webview().CapturePreview(COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_JPEG, &stream, &done)
+            })
+        };
+        // An editor a moment early beats one that never comes.
+        if asked.is_err() {
+            self.bring_in();
+        }
+    }
+
+    /// The message that is wanted is the one in the page.
+    fn settled(&self) -> bool {
+        self.wanted.get() && self.loading.get() == 0
+    }
+
     fn bring_in(&self) {
+        if !self.settled() {
+            return;
+        }
+        self.wanted.set(false);
         let open = self.open.borrow();
         let Some(open) = open.as_ref() else { return };
         let _ = open.view.set_bounds(rect(self.slot.get()));
@@ -196,12 +237,14 @@ impl ComposePane for Rc<EditorView> {
         if self.page.open.borrow().is_none() {
             self.page.ready.set(false);
             self.page.waiting.borrow_mut().clear();
+            self.page.loading.set(0);
             match self.create(app) {
                 Ok(created) => *self.page.open.borrow_mut() = Some(created),
                 Err(_) => return false,
             }
         }
         self.page.wanted.set(true);
+        self.page.loading.set(self.page.loading.get() + 1);
         self.page.take_focus.set(take_focus);
         self.page.run(format!("editor.theme({});editor.load({});", theme(app), json!(html)));
         true
