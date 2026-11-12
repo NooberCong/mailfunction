@@ -42,6 +42,13 @@ its body. Finding a code (`crates/core/src/codes.rs`) fails closed, as a wrong c
 only mail Gmail verified counts, only one code per mail, and only in the languages listed there. The
 code stays out of the notification's XML, which Windows keeps on disk, and out of clipboard history.
 
+Email links from other apps open as a new message. At each start the app offers itself to Windows
+for `mailto:` links, in the current user's hive, and Windows lists it among the apps for them. Only
+the user can make it the default, so Settings sends them to Windows for that. Windows starts the
+app with the link, and a second start hands what it was given to the first through a named pipe
+that only the same user can write to. Either way a link fills in only To, Cc, Subject and Body,
+as one clicked in a message does.
+
 Settings are in the sidebar, or `Ctrl+,`, and apply as they change. The app's own are one JSON
 document in the store, so a new one needs no migration. Each account's name, signature and
 notifications live on the account. Show all images loads every remote image without asking,
@@ -79,7 +86,8 @@ window's pixels while moving between messages, and fails if the old message outl
 The closed test works in the real window, and fails if the UI thread stays busy behind a closed
 window or if the window comes back with anything missing. The restored test minimizes the real
 window, lets mail and syncs happen, and fails if it comes back with any of itself see-through. The
-tray test starts the real executable and sends it the messages Windows would send. The settings
+tray test starts the real executable and sends it the messages Windows would send, and opens
+`mailto:` links through Windows' own association, putting back the user's own registration afterwards. The settings
 test works each setting from its control to what it changes, and the live and tray tests cover
 the ones that need a real page, real SMTP or Windows itself.
 

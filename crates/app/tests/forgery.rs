@@ -224,6 +224,23 @@ fn a_forgery_gets_nothing_that_a_genuine_sender_has_earned() {
     assert_eq!(app.get_draft_files().row_count(), 0);
     assert!(opened.borrow().last().unwrap().contains("Line one"), "{}", opened.borrow().last().unwrap());
 
+    // The same link from another app goes no further either, and comes over whatever was showing.
+    controller.open_settings();
+    assert!(app.get_settings_open() && !app.get_composing());
+    controller.requested(link);
+    settle();
+    assert!(app.get_composing() && !app.get_settings_open());
+    assert_eq!((app.get_draft_to().as_str(), app.get_draft_subject().as_str(), app.get_draft_bcc().as_str()), ("a@x.example", "Hi", ""));
+    assert_eq!(app.get_draft_files().row_count(), 0);
+    assert!(opened.borrow().last().unwrap().contains("Line one"), "{}", opened.borrow().last().unwrap());
+    // Anything else a start can say only brings the window up.
+    let editors = opened.borrow().len();
+    for request in ["", "-ToastActivated", "--background", "https://x.example", "file:///C:/secret.txt"] {
+        controller.requested(request);
+    }
+    settle();
+    assert!(app.get_composing() && app.get_draft_to() == "a@x.example" && opened.borrow().len() == editors);
+
     drop(w);
     drop(controller);
     drop(store);

@@ -7,8 +7,8 @@ use std::sync::Arc;
 use mailfunction::editor::EditorView;
 use mailfunction::notify::{ACTIVATED, Toasts};
 use mailfunction::webview::Webview;
-use mailfunction::{App, Controller, Theme, chrome, instance, on_ui_thread, startup};
-use mailfunction_core::oauth;
+use mailfunction::{App, Controller, Theme, chrome, instance, mailto, on_ui_thread, startup};
+use mailfunction_core::{compose, oauth};
 use mailfunction_core::remote::Web;
 use slint::ComponentHandle;
 
@@ -21,9 +21,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(dir) => PathBuf::from(dir),
         None => env_path("LOCALAPPDATA").join("mailfunction"),
     };
-    if !instance::claim(&data) {
+    // What Windows starts the app with for a link, whether or not it is running already.
+    let link = std::env::args().skip(1).find(|argument| compose::from_mailto(argument).is_some());
+    let heard = |request: String| on_ui_thread(move |this| this.requested(&request));
+    if !instance::claim(&data, link.as_deref().unwrap_or_default(), heard) {
         return Ok(());
     }
+    mailto::register();
     let client_file = env_path("USERPROFILE").join(".config").join("mailfunction").join("google-client.json");
 
     let app = App::new()?;
@@ -40,6 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     controller.load_accounts()?;
     controller.start_engine();
     app.on_start_with_windows_changed(startup::set);
+    app.on_choose_mail_app(mailto::choose);
     if controller.settings().start_with_windows {
         startup::set(true);
     }
@@ -59,6 +64,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         on_ui_thread(|this| this.refresh_badge());
     })?;
+    if let Some(link) = link {
+        on_ui_thread(move |this| this.requested(&link));
+    }
     chrome::watch_window(&app);
     // Until the app says so, as there may well be no window showing.
     slint::run_event_loop_until_quit()?;

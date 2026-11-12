@@ -9,6 +9,7 @@ pub mod editor;
 pub mod instance;
 pub mod list;
 pub mod logos;
+pub mod mailto;
 pub mod notify;
 mod settings;
 pub mod startup;
@@ -888,6 +889,15 @@ impl Controller {
             && let Ok(row) = usize::try_from(self.app.get_selected_row())
         {
             self.select_row(row);
+        }
+    }
+
+    /// Answers a later start of the app, or Windows starting it with a link: a `mailto:` link
+    /// becomes a message, and anything else just brings the window up.
+    pub fn requested(self: &Rc<Self>, request: &str) {
+        match compose::from_mailto(request) {
+            Some(fields) => self.write_to(fields),
+            None => self.reveal(),
         }
     }
 

@@ -153,6 +153,15 @@ impl Controller {
         self.start_writing(self.selected_with_account().map(|(_, account)| account), fields);
     }
 
+    /// Starts a message for a link from another app, from the account on screen, over whatever
+    /// the window was showing. What was being written goes to Drafts.
+    pub(crate) fn write_to(self: &Rc<Self>, fields: Compose) {
+        self.raise();
+        self.app.set_adding(false);
+        self.leave_settings();
+        self.start_writing(None, fields);
+    }
+
     fn start_writing(self: &Rc<Self>, account: Option<i64>, fields: Compose) {
         let first = self.accounts.borrow().first().map(|m| m.account.id);
         let Some(account) = account.or(self.shown.get()).or(first) else { return };

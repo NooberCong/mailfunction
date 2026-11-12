@@ -63,6 +63,8 @@ Format your text, add pictures and attachments, and choose which account to send
 
 You'll need 64-bit Windows 10 or 11, and [WebView2](https://developer.microsoft.com/microsoft-edge/webview2/), which Windows 11 already includes.
 
+To have email links open in mailfunction, go to **Settings**, **General**, **Email links** and choose it in Windows. Windows also offers it the next time you click one.
+
 Releases aren't code signed yet, so Windows may warn you the first time. Choose **More info**, then **Run anyway**.
 
 ## Sign in

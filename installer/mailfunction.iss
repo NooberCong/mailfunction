@@ -52,6 +52,9 @@ Filename: "powershell.exe"; WorkingDir: "{app}"; Parameters: "-NoProfile -Comman
 ; The app writes these itself. Naming them here is what removes them with it.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "mailfunction"; Flags: dontcreatekey uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\CLSID\{{6F1C2A54-8D3E-4B7A-9C21-5E0D7A3B1F46}"; Flags: dontcreatekey uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\mailfunction.mailto"; Flags: dontcreatekey uninsdeletekey
+Root: HKCU; Subkey: "Software\mailfunction"; Flags: dontcreatekey uninsdeletekey
+Root: HKCU; Subkey: "Software\RegisteredApplications"; ValueType: none; ValueName: "mailfunction"; Flags: dontcreatekey uninsdeletevalue
 
 [Code]
 // Mail stays behind on uninstalling, as it does with any app, but one identity per account has no

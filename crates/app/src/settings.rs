@@ -8,7 +8,7 @@ use std::time::Duration;
 use mailfunction_core::settings::{Appearance, MarkRead, Settings, TextSize};
 use slint::{ComponentHandle, TimerMode};
 
-use crate::{Controller, Preferences, Theme, chrome};
+use crate::{Controller, Preferences, Theme, chrome, mailto};
 
 /// A pause in typing long enough to be worth saving.
 const SAVE_DELAY: Duration = Duration::from_millis(600);
@@ -84,6 +84,14 @@ impl Controller {
         self.clear_message();
         self.app.set_showing_keys(false);
         self.app.set_settings_open(true);
+        self.check_mail_links();
+    }
+
+    /// Windows keeps the choice of mail app, and it can change there while this screen is open.
+    pub(crate) fn check_mail_links(&self) {
+        if self.app.get_settings_open() {
+            self.app.set_opens_mail_links(mailto::is_default());
+        }
     }
 
     pub fn close_settings(self: &Rc<Self>) {

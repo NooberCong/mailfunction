@@ -1,7 +1,8 @@
 //! The real executable, from the outside: what closing its window does, what starting it again
 //! does, and what its tray icon does. Everything goes through window messages to the app itself,
-//! the ones Windows would send, so no input reaches the desktop. Opens a window, so plain
-//! `cargo test` leaves it out. Run with `scripts/test-imap.ps1`.
+//! the ones Windows would send, so no input reaches the desktop. Links reach it through Windows'
+//! own association, as from another app. Opens a window, so plain `cargo test` leaves it out. Run
+//! with `scripts/test-imap.ps1`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
@@ -11,16 +12,22 @@ use mailfunction::startup;
 use mailfunction::tray::{CALLBACK, ICON_ID, NIN_SELECT};
 use mailfunction_core::settings::Settings;
 use mailfunction_core::store::{Account, AuthKind, LabelSpec, NewMessage, Role, Security, Store};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+use windows::Win32::System::Threading::{
+    GetExitCodeProcess, GetProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, TerminateProcess, WaitForSingleObject,
+};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
-use windows::Win32::UI::Shell::{NIM_DELETE, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect, Shell_NotifyIconW};
+use windows::Win32::UI::Shell::{
+    IEnumAssocHandlers, NIM_DELETE, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, SEE_MASK_CLASSNAME, SEE_MASK_NOCLOSEPROCESS,
+    SHAssocEnumHandlersForProtocolByApplication, SHELLEXECUTEINFOW, Shell_NotifyIconGetRect, Shell_NotifyIconW, ShellExecuteExW,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW,
-    RegisterWindowMessageW, WM_CLOSE, WM_CONTEXTMENU, WM_KEYDOWN,
+    RegisterWindowMessageW, SW_SHOWNORMAL, WM_CLOSE, WM_CONTEXTMENU, WM_KEYDOWN,
 };
-use windows::core::{BOOL, w};
+use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR, w};
 
 const VK_DOWN: usize = 0x28;
 const VK_ESCAPE: usize = 0x1B;
@@ -149,6 +156,12 @@ fn capture(hwnd: HWND, name: &str) {
 }
 
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+/// What the app declares to be offered for `mailto:` links.
+const LINK_KEYS: [&str; 2] = [r"HKCU\Software\Classes\mailfunction.mailto", r"HKCU\Software\mailfunction"];
+const REGISTERED_APPS: &str = r"HKCU\Software\RegisteredApplications";
+/// Asks for more than the composer takes, which it should leave out.
+const LINK: &str =
+    "mailto:ann@example.com?subject=From%20another%20app&body=Written%20from%20a%20link&bcc=evil@x.example&attach=C:%5Csecret.txt";
 
 fn start(dir: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_mailfunction")).env("MAILFUNCTION_DATA_DIR", dir).spawn().unwrap()
@@ -165,20 +178,147 @@ impl Drop for Running {
     }
 }
 
-/// What Windows would start at login, as the app wrote it.
-fn run_entry() -> Option<String> {
-    let output = Command::new("reg").args(["query", RUN_KEY, "/v", "mailfunction"]).output().unwrap();
+/// A value in the registry, or with no name the key's own.
+fn reg_value(key: &str, name: Option<&str>) -> Option<String> {
+    let which = name.map_or(vec!["/ve"], |name| vec!["/v", name]);
+    let output = Command::new("reg").args(["query", key]).args(which).output().unwrap();
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
     output.status.success().then(|| text.split("REG_SZ").nth(1).unwrap().trim().to_string())
 }
 
-fn set_run_entry(value: Option<&str>) {
+fn set_reg_value(key: &str, name: &str, value: Option<&str>) {
     let mut command = Command::new("reg");
     match value {
-        Some(value) => command.args(["add", RUN_KEY, "/v", "mailfunction", "/d", value, "/f"]),
-        None => command.args(["delete", RUN_KEY, "/v", "mailfunction", "/f"]),
+        Some(value) => command.args(["add", key, "/v", name, "/d", value, "/f"]),
+        None => command.args(["delete", key, "/v", name, "/f"]),
     };
     let _ = command.output();
+}
+
+/// What Windows would start at login, as the app wrote it.
+fn run_entry() -> Option<String> {
+    reg_value(RUN_KEY, Some("mailfunction"))
+}
+
+fn set_run_entry(value: Option<&str>) {
+    set_reg_value(RUN_KEY, "mailfunction", value);
+}
+
+/// The copy under test offers itself for `mailto:` links as it starts, over the user's own copy
+/// of the app. This puts back whatever was there, however the test ends.
+struct LinkRegistration {
+    keys: Vec<(&'static str, Option<PathBuf>)>,
+    registered: Option<String>,
+}
+
+impl LinkRegistration {
+    fn save(dir: &Path) -> Self {
+        let keys = LINK_KEYS
+            .iter()
+            .enumerate()
+            .map(|(n, &key)| {
+                let file = dir.join(format!("saved-{n}.reg"));
+                let saved = Command::new("reg").args(["export", key]).arg(&file).arg("/y").output().unwrap();
+                (key, saved.status.success().then_some(file))
+            })
+            .collect();
+        Self { keys, registered: reg_value(REGISTERED_APPS, Some("mailfunction")) }
+    }
+}
+
+impl Drop for LinkRegistration {
+    fn drop(&mut self) {
+        for (key, saved) in &self.keys {
+            let _ = Command::new("reg").args(["delete", key, "/f"]).output();
+            if let Some(file) = saved {
+                let _ = Command::new("reg").arg("import").arg(file).output();
+            }
+        }
+        set_reg_value(REGISTERED_APPS, "mailfunction", self.registered.as_deref());
+    }
+}
+
+/// The apps Windows offers for `mailto:` links, by the name it shows and the program it runs.
+fn offered_for_links() -> Vec<(String, String)> {
+    let handlers: IEnumAssocHandlers = unsafe { SHAssocEnumHandlersForProtocolByApplication(w!("mailto")) }.unwrap();
+    let text = |read: windows::core::Result<PWSTR>| read.map(|text| unsafe { text.to_string() }.unwrap()).unwrap_or_default();
+    let mut offered = Vec::new();
+    loop {
+        let mut next = [None];
+        let mut fetched = 0;
+        if unsafe { handlers.Next(&mut next, Some(&raw mut fetched)) }.is_err() || fetched == 0 {
+            return offered;
+        }
+        let handler = next[0].take().unwrap();
+        offered.push((text(unsafe { handler.GetUIName() }), text(unsafe { handler.GetName() })));
+    }
+}
+
+/// Opens a link as Windows does once the user has chosen the app for it, through what the app
+/// declared, and returns the process Windows started for it.
+fn open_as_windows_would(link: &str) -> HANDLE {
+    let (verb, file, class) = (HSTRING::from("open"), HSTRING::from(link), HSTRING::from("mailfunction.mailto"));
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_CLASSNAME | SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpClass: PCWSTR(class.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&raw mut info) }.unwrap();
+    assert!(!info.hProcess.is_invalid(), "Windows started nothing");
+    info.hProcess
+}
+
+fn exit_code(process: HANDLE) -> u32 {
+    assert_eq!(unsafe { WaitForSingleObject(process, PATIENCE.as_millis() as u32) }, WAIT_OBJECT_0, "it kept running");
+    let mut code = 0;
+    unsafe {
+        GetExitCodeProcess(process, &raw mut code).unwrap();
+        CloseHandle(process).unwrap();
+    }
+    code
+}
+
+/// Windows offers the app for `mailto:` links, and one comes up as a message over a closed window.
+fn link_while_running(window: HWND) {
+    println!("a mailto: link, through Windows, with the window closed");
+    let exe = std::path::absolute(env!("CARGO_BIN_EXE_mailfunction")).unwrap().display().to_string();
+    let command = reg_value(r"HKCU\Software\Classes\mailfunction.mailto\shell\open\command", None);
+    assert_eq!(command, Some(format!(r#""{exe}" "%1""#)));
+    let offered = offered_for_links();
+    println!("  offered: {offered:?}");
+    assert!(
+        offered.iter().any(|(name, program)| name == "mailfunction" && program.eq_ignore_ascii_case(&exe)),
+        "Windows doesn't offer the app for mailto: links"
+    );
+    post(window, WM_CLOSE, 0, 0);
+    until("window gone", || !showing(window));
+    assert_eq!(exit_code(open_as_windows_would(LINK)), 0, "the link's own process should pass it on and end");
+    until("window back", || showing(window));
+    std::thread::sleep(Duration::from_millis(1500));
+    capture(window, "mailto-running");
+}
+
+/// A link starts the app when it isn't running, and comes up as a message.
+fn link_from_cold() {
+    println!("a mailto: link, through Windows, with the app not running");
+    let process = open_as_windows_would(LINK);
+    let pid = unsafe { GetProcessId(process) };
+    let mut found = None;
+    until("a new window", || {
+        found = main_window(pid).filter(|hwnd| showing(*hwnd));
+        found.is_some()
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    capture(found.unwrap(), "mailto-cold");
+    unsafe {
+        TerminateProcess(process, 0).unwrap();
+        WaitForSingleObject(process, PATIENCE.as_millis() as u32);
+        CloseHandle(process).unwrap();
+    }
 }
 
 /// Started the way Windows starts it at login, the window must never reach the screen. It would
@@ -311,6 +451,8 @@ fn scenario(dir: &Path, app: &mut Child) {
     start_again(dir);
     until("window back", || showing(window));
 
+    link_while_running(window);
+
     println!("clicking the icon");
     post(window, WM_CLOSE, 0, 0);
     until("window gone", || !showing(window));
@@ -375,6 +517,8 @@ fn scenario(dir: &Path, app: &mut Child) {
     until("a new window", || main_window(pid).is_some_and(showing));
     again.kill().unwrap();
     again.wait().unwrap();
+
+    link_from_cold();
 }
 
 fn main() {
@@ -384,7 +528,12 @@ fn main() {
     // Otherwise windows report scaled positions, which name the wrong pixels on screen.
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }.unwrap();
     let dir: PathBuf = std::env::temp_dir().join(format!("mailfunction-tray-{}", std::process::id()));
+    // What Windows starts for a link inherits this process's environment, and without this would
+    // open the user's own mail.
+    unsafe { std::env::set_var("MAILFUNCTION_DATA_DIR", &dir) };
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.unwrap();
     seed(&dir);
+    let registration = LinkRegistration::save(&dir);
     let mut app = start(&dir);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         scenario(&dir, &mut app);
@@ -393,6 +542,7 @@ fn main() {
     }));
     let _ = app.kill();
     let _ = app.wait();
+    drop(registration);
     let _ = std::fs::remove_dir_all(&dir);
     if let Err(failure) = result {
         std::panic::resume_unwind(failure);

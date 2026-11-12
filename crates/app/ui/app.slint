@@ -1059,9 +1059,11 @@ component Sheet inherits Rectangle {
 component BarAction inherits Rectangle {
     in property <string> text;
     out property <bool> hovered: touch.has-hover;
+    /// From each edge to the text, which is what lines up with the controls around it.
+    out property <length> inset: 10px;
     callback clicked <=> touch.clicked;
 
-    width: label.preferred-width + 20px;
+    width: label.preferred-width + 2 * root.inset;
     height: 28px;
     border-radius: 7px;
     background: touch.has-hover ? Theme.faint : transparent;
@@ -2340,7 +2342,6 @@ component AccountSettings inherits Rectangle {
     callback remove();
 
     private property <bool> confirming;
-    private property <length> action-inset: 10px;
 
     function report() { root.edited(name.text, signature.text, notify.on); }
 
@@ -2381,7 +2382,7 @@ component AccountSettings inherits Rectangle {
                 horizontal-stretch: 0;
             }
             Rectangle {
-                width: remove.width - root.action-inset;
+                width: remove.width - remove.inset;
                 height: remove.height;
                 horizontal-stretch: 0;
                 remove := BarAction {
@@ -2464,7 +2465,9 @@ component SettingsTab inherits Rectangle {
 component SettingsScreen inherits Rectangle {
     in-out property <int> page;
     in property <[AccountItem]> accounts;
+    in property <bool> opens-mail-links;
     callback back();
+    callback choose-mail-app();
     callback add-account();
     callback remove-account(int);
     callback identity-edited(int, string, string, bool);
@@ -2547,6 +2550,20 @@ component SettingsScreen inherits Rectangle {
                             title: "Keep running when closed";
                             hint: "So that mail and notifications keep coming";
                             on <=> Theme.preferences.keep-running;
+                        }
+                        // Only Windows can make the app the default, so this goes there.
+                        Setting {
+                            title: "Email links";
+                            hint: root.opens-mail-links ? "Open here, as a new message" : "Open in another app";
+                            Rectangle {
+                                width: change.width - change.inset;
+                                horizontal-stretch: 0;
+                                change := BarAction {
+                                    x: 0;
+                                    text: "Change in Windows";
+                                    clicked => { root.choose-mail-app(); }
+                                }
+                            }
                         }
                     }
 
@@ -2708,6 +2725,8 @@ export component App inherits Window {
 
     in property <bool> settings-open;
     in-out property <int> settings-page;
+    /// Windows opens `mailto:` links here, as the user chose.
+    in property <bool> opens-mail-links;
 
     in property <string> notice;
     in property <string> notice-action;
@@ -2777,6 +2796,7 @@ export component App inherits Window {
     callback preferences-changed();
     callback identity-edited(int, string, string, bool);
     callback start-with-windows-changed(bool);
+    callback choose-mail-app();
 
     changed dark => { root.theme-changed(); }
     changed preferences => { root.preferences-changed(); }
@@ -3445,7 +3465,9 @@ export component App inherits Window {
         if root.signed-in && !root.adding && root.settings-open: SettingsScreen {
             page <=> root.settings-page;
             accounts: root.accounts;
+            opens-mail-links: root.opens-mail-links;
             back => { root.close-settings(); }
+            choose-mail-app => { root.choose-mail-app(); }
             add-account => {
                 root.add-account();
                 keys.focus();

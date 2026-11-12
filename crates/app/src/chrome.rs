@@ -252,6 +252,8 @@ pub fn watch_window(app: &App) {
                 on_ui_thread(|this| this.window_changed());
             }
             WindowEvent::Moved(_) => on_ui_thread(|this| this.window_changed()),
+            // Back from Windows' settings, perhaps having chosen a mail app there.
+            WindowEvent::Focused(true) => on_ui_thread(|this| this.check_mail_links()),
             // A file dropped on the window goes on the message being written.
             WindowEvent::DroppedFile(path) => {
                 let path = path.clone();
